@@ -1,6 +1,5 @@
 import type {
   Agent,
-  AgentCapability,
   AgentHubEvent,
   AgentStatus,
   AgentAuthority,
@@ -23,9 +22,32 @@ export interface CreateAgentInput {
   id?: string;
   projectId?: string | null;
   name: string;
+  provider?: string;
+  model?: string;
+  position?: string;
   status?: AgentStatus;
-  capabilities?: AgentCapability[];
+  allowedComplexities?: TaskComplexity[];
+  allowedRiskLevels?: TaskRisk[];
+  capabilities?: string[];
+  specialties?: string[];
   authority?: AgentAuthority;
+  routingPriority?: number;
+  enabled?: boolean;
+}
+
+export interface UpdateAgentInput {
+  name?: string;
+  provider?: string;
+  model?: string;
+  position?: string;
+  status?: AgentStatus;
+  allowedComplexities?: TaskComplexity[];
+  allowedRiskLevels?: TaskRisk[];
+  capabilities?: string[];
+  specialties?: string[];
+  authority?: AgentAuthority;
+  routingPriority?: number;
+  enabled?: boolean;
 }
 
 export interface CreateTaskInput {
@@ -64,6 +86,8 @@ export interface AgentRepository {
   create(input: CreateAgentInput): Agent;
   findById(id: string): Agent | null;
   list(): Agent[];
+  update(id: string, input: UpdateAgentInput): Agent;
+  delete(id: string): void;
 }
 
 export interface TaskRepository {

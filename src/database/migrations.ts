@@ -75,4 +75,18 @@ export const migrations: readonly Migration[] = [
       CREATE INDEX idx_events_entity ON events(entity_type, entity_id);
     `,
   },
+  {
+    version: 2,
+    name: 'agent_profiles',
+    up: `
+      ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'unknown' CHECK (length(trim(provider)) > 0);
+      ALTER TABLE agents ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown' CHECK (length(trim(model)) > 0);
+      ALTER TABLE agents ADD COLUMN position TEXT NOT NULL DEFAULT 'Agent' CHECK (length(trim(position)) > 0);
+      ALTER TABLE agents ADD COLUMN allowed_complexities TEXT NOT NULL DEFAULT '["TRIVIAL","SIMPLE","MEDIUM","COMPLEX","CRITICAL"]' CHECK (json_valid(allowed_complexities));
+      ALTER TABLE agents ADD COLUMN allowed_risk_levels TEXT NOT NULL DEFAULT '["LOW","MEDIUM","HIGH","CRITICAL"]' CHECK (json_valid(allowed_risk_levels));
+      ALTER TABLE agents ADD COLUMN specialties TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(specialties) AND json_type(specialties) = 'array');
+      ALTER TABLE agents ADD COLUMN routing_priority INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE agents ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1));
+    `,
+  },
 ];

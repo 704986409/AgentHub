@@ -1,15 +1,14 @@
 import type {
   Agent,
-  AgentCapability,
   AgentHubEvent,
   AgentStatus,
   AgentAuthority,
+  TaskComplexity,
+  TaskRisk,
   Assignment,
   AssignmentStatus,
   Project,
   Task,
-  TaskComplexity,
-  TaskRisk,
   TaskStatus,
 } from '../core/types.js';
 
@@ -33,9 +32,17 @@ export interface AgentRow {
   id: string;
   project_id: string | null;
   name: string;
+  provider: string;
+  model: string;
+  position: string;
   status: AgentStatus;
+  allowed_complexities: string;
+  allowed_risk_levels: string;
   capabilities: string;
+  specialties: string;
   authority: AgentAuthority;
+  routing_priority: number;
+  enabled: number;
   created_at: string;
   updated_at: string;
 }
@@ -44,9 +51,17 @@ export const mapAgent = (row: AgentRow): Agent => ({
   id: row.id,
   projectId: row.project_id,
   name: row.name,
+  provider: row.provider,
+  model: row.model,
+  position: row.position,
   status: row.status,
-  capabilities: JSON.parse(row.capabilities) as AgentCapability[],
+  allowedComplexities: JSON.parse(row.allowed_complexities) as TaskComplexity[],
+  allowedRiskLevels: JSON.parse(row.allowed_risk_levels) as TaskRisk[],
+  capabilities: JSON.parse(row.capabilities) as string[],
+  specialties: JSON.parse(row.specialties) as string[],
   authority: row.authority,
+  routingPriority: row.routing_priority,
+  enabled: row.enabled === 1,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 });

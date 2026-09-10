@@ -65,9 +65,17 @@ export interface Agent {
   id: string;
   projectId: string | null;
   name: string;
+  provider: string;
+  model: string;
+  position: string;
   status: AgentStatus;
-  capabilities: AgentCapability[];
+  allowedComplexities: TaskComplexity[];
+  allowedRiskLevels: TaskRisk[];
+  capabilities: string[];
+  specialties: string[];
   authority: AgentAuthority;
+  routingPriority: number;
+  enabled: boolean;
   createdAt: string;
   updatedAt: string;
 }
