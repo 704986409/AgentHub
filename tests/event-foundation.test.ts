@@ -9,6 +9,7 @@ import {
   AgentRegistry,
   AgentStatus,
   AssignmentManager,
+  CodexEventMapper,
   CodexProvider,
   Database,
   DomainEventType,
@@ -152,10 +153,12 @@ describe('Event Foundation E2E', () => {
     expect(byType.get('SystemAudit')).toMatchObject({ entityType: 'system', entityId: null });
   });
 
-  it('redacts sensitive Codex payloads on the bus and in EventStore and SQLite', () => {
+  it('persists only redacted Codex semantic metadata and ignores stderr diagnostics', () => {
     const observed: unknown[] = [];
     bus.subscribe((event) => observed.push(event.payload));
-    const provider = new CodexProvider({}, bus);
+    const provider = new CodexProvider({ debug: true }, bus);
+    const mapper = new CodexEventMapper({ eventBus: bus, source: provider, context: { provider: 'codex' } });
+    mapper.attach();
     const secrets = [
       'authorization-secret',
       'token-secret',
@@ -178,11 +181,10 @@ describe('Event Foundation E2E', () => {
     provider.client.processManager.emit('stderr', Buffer.from('secret=stderr-secret\n'));
 
     const busJson = JSON.stringify(observed);
-    const storedEvents = eventStore.list().filter((event) =>
-      event.eventType === 'CodexServerRequestReceived' || event.eventType === 'CodexProviderError');
+    const storedEvents = eventStore.list().filter((event) => event.eventType === 'AgentApprovalRequired');
     const storeJson = JSON.stringify(storedEvents);
     const rows = database.connection.prepare(
-      `SELECT payload FROM events WHERE event_type IN ('CodexServerRequestReceived', 'CodexProviderError')`,
+      `SELECT payload FROM events WHERE event_type = 'AgentApprovalRequired'`,
     ).all() as Array<{ payload: string }>;
     const sqliteJson = JSON.stringify(rows);
     for (const secret of secrets) {
@@ -190,8 +192,10 @@ describe('Event Foundation E2E', () => {
       expect(storeJson).not.toContain(secret);
       expect(sqliteJson).not.toContain(secret);
     }
-    expect(storeJson).toContain('[REDACTED]');
-    expect(storedEvents).toHaveLength(2);
+    expect(storedEvents).toHaveLength(1);
+    expect(eventStore.list().some((event) => event.eventType === 'ProviderError')).toBe(false);
+    expect(provider.client.diagnostics.snapshot().some((event) => event.type === 'stderr')).toBe(true);
+    mapper.dispose();
   });
 
   it('preserves audit authorship while redacting authorization through EventBus, EventStore, and SQLite', () => {

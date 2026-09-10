@@ -1,4 +1,5 @@
 export * from './CodexProtocol.js';
+export * from './CodexError.js';
 export * from './CodexDiagnostics.js';
 export * from './CodexMessageParser.js';
 export * from './CodexProcessManager.js';

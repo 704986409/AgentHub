@@ -9,6 +9,7 @@ import type {
   CodexServerRequestHandler,
 } from './CodexProvider.js';
 import type { CodexServerRequest } from './CodexProtocol.js';
+import { normalizeCodexErrorCode } from './CodexError.js';
 
 export interface CodexEventSource {
   onNotification(handler: CodexNotificationHandler): () => void;
@@ -33,6 +34,14 @@ const approvalMethods = new Set([
   'item/permissions/requestApproval',
 ]);
 const inputMethods = new Set(['item/tool/requestUserInput', 'mcpServer/elicitation/request']);
+const operationTypes = new Set([
+  'commandExecution',
+  'fileChange',
+  'mcpToolCall',
+  'toolCall',
+  'dynamicToolCall',
+  'collabAgentToolCall',
+]);
 
 export class CodexEventMapper {
   readonly #context: Readonly<AgentRuntimeContext>;
@@ -106,7 +115,7 @@ export class CodexEventMapper {
           ...idField('phase', stringValue(item?.phase)),
           textLength: text?.length ?? 0,
         });
-      } else if (operationType !== 'agentMessage') {
+      } else if (operationTypes.has(operationType)) {
         this.#publish(
           method === 'item/started' ? AgentRuntimeEventType.AGENT_OPERATION_STARTED : AgentRuntimeEventType.AGENT_OPERATION_COMPLETED,
           {
@@ -116,7 +125,7 @@ export class CodexEventMapper {
           },
         );
       } else {
-        this.#publish(AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED, itemMetadata);
+        this.#publish(AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED, { ...itemMetadata, itemType: operationType });
       }
       return;
     }
@@ -124,7 +133,7 @@ export class CodexEventMapper {
       const error = asRecord(record?.error);
       this.#publish(AgentRuntimeEventType.AGENT_RUNTIME_ERROR, {
         ...metadata,
-        ...idField('errorCode', stringValue(error?.code) ?? stringValue(error?.codexErrorInfo) ?? stringValue(record?.errorCode)),
+        ...idField('errorCode', stringValue(error?.code) ?? normalizeCodexErrorCode(error?.codexErrorInfo) ?? stringValue(record?.errorCode)),
         ...(typeof record?.willRetry === 'boolean' ? { willRetry: record.willRetry } : {}),
       });
       return;

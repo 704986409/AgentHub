@@ -1,5 +1,4 @@
 import type { EventBus } from '../../events/event-bus.js';
-import { redactEventValue } from '../../events/event-redaction.js';
 import type { CodexAppServerClientOptions } from './CodexAppServerClient.js';
 import { CodexAppServerClient } from './CodexAppServerClient.js';
 import type { CodexServerRequest } from './CodexProtocol.js';
@@ -36,36 +35,23 @@ export class CodexProvider {
     this.client = new CodexAppServerClient(options);
     this.client.onNotification((method, params) => {
       for (const handler of this.#notificationHandlers) handler(method, params);
-      this.eventBus?.publish({ eventType: 'CodexNotificationReceived', payload: summarizeNotification(method, params) });
     });
     this.client.onServerRequest((request) => {
       for (const handler of this.#serverRequestHandlers) handler(request);
-      this.eventBus?.publish({ eventType: 'CodexServerRequestReceived', payload: redactEventValue(request), actor: 'codex' });
     });
     this.client.onProtocolError((error) => {
       for (const handler of this.#protocolErrorHandlers) handler(error);
       this.#status = CodexProviderStatus.ERROR;
-      this.eventBus?.publishSystemError(error, { source: 'codex-protocol' });
-      this.eventBus?.publish({ eventType: 'CodexProviderError', payload: { message: error.message } });
     });
     this.client.processManager.on('exit', (exit: { code: number | null; signal: NodeJS.Signals | null }) => {
       for (const handler of this.#processExitHandlers) handler(exit.code, exit.signal);
       if (this.#status !== CodexProviderStatus.STOPPING) {
         this.#status = CodexProviderStatus.ERROR;
-        this.eventBus?.publish({ eventType: 'CodexProviderError', payload: exit });
       }
     });
     this.client.processManager.on('error', (error: Error) => {
       for (const handler of this.#processErrorHandlers) handler(error);
       this.#status = CodexProviderStatus.ERROR;
-      this.eventBus?.publishSystemError(error, { source: 'codex-process' });
-      this.eventBus?.publish({ eventType: 'CodexProviderError', payload: { message: error.message } });
-    });
-    this.client.processManager.on('stderr', (chunk: Buffer) => {
-      this.eventBus?.publish({
-        eventType: 'CodexProviderError',
-        payload: { stderr: redactEventValue(chunk.toString('utf8').slice(-2_000)) },
-      });
     });
   }
 
@@ -155,21 +141,6 @@ export const codexProviderEventTypes = [
   'CodexProviderStarting',
   'CodexProviderReady',
   'CodexProviderStopped',
-  'CodexProviderError',
   'CodexRequestSent',
   'CodexResponseReceived',
-  'CodexNotificationReceived',
-  'CodexServerRequestReceived',
 ] as const;
-
-function summarizeNotification(method: string, params: unknown): Record<string, unknown> {
-  if (typeof params !== 'object' || params === null) return { method };
-  const record = params as Record<string, unknown>;
-  const turn = typeof record.turn === 'object' && record.turn !== null ? record.turn as Record<string, unknown> : undefined;
-  return {
-    method,
-    ...(typeof record.threadId === 'string' ? { threadId: record.threadId } : {}),
-    ...(typeof record.turnId === 'string' ? { turnId: record.turnId } : {}),
-    ...(typeof turn?.id === 'string' ? { turnId: turn.id } : {}),
-  };
-}

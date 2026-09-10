@@ -1,4 +1,5 @@
 import type { CodexDiagnostics } from './CodexDiagnostics.js';
+import { normalizeCodexErrorCode } from './CodexError.js';
 
 export interface CodexManagerSession {
   threadId: string;
@@ -514,18 +515,12 @@ function collectText(pending: PendingTurn): string {
 function normalizeTurnError(value: unknown): NormalizedTurnError {
   if (!isRecord(value)) return { kind: 'provider_error', code: undefined, message: 'Codex turn failed' };
   const message = typeof value.message === 'string' ? value.message : 'Codex turn failed';
-  const code = normalizeErrorCode(value.codexErrorInfo);
+  const code = normalizeCodexErrorCode(value.codexErrorInfo);
   const upstream =
     code === 'serverOverloaded' ||
     code === 'rateLimitExceeded' ||
     /at capacity|temporar(?:y|ily) unavailable|server overloaded|service unavailable/i.test(message);
   return { kind: upstream ? 'upstream_unavailable' : 'provider_error', code, message };
-}
-
-function normalizeErrorCode(value: unknown): string | undefined {
-  if (typeof value === 'string') return value;
-  if (isRecord(value)) return Object.keys(value)[0];
-  return undefined;
 }
 
 function classifyRequestFailure(error: unknown): NormalizedTurnError {

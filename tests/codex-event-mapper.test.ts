@@ -10,6 +10,7 @@ import {
   type CodexProtocolErrorHandler,
   type CodexServerRequest,
   type CodexServerRequestHandler,
+  CodexProvider,
   Database,
   EventBus,
   EventStore,
@@ -81,8 +82,17 @@ describe('Codex event mapper', () => {
     source.notification('item/completed', {
       threadId: 'th-1', turnId: 'tu-1', item: { id: 'op-1', type: 'commandExecution', status: 'completed', stdout: 'private stdout' },
     });
+    source.notification('item/started', {
+      threadId: 'th-1', turnId: 'tu-1', item: { id: 'reason-1', type: 'reasoning', content: ['private reasoning'] },
+    });
+    source.notification('item/completed', {
+      threadId: 'th-1', turnId: 'tu-1', item: { id: 'future-item-1', type: 'futureItem', payload: 'private future payload' },
+    });
     source.notification('error', {
       threadId: 'th-1', turnId: 'tu-1', willRetry: true, error: { codexErrorInfo: 'serverOverloaded', message: 'private error' },
+    });
+    source.notification('error', {
+      threadId: 'th-1', turnId: 'tu-2', willRetry: false, error: { codexErrorInfo: { serverOverloaded: {} }, message: 'private error object' },
     });
     source.notification('future/newEvent', {
       threadId: 'th-1', turnId: 'tu-1', itemId: 'future-1', prompt: 'private prompt', nested: { apiKey: 'secret' },
@@ -97,6 +107,9 @@ describe('Codex event mapper', () => {
       AgentRuntimeEventType.AGENT_MESSAGE_COMPLETED,
       AgentRuntimeEventType.AGENT_OPERATION_STARTED,
       AgentRuntimeEventType.AGENT_OPERATION_COMPLETED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+      AgentRuntimeEventType.AGENT_RUNTIME_ERROR,
       AgentRuntimeEventType.AGENT_RUNTIME_ERROR,
       AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
     ]);
@@ -109,7 +122,16 @@ describe('Codex event mapper', () => {
     });
     expect(events[5]?.payload).toMatchObject({ itemId: 'msg-1', phase: 'final_answer', textLength: 14 });
     expect(events[6]?.payload).toMatchObject({ itemId: 'op-1', operationType: 'commandExecution' });
-    expect(events[8]?.payload).toMatchObject({ errorCode: 'serverOverloaded', willRetry: true });
+    expect(events[8]).toMatchObject({
+      eventType: AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+      payload: { itemId: 'reason-1', itemType: 'reasoning' },
+    });
+    expect(events[9]).toMatchObject({
+      eventType: AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+      payload: { itemId: 'future-item-1', itemType: 'futureItem' },
+    });
+    expect(events[10]?.payload).toMatchObject({ errorCode: 'serverOverloaded', willRetry: true });
+    expect(events[11]?.payload).toMatchObject({ errorCode: 'serverOverloaded', willRetry: false });
     expect(JSON.stringify(events)).not.toContain('private');
     expect(JSON.stringify(events)).not.toContain('secret');
   });
@@ -138,6 +160,25 @@ describe('Codex event mapper', () => {
     expect(request.params).toHaveProperty('command', 'private');
     expect(JSON.stringify(events)).not.toContain('private');
   });
+
+  it.each(['commandExecution', 'fileChange', 'mcpToolCall', 'toolCall', 'dynamicToolCall', 'collabAgentToolCall'])(
+    'maps the explicit operation item type %s',
+    (itemType) => {
+      const { source, events } = createAttachedMapper();
+      source.notification('item/started', {
+        threadId: 'th-1', turnId: 'tu-1', item: { id: 'op-1', type: itemType, arguments: 'private' },
+      });
+      source.notification('item/completed', {
+        threadId: 'th-1', turnId: 'tu-1', item: { id: 'op-1', type: itemType, status: 'completed', result: 'private' },
+      });
+      expect(events.map((event) => event.eventType)).toEqual([
+        AgentRuntimeEventType.AGENT_OPERATION_STARTED,
+        AgentRuntimeEventType.AGENT_OPERATION_COMPLETED,
+      ]);
+      expect(events[0]?.payload).toMatchObject({ operationType: itemType });
+      expect(JSON.stringify(events)).not.toContain('private');
+    },
+  );
 
   it('maps protocol/process failures and process exit to provider-neutral events', () => {
     const { source, events } = createAttachedMapper();
@@ -189,6 +230,53 @@ describe('Codex event mapper', () => {
     mapper.dispose();
     store.close();
     database.close();
+  });
+
+  it('uses only the semantic EventBus path when Provider and Mapper share an EventStore', () => {
+    const database = new Database(':memory:');
+    database.initialize();
+    const bus = new EventBus();
+    const store = new EventStore(new SqliteEventRepository(database), bus);
+    const provider = new CodexProvider({}, bus);
+    const mapper = new CodexEventMapper({ eventBus: bus, source: provider, context: { provider: 'codex' } });
+    let rawCount = 0;
+    provider.onNotification(() => { rawCount += 1; });
+    mapper.attach();
+
+    provider.client.processManager.emit('stdout', Buffer.from(
+      '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"tu-1"}}}\n',
+    ));
+    provider.client.processManager.emit('stdout', Buffer.from(
+      '{"id":"req-1","method":"item/fileChange/requestApproval","params":{"threadId":"th-1","turnId":"tu-1","itemId":"op-1"}}\n',
+    ));
+    provider.client.processManager.emit('stdout', Buffer.from('{malformed}\n'));
+    provider.client.processManager.emit('error', new Error('process failed'));
+
+    expect(rawCount).toBe(1);
+    const storedTypes = store.list().map((event) => event.eventType);
+    expect(storedTypes).toHaveLength(4);
+    expect(storedTypes.filter((type) => type === 'AgentExecutionStarted')).toHaveLength(1);
+    expect(storedTypes.filter((type) => type === 'AgentApprovalRequired')).toHaveLength(1);
+    expect(storedTypes.filter((type) => type === 'ProviderError')).toHaveLength(2);
+    expect(storedTypes.some((type) => type.startsWith('Codex'))).toBe(false);
+    mapper.dispose();
+    store.close();
+    database.close();
+  });
+
+  it('keeps stderr in diagnostics without publishing a false ProviderError', () => {
+    const bus = new EventBus();
+    const events: DomainEvent[] = [];
+    bus.subscribe((event) => events.push(event));
+    const provider = new CodexProvider({ debug: true }, bus);
+
+    provider.client.processManager.emit('stderr', Buffer.from('INFO normal diagnostic\n'));
+
+    expect(events.filter((event) => event.eventType === 'ProviderError' || event.eventType === 'CodexProviderError')).toHaveLength(0);
+    expect(provider.client.diagnostics.snapshot()).toContainEqual(expect.objectContaining({
+      type: 'stderr',
+      details: { raw: 'INFO normal diagnostic' },
+    }));
   });
 
   it('is idempotent when attached and cleans every subscription through repeated lifecycle cycles', () => {

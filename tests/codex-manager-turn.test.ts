@@ -123,6 +123,20 @@ describe('Codex Manager turn controller', () => {
       status: 'upstream_unavailable',
       error: { kind: 'upstream_unavailable', code: 'serverOverloaded' },
     });
+
+    transport.turnResponse = { turn: { id: 'turn-4', status: 'inProgress', items: [] } };
+    const objectCapacityPromise = controller.runTurn({ prompt: 'capacity object' });
+    await allowRequestResponseToSettle();
+    controller.handleNotification('error', {
+      threadId: 'thread-1',
+      turnId: 'turn-4',
+      willRetry: false,
+      error: { message: 'Selected model is at capacity', codexErrorInfo: { serverOverloaded: {} } },
+    });
+    await expect(objectCapacityPromise).resolves.toMatchObject({
+      status: 'upstream_unavailable',
+      error: { kind: 'upstream_unavailable', code: 'serverOverloaded' },
+    });
   });
 
   it('clears a timed-out turn and ignores events from other turns', async () => {
