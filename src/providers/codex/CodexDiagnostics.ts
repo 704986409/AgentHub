@@ -1,4 +1,7 @@
+import type { ManagerPromptDiagnosticEventType } from '../../manager/ManagerPromptDiagnostics.js';
+
 export type CodexDiagnosticEventType =
+  | ManagerPromptDiagnosticEventType
   | 'process-started'
   | 'outbound'
   | 'inbound-stdout'

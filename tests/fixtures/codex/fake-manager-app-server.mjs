@@ -47,11 +47,12 @@ function handle(message) {
       return;
     }
     send({ id: message.id, result: { turn: { id: turnId, status: 'inProgress', items: [] } } });
-    setTimeout(() => emitTurn(message.params.threadId, turnId), 5);
+    const promptAccepted = scenario !== 'manager-prompt-valid' || validateManagerPrompt(message.params);
+    setTimeout(() => emitTurn(message.params.threadId, turnId, promptAccepted), 5);
   }
 }
 
-function emitTurn(threadId, turnId) {
+function emitTurn(threadId, turnId, promptAccepted = true) {
   if (scenario === 'capacity') {
     send({
       method: 'error',
@@ -75,7 +76,7 @@ function emitTurn(threadId, turnId) {
   }
   if (scenario === 'hang') return;
 
-  const outputText = directiveOutput(turnId);
+  const outputText = directiveOutput(turnId, promptAccepted);
   const splitAt = Math.ceil(outputText.length / 2);
   send({ method: 'turn/started', params: { threadId, turn: { id: turnId, status: 'inProgress', items: [] } } });
   send({ method: 'fixture/progress', params: { threadId, turnId, progress: 0.5 } });
@@ -96,11 +97,38 @@ function emitTurn(threadId, turnId) {
   });
 }
 
-function directiveOutput(turnId) {
+function directiveOutput(turnId, promptAccepted) {
+  if (scenario === 'manager-prompt-valid') return promptAccepted ? envelopeDirective : 'Invalid Manager prompt.';
   if (scenario === 'directive-valid') return validDirective;
   if (scenario === 'directive-repair-success') return turnId.endsWith('-1') ? 'No control block.' : validDirective;
   if (scenario === 'directive-repair-invalid') return 'No control block.';
   return 'OK';
+}
+
+function validateManagerPrompt(params) {
+  const prompt = params?.input?.[0]?.text;
+  if (typeof prompt !== 'string') return false;
+  const expectedOrder = [
+    '[AGENTHUB_MANAGER_ROLE_JSON]',
+    '[PROJECT_JSON]',
+    '[USER_REQUIREMENT_JSON]',
+    '[CURRENT_TASK_JSON]',
+    '[AGENTHUB_INSTRUCTIONS]',
+  ];
+  let lastIndex = -1;
+  for (const section of expectedOrder) {
+    const index = prompt.indexOf(section);
+    if (index <= lastIndex) return false;
+    lastIndex = index;
+  }
+  return prompt.includes(JSON.stringify({ text: 'Development Manager role' }))
+    && prompt.includes(JSON.stringify({
+      workspace: 'D:\\Code\\Demo',
+      targetBranch: 'main',
+      repositoryRules: ['Use TypeScript', 'No destructive Git'],
+    }))
+    && prompt.includes(JSON.stringify({ text: 'Add save support' }))
+    && prompt.includes('Produce exactly one final <AGENTHUB_DIRECTIVE> block.');
 }
 
 const validDirective = [
@@ -114,6 +142,21 @@ const validDirective = [
     issues: [],
     requestedChecks: [],
     summary: 'OK',
+  }),
+  '</AGENTHUB_DIRECTIVE>',
+].join('\n');
+
+const envelopeDirective = [
+  '<AGENTHUB_DIRECTIVE>',
+  JSON.stringify({
+    action: 'INFORM',
+    taskId: 'ENVELOPE',
+    title: 'Envelope received',
+    instructions: '',
+    acceptanceCriteria: [],
+    issues: [],
+    requestedChecks: [],
+    summary: 'PROMPT_CONTEXT_RECEIVED',
   }),
   '</AGENTHUB_DIRECTIVE>',
 ].join('\n');
