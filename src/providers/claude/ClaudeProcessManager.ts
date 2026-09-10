@@ -62,7 +62,7 @@ export class ClaudeProcessManager extends EventEmitter {
     this.#command = options.command ?? 'claude';
     this.#args = [...(options.args ?? [])];
     this.#cwd = options.cwd;
-    this.#env = options.env ?? process.env;
+    this.#env = { ...process.env, ...options.env };
     this.#stopTimeoutMs = options.stopTimeoutMs ?? 2_000;
     this.on('error', () => undefined);
   }

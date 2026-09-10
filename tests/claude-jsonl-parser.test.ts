@@ -9,9 +9,9 @@ import {
 describe('Claude JSONL parser', () => {
   it('frames fragmented and multiple JSON lines with CRLF, whitespace, and empty lines', () => {
     const { parser, messages, errors } = createParser();
-    parser.push('{"a":');
-    parser.push('1}\r\n\n  {"b":2}  \n{"c"');
-    parser.push(':3}\n');
+    parser.push(Buffer.from('{"a":'));
+    parser.push(Buffer.from('1}\r\n\n  {"b":2}  \n{"c"'));
+    parser.push(Buffer.from(':3}\n'));
     parser.end();
 
     expect(messages).toEqual([{ a: 1 }, { b: 2 }, { c: 3 }]);
@@ -35,7 +35,7 @@ describe('Claude JSONL parser', () => {
 
   it('flushes a valid final object without a trailing newline exactly once', () => {
     const { parser, messages, errors } = createParser();
-    parser.push('{"type":"result"}');
+    parser.push(Buffer.from('{"type":"result"}'));
     parser.end();
     parser.end();
 
@@ -50,45 +50,45 @@ describe('Claude JSONL parser', () => {
     ['string root', '"value"\n', 'CLAUDE_JSONL_INVALID_ROOT'],
   ])('enters terminal failure for %s', (_name, input, code) => {
     const { parser, messages, errors } = createParser();
-    parser.push(input);
+    parser.push(Buffer.from(input));
 
     expect(messages).toEqual([]);
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({ code, lineNumber: 1 });
     expect(errors[0]?.message).not.toContain(input.trim());
     expect(parser.failed).toBe(true);
-    expect(captureError(() => parser.push('{"valid":true}\n'))).toMatchObject({
+    expect(captureError(() => parser.push(Buffer.from('{"valid":true}\n')))).toMatchObject({
       code: 'CLAUDE_JSONL_PARSER_FAILED',
     });
   });
 
   it('rejects oversized complete and incomplete lines without retaining content', () => {
     const complete = createParser(8);
-    complete.parser.push('{"long":123}\n');
+    complete.parser.push(Buffer.from('{"long":123}\n'));
     expect(complete.errors[0]).toMatchObject({ code: 'CLAUDE_JSONL_LINE_TOO_LARGE', lineNumber: 1 });
 
     const incomplete = createParser(4);
-    incomplete.parser.push('12345');
+    incomplete.parser.push(Buffer.from('12345'));
     expect(incomplete.errors[0]).toMatchObject({ code: 'CLAUDE_JSONL_LINE_TOO_LARGE', lineNumber: 1 });
     expect(incomplete.messages).toEqual([]);
   });
 
   it('reports partial invalid JSON at EOF and rejects push after a clean end', () => {
     const partial = createParser();
-    partial.parser.push('{"type":');
+    partial.parser.push(Buffer.from('{"type":'));
     partial.parser.end();
     expect(partial.errors[0]).toMatchObject({ code: 'CLAUDE_JSONL_INVALID_JSON', lineNumber: 1 });
 
     const closed = createParser();
     closed.parser.end();
-    expect(captureError(() => closed.parser.push('{}\n'))).toMatchObject({
+    expect(captureError(() => closed.parser.push(Buffer.from('{}\n')))).toMatchObject({
       code: 'CLAUDE_JSONL_PARSER_CLOSED',
     });
   });
 
   it('does not mutate raw parsed messages', () => {
     const { parser, messages } = createParser();
-    parser.push('{"type":"assistant","token":"raw","nested":{"value":1}}\n');
+    parser.push(Buffer.from('{"type":"assistant","token":"raw","nested":{"value":1}}\n'));
     parser.end();
     expect(messages[0]).toEqual({ type: 'assistant', token: 'raw', nested: { value: 1 } });
   });

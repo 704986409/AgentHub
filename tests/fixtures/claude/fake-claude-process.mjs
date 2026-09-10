@@ -30,7 +30,65 @@ if (mode === 'quick') {
 } else if (mode === 'hang') {
   process.stdin.resume();
   setInterval(() => undefined, 1_000);
+} else if (mode === 'turn-success' || mode === 'prompt-args' || mode === 'env-overlay') {
+  const args = process.argv.slice(3);
+  const resumedSession = readOption(args, '--resume');
+  const sessionId = resumedSession ?? 'session-A';
+  const prompt = readPrintPrompt(args);
+  const result = mode === 'prompt-args'
+    ? prompt
+    : mode === 'env-overlay'
+      ? JSON.stringify({ inheritedPath: typeof process.env.PATH === 'string', custom: process.env.AGENTHUB_TEST_ENV })
+      : resumedSession === undefined ? 'first-ok' : 'second-ok';
+  emitTurn(sessionId, sessionId, result);
+} else if (mode === 'missing-result') {
+  emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
+  emit({ type: 'assistant', text: 'no terminal result' });
+} else if (mode === 'missing-session') {
+  emit({ type: 'result', result: 'missing-session' });
+} else if (mode === 'init-result-mismatch') {
+  emitTurn('session-A', 'session-B', 'mismatch');
+} else if (mode === 'resume-return-mismatch') {
+  emitTurn('session-B', 'session-B', 'mismatch');
+} else if (mode === 'duplicate-result') {
+  emitTurn('session-A', 'session-A', 'first');
+  emit({ type: 'result', session_id: 'session-A', result: 'second' });
+} else if (mode === 'error-result') {
+  emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
+  emit({ type: 'result', session_id: 'session-A', result: 'failed', is_error: true });
+} else if (mode === 'nonzero-result') {
+  emitTurn('session-A', 'session-A', 'present');
+  process.exitCode = 7;
+} else if (mode === 'resume-fail') {
+  process.stderr.write('Session not found\n');
+  process.exitCode = 2;
+} else if (mode === 'parser-error-hang') {
+  process.stdout.write('{bad json}\n');
+  setInterval(() => undefined, 1_000);
+} else if (mode === 'result-hang') {
+  emitTurn('session-A', 'session-A', 'present');
+  setInterval(() => undefined, 1_000);
 } else {
   process.stderr.write(`Unknown fixture mode: ${mode}\n`);
   process.exitCode = 64;
+}
+
+function emitTurn(initSessionId, resultSessionId, result) {
+  emit({ type: 'system', subtype: 'init', session_id: initSessionId, pid: process.pid });
+  emit({ type: 'assistant', text: 'fixture assistant' });
+  emit({ type: 'result', subtype: 'success', session_id: resultSessionId, result });
+}
+
+function emit(message) {
+  process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function readOption(args, name) {
+  const index = args.indexOf(name);
+  return index < 0 ? undefined : args[index + 1];
+}
+
+function readPrintPrompt(args) {
+  const index = args.indexOf('-p');
+  return index < 0 ? undefined : args[index + 1];
 }

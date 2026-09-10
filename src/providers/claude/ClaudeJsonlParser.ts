@@ -59,7 +59,7 @@ export class ClaudeJsonlParser {
     return this.#lineNumber;
   }
 
-  public push(chunk: Buffer | string): void {
+  public push(chunk: Buffer): void {
     if (this.#failed) {
       throw new ClaudeJsonlParseError(
         'CLAUDE_JSONL_PARSER_FAILED',
@@ -76,7 +76,7 @@ export class ClaudeJsonlParser {
         0,
       );
     }
-    this.#buffer += typeof chunk === 'string' ? chunk : this.#decoder.write(chunk);
+    this.#buffer += this.#decoder.write(chunk);
     this.processCompleteLines();
     this.enforceLineLimit(this.#buffer, this.#lineNumber + 1);
   }
