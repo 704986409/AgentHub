@@ -25,3 +25,22 @@ Available commands:
 
 Database access is centralized in `src/database` and `src/repositories`.
 Application code should use repositories instead of executing SQL directly.
+
+## Codex App Server
+
+V0.2.1 uses the locally installed Codex CLI as a long-running `codex app-server`
+child process. Protocol bindings can be regenerated for the current CLI with:
+
+```bash
+codex app-server generate-ts --out src/providers/codex/generated --experimental
+codex app-server generate-json-schema --out src/providers/codex/generated-schema --experimental
+```
+
+Generated bindings are intentionally ignored from version control because the
+CLI generates imports that vary by TypeScript module configuration. The runtime
+uses small JSON-RPC envelope types and treats generated bindings as a local
+protocol reference.
+
+The real process integration test is enabled explicitly with
+`AGENTHUB_RUN_CODEX_INTEGRATION=1`; unit and parser tests always run in the
+normal `npm test` command.

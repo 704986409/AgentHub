@@ -6,3 +6,6 @@ coverage/
 *.db-wal
 .env
 *.log
+src/providers/codex/generated/
+src/providers/codex/generated-schema/
+.tmp-codex-schema/
