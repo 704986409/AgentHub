@@ -2,6 +2,7 @@ import type { CodexDiagnostics } from './CodexDiagnostics.js';
 
 export interface CodexManagerSession {
   threadId: string;
+  sessionId: string;
 }
 
 export interface CodexTurnRequest {
@@ -31,6 +32,7 @@ export interface CodexTurnEvent {
 
 export interface CodexTurnResult {
   threadId: string;
+  sessionId: string;
   turnId?: string;
   status: CodexTurnResultStatus;
   text: string;
@@ -76,6 +78,7 @@ interface BufferedNotification {
 
 interface PendingTurn {
   threadId: string;
+  sessionId: string;
   turnId: string | undefined;
   startedAt: number;
   settled: boolean;
@@ -107,7 +110,7 @@ export class CodexManagerTurnController {
   readonly #threadRequestTimeoutMs: number;
   readonly #turnTimeoutMs: number;
   readonly #diagnostics: CodexDiagnostics | undefined;
-  #managerThreadId: string | undefined;
+  #managerSession: CodexManagerSession | undefined;
   #threadCreation: Promise<CodexManagerSession> | undefined;
   #pendingTurn: PendingTurn | undefined;
   #lastSettledTurn: { threadId: string; turnId: string | undefined } | undefined;
@@ -124,7 +127,11 @@ export class CodexManagerTurnController {
   }
 
   public get managerThreadId(): string | undefined {
-    return this.#managerThreadId;
+    return this.#managerSession?.threadId;
+  }
+
+  public get managerSession(): CodexManagerSession | undefined {
+    return this.#managerSession === undefined ? undefined : { ...this.#managerSession };
   }
 
   public get pendingTurnCount(): number {
@@ -133,7 +140,7 @@ export class CodexManagerTurnController {
 
   public async createManagerThread(): Promise<CodexManagerSession> {
     this.ensureReady();
-    if (this.#managerThreadId !== undefined) return { threadId: this.#managerThreadId };
+    if (this.#managerSession !== undefined) return { ...this.#managerSession };
     if (this.#threadCreation !== undefined) return this.#threadCreation;
 
     this.#threadCreation = this.createManagerThreadRequest();
@@ -157,7 +164,7 @@ export class CodexManagerTurnController {
     try {
       const session = await this.createManagerThread();
       const timeoutMs = request.timeoutMs ?? this.#turnTimeoutMs;
-      const pending = this.createPendingTurn(session.threadId);
+      const pending = this.createPendingTurn(session);
       this.#pendingTurn = pending;
 
       let response: unknown;
@@ -232,7 +239,7 @@ export class CodexManagerTurnController {
         message: `Codex app-server exited during turn (code=${String(code)}, signal=${String(signal)})`,
       });
     }
-    this.#managerThreadId = undefined;
+    this.#managerSession = undefined;
   }
 
   public stop(): void {
@@ -244,7 +251,7 @@ export class CodexManagerTurnController {
         message: 'Codex provider stopped during turn',
       });
     }
-    this.#managerThreadId = undefined;
+    this.#managerSession = undefined;
   }
 
   private async createManagerThreadRequest(): Promise<CodexManagerSession> {
@@ -257,21 +264,27 @@ export class CodexManagerTurnController {
     }
     const thread = readRecordField(response, 'thread');
     const threadId = readNonEmptyString(thread, 'id');
-    if (threadId === undefined) {
-      throw new CodexManagerError('protocol_error', 'thread/start response is missing thread.id', 'INVALID_THREAD_RESPONSE');
+    const sessionId = readNonEmptyString(thread, 'sessionId');
+    if (threadId === undefined || sessionId === undefined) {
+      throw new CodexManagerError(
+        'protocol_error',
+        'thread/start response is missing thread.id or thread.sessionId',
+        'INVALID_THREAD_RESPONSE',
+      );
     }
-    this.#managerThreadId = threadId;
-    return { threadId };
+    this.#managerSession = { threadId, sessionId };
+    return { ...this.#managerSession };
   }
 
-  private createPendingTurn(threadId: string): PendingTurn {
+  private createPendingTurn(session: CodexManagerSession): PendingTurn {
     let resolveTurn: ((result: CodexTurnResult) => void) | undefined;
     const promise = new Promise<CodexTurnResult>((resolve) => {
       resolveTurn = resolve;
     });
     if (resolveTurn === undefined) throw new Error('Unable to create turn result promise');
     const pending: PendingTurn = {
-      threadId,
+      threadId: session.threadId,
+      sessionId: session.sessionId,
       turnId: undefined,
       startedAt: Date.now(),
       settled: false,
@@ -411,6 +424,7 @@ export class CodexManagerTurnController {
     this.addEvent(pending, { kind: 'completed', method: 'turn/completed' });
     this.finish(pending, {
       threadId: pending.threadId,
+      sessionId: pending.sessionId,
       ...(pending.turnId === undefined ? {} : { turnId: pending.turnId }),
       status: 'completed',
       text: collectText(pending),
@@ -432,6 +446,7 @@ export class CodexManagerTurnController {
       error.kind === 'timeout' ? 'timeout' : error.kind === 'upstream_unavailable' ? 'upstream_unavailable' : 'failed';
     this.finish(pending, {
       threadId: pending.threadId,
+      sessionId: pending.sessionId,
       ...(pending.turnId === undefined ? {} : { turnId: pending.turnId }),
       status,
       text: collectText(pending),

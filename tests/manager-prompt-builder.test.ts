@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   CodexDiagnostics,
-  CodexProvider,
+  CodexManagerUseCase,
   ManagerPromptBuilder,
   ManagerRoleLoader,
   type ManagerPromptEnvelope,
@@ -64,12 +64,12 @@ describe('ManagerPromptBuilder', () => {
     ['invalid criteria', { task: { acceptanceCriteria: [''] } }, 'ACCEPTANCE_CRITERIA_INVALID'],
     ['negative revision', { task: { revision: -1 } }, 'REVISION_INVALID'],
   ])('rejects %s before starting a Codex turn', async (_name, override, code) => {
-    const provider = new CodexProvider();
+    const provider = CodexManagerUseCase.create();
     const envelope = mergeEnvelope(createEnvelope(), override);
     await expect(provider.runManagerPlanningTurn(envelope)).rejects.toMatchObject({ code });
     expect(provider.client.requestManager.pendingCount).toBe(0);
     expect(provider.pendingTurnCount).toBe(0);
-    expect(provider.getManagerThreadId()).toBeUndefined();
+    expect(provider.getManagerSession()).toBeUndefined();
   });
 
   it('keeps tag-like user text inside one JSON value and preserves it exactly', () => {

@@ -2,7 +2,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { CodexProvider, type ManagerPromptEnvelope } from '../src/index.js';
+import { CodexManagerUseCase, type ManagerPromptEnvelope } from '../src/index.js';
 
 const fixturePath = fileURLToPath(new URL('./fixtures/codex/fake-manager-app-server.mjs', import.meta.url));
 
@@ -15,7 +15,7 @@ describe('Manager prompt integration', () => {
     expect(result).toMatchObject({
       directiveStatus: 'valid',
       directive: { action: 'INFORM', taskId: 'ENVELOPE', summary: 'PROMPT_CONTEXT_RECEIVED' },
-      initialTurn: { threadId: 'manager-thread-1', turnId: 'manager-turn-1', status: 'completed' },
+      initialTurn: { threadId: 'manager-thread-1', sessionId: 'manager-session-1', turnId: 'manager-turn-1', status: 'completed' },
     });
     expect(outboundMethodCount(provider, 'thread/start')).toBe(1);
     expect(outboundMethodCount(provider, 'turn/start')).toBe(1);
@@ -62,22 +62,21 @@ function createEnvelope(): ManagerPromptEnvelope {
   };
 }
 
-function createFixtureProvider(scenario: string): CodexProvider {
-  return new CodexProvider({
+function createFixtureProvider(scenario: string): CodexManagerUseCase {
+  return CodexManagerUseCase.create({
     command: process.execPath,
     args: [fixturePath, scenario],
     debug: true,
-    managerTurnTimeoutMs: 2_000,
-  });
+  }, { turnTimeoutMs: 2_000 });
 }
 
-function outboundMethodCount(provider: CodexProvider, method: string): number {
+function outboundMethodCount(provider: CodexManagerUseCase, method: string): number {
   return provider.client.diagnostics.snapshot()
     .filter((event) => event.type === 'outbound' && event.details.method === method)
     .length;
 }
 
-function assertNoPendingWork(provider: CodexProvider): void {
+function assertNoPendingWork(provider: CodexManagerUseCase): void {
   expect(provider.client.requestManager.pendingCount).toBe(0);
   expect(provider.pendingTurnCount).toBe(0);
 }

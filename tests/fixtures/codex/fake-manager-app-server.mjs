@@ -5,6 +5,7 @@ const scenario = process.argv[2] ?? 'success';
 let buffer = '';
 let initialized = false;
 let turnNumber = 0;
+let pendingServerRequest;
 
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
@@ -23,6 +24,14 @@ function send(message) {
 }
 
 function handle(message) {
+  if (message.method === undefined && message.id === 'server-request-1' && pendingServerRequest !== undefined) {
+    if (message.result?.decision === 'accept') {
+      const { threadId, turnId } = pendingServerRequest;
+      pendingServerRequest = undefined;
+      emitTurn(threadId, turnId);
+    }
+    return;
+  }
   if (message.method === 'initialize') {
     send({ id: message.id, result: { platformFamily: 'fixture', platformOs: 'fixture' } });
     return;
@@ -36,7 +45,7 @@ function handle(message) {
       send({ id: message.id, error: { code: -32000, message: 'not initialized' } });
       return;
     }
-    send({ id: message.id, result: { thread: { id: 'manager-thread-1' } } });
+    send({ id: message.id, result: { thread: { id: 'manager-thread-1', sessionId: 'manager-session-1' } } });
     return;
   }
   if (message.method === 'turn/start') {
@@ -47,6 +56,20 @@ function handle(message) {
       return;
     }
     send({ id: message.id, result: { turn: { id: turnId, status: 'inProgress', items: [] } } });
+    if (scenario === 'server-request') {
+      pendingServerRequest = { threadId: message.params.threadId, turnId };
+      setTimeout(() => send({
+        id: 'server-request-1',
+        method: 'item/commandExecution/requestApproval',
+        params: {
+          itemId: 'command-1',
+          threadId: message.params.threadId,
+          turnId,
+          reason: 'fixture approval',
+        },
+      }), 5);
+      return;
+    }
     const promptAccepted = scenario !== 'manager-prompt-valid' || validateManagerPrompt(message.params);
     setTimeout(() => emitTurn(message.params.threadId, turnId, promptAccepted), 5);
   }

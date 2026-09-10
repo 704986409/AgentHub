@@ -33,6 +33,27 @@ describe('Codex protocol foundation', () => {
     expect(parsed[0]?.message && isCodexErrorResponse(parsed[0].message)).toBe(true);
   });
 
+  it.each([
+    'item/commandExecution/requestApproval',
+    'item/fileChange/requestApproval',
+    'item/permissions/requestApproval',
+    'item/tool/requestUserInput',
+    'mcpServer/elicitation/request',
+  ])('preserves the id and turn context for the %s server request', (method) => {
+    const parser = new CodexMessageParser();
+    const parsed = parser.feed(`${JSON.stringify({
+      id: 'request-7',
+      method,
+      params: { threadId: 'thread-1', turnId: 'turn-2', itemId: 'item-3' },
+    })}\n`);
+    expect(parsed[0]?.message && isCodexServerRequest(parsed[0].message)).toBe(true);
+    expect(parsed[0]?.message).toEqual({
+      id: 'request-7',
+      method,
+      params: { threadId: 'thread-1', turnId: 'turn-2', itemId: 'item-3' },
+    });
+  });
+
   it('redacts credential-shaped fields before a raw protocol line is logged', () => {
     const json = redactProtocolLine('{"access_token":"sensitive","token":"also-sensitive","ok":true}');
     expect(json).not.toContain('sensitive');

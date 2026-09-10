@@ -9,7 +9,6 @@ import type { ManagerPromptDiagnosticRecorder } from './ManagerPromptDiagnostics
 
 const managerInstructions = [
   'Inspect only repository content relevant to the requirement.',
-  'Act as Development Manager, not the primary implementation engineer.',
   'Minimize scope creep.',
   'Produce exactly one final <AGENTHUB_DIRECTIVE> block.',
   'The directive JSON must include action, taskId, title, instructions, acceptanceCriteria, issues, requestedChecks, and summary.',

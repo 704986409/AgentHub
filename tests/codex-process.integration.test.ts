@@ -2,7 +2,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { CodexAppServerClient, CodexProvider, CodexProviderStatus } from '../src/index.js';
+import { CodexAppServerClient, CodexManagerUseCase, CodexProvider, CodexProviderStatus } from '../src/index.js';
 
 const managerFixture = fileURLToPath(new URL('./fixtures/codex/fake-manager-app-server.mjs', import.meta.url));
 
@@ -62,12 +62,7 @@ describe('Codex app-server process integration', () => {
   }, 30_000);
 
   it('runs a complete Manager turn through the fake app-server and reuses its thread', async () => {
-    const provider = new CodexProvider({
-      command: process.execPath,
-      args: [managerFixture, 'success'],
-      debug: true,
-      managerTurnTimeoutMs: 2_000,
-    });
+    const provider = createManagerUseCase('success', 2_000, true);
     await provider.initialize();
     expect(provider.getStatus()).toBe(CodexProviderStatus.READY);
 
@@ -75,12 +70,14 @@ describe('Codex app-server process integration', () => {
     const second = await provider.runTurn({ prompt: 'Reply with exactly OK again.' });
     expect(first).toMatchObject({
       threadId: 'manager-thread-1',
+      sessionId: 'manager-session-1',
       turnId: 'manager-turn-1',
       status: 'completed',
       text: 'OK',
     });
     expect(second).toMatchObject({
       threadId: 'manager-thread-1',
+      sessionId: 'manager-session-1',
       turnId: 'manager-turn-2',
       status: 'completed',
       text: 'OK',
@@ -104,11 +101,7 @@ describe('Codex app-server process integration', () => {
   });
 
   it('classifies a fake app-server capacity error as upstream unavailable', async () => {
-    const provider = new CodexProvider({
-      command: process.execPath,
-      args: [managerFixture, 'capacity'],
-      managerTurnTimeoutMs: 2_000,
-    });
+    const provider = createManagerUseCase('capacity', 2_000);
     await provider.initialize();
     const result = await provider.runTurn({ prompt: 'Reply with exactly OK.' });
     expect(result).toMatchObject({
@@ -121,11 +114,7 @@ describe('Codex app-server process integration', () => {
   });
 
   it('cleans up timed-out and malformed fake app-server turns', async () => {
-    const timeoutProvider = new CodexProvider({
-      command: process.execPath,
-      args: [managerFixture, 'hang'],
-      managerTurnTimeoutMs: 30,
-    });
+    const timeoutProvider = createManagerUseCase('hang', 30);
     await timeoutProvider.initialize();
     const timeoutResult = await timeoutProvider.runTurn({ prompt: 'wait' });
     expect(timeoutResult).toMatchObject({ status: 'timeout', error: { kind: 'timeout' } });
@@ -133,11 +122,7 @@ describe('Codex app-server process integration', () => {
     expect(timeoutProvider.client.requestManager.pendingCount).toBe(0);
     await timeoutProvider.shutdown();
 
-    const malformedProvider = new CodexProvider({
-      command: process.execPath,
-      args: [managerFixture, 'malformed'],
-      managerTurnTimeoutMs: 2_000,
-    });
+    const malformedProvider = createManagerUseCase('malformed', 2_000);
     await malformedProvider.initialize();
     const malformedResult = await malformedProvider.runTurn({ prompt: 'malformed' });
     expect(malformedResult).toMatchObject({ status: 'failed', error: { kind: 'protocol_error' } });
@@ -145,15 +130,89 @@ describe('Codex app-server process integration', () => {
     expect(malformedProvider.client.requestManager.pendingCount).toBe(0);
     await malformedProvider.shutdown();
 
-    const unmatchedProvider = new CodexProvider({
-      command: process.execPath,
-      args: [managerFixture, 'unmatched'],
-      managerTurnTimeoutMs: 2_000,
-    });
+    const unmatchedProvider = createManagerUseCase('unmatched', 2_000);
     await unmatchedProvider.initialize();
     const unmatchedResult = await unmatchedProvider.runTurn({ prompt: 'unmatched' });
     expect(unmatchedResult).toMatchObject({ status: 'failed', error: { kind: 'protocol_error' } });
     expect(unmatchedProvider.client.requestManager.pendingCount).toBe(0);
     await unmatchedProvider.shutdown();
   });
+
+  it('preserves raw notifications and exposes respondable server requests', async () => {
+    const manager = createManagerUseCase('server-request', 2_000);
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    const serverRequests: unknown[] = [];
+    manager.provider.onNotification((method, params) => notifications.push({ method, params }));
+    manager.provider.onServerRequest((request) => {
+      serverRequests.push(request);
+      manager.provider.respondToServerRequest(request.id, { decision: 'accept' });
+    });
+
+    await manager.initialize();
+    const result = await manager.runTurn({ prompt: 'Exercise the server request boundary.' });
+
+    expect(result).toMatchObject({
+      status: 'completed',
+      threadId: 'manager-thread-1',
+      sessionId: 'manager-session-1',
+      turnId: 'manager-turn-1',
+    });
+    expect(serverRequests).toEqual([
+      {
+        id: 'server-request-1',
+        method: 'item/commandExecution/requestApproval',
+        params: {
+          itemId: 'command-1',
+          threadId: 'manager-thread-1',
+          turnId: 'manager-turn-1',
+          reason: 'fixture approval',
+        },
+      },
+    ]);
+    const delta = notifications.find((notification) => notification.method === 'item/agentMessage/delta');
+    expect(delta?.params).toMatchObject({
+      threadId: 'manager-thread-1',
+      turnId: 'manager-turn-1',
+      itemId: 'message-1',
+    });
+    const progress = notifications.find((notification) => notification.method === 'fixture/progress');
+    expect(progress?.params).toMatchObject({ progress: 0.5 });
+    expect(manager.client.requestManager.pendingCount).toBe(0);
+    expect(manager.pendingTurnCount).toBe(0);
+    await manager.shutdown();
+  });
+
+  it('clears pending requests and turns when shutdown cancels active work', async () => {
+    const manager = createManagerUseCase('hang', 2_000, true);
+    await manager.initialize();
+    const turn = manager.runTurn({ prompt: 'Remain active until shutdown.' });
+    await waitForOutboundMethod(manager, 'turn/start');
+
+    await manager.shutdown();
+    await expect(turn).resolves.toMatchObject({
+      status: 'failed',
+      error: { kind: 'provider_error', code: 'PROVIDER_STOPPED' },
+    });
+    expect(manager.client.requestManager.pendingCount).toBe(0);
+    expect(manager.pendingTurnCount).toBe(0);
+    expect(manager.client.processManager.running).toBe(false);
+  });
 });
+
+function createManagerUseCase(scenario: string, turnTimeoutMs: number, debug = false): CodexManagerUseCase {
+  return CodexManagerUseCase.create({
+    command: process.execPath,
+    args: [managerFixture, scenario],
+    debug,
+  }, { turnTimeoutMs });
+}
+
+async function waitForOutboundMethod(manager: CodexManagerUseCase, method: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const found = manager.client.diagnostics.snapshot()
+      .some((event) => event.type === 'outbound' && event.details.method === method);
+    if (found) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Timed out waiting for ${method}`);
+}

@@ -143,7 +143,7 @@ function block(value: unknown): string {
 }
 
 function completedTurn(turnId: string, text: string): CodexTurnResult {
-  return { threadId: 'thread-1', turnId, status: 'completed', text, events: [] };
+  return { threadId: 'thread-1', sessionId: 'session-1', turnId, status: 'completed', text, events: [] };
 }
 
 function failedTurn(
@@ -153,6 +153,7 @@ function failedTurn(
 ): CodexTurnResult {
   return {
     threadId: 'thread-1',
+    sessionId: 'session-1',
     turnId,
     status,
     text: '',

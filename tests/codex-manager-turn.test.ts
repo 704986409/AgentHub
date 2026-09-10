@@ -7,7 +7,7 @@ import {
 
 class MockManagerTransport implements CodexManagerTransport {
   readonly requests: Array<{ method: string; params: unknown; timeoutMs: number | undefined }> = [];
-  threadResponse: unknown = { thread: { id: 'thread-1' } };
+  threadResponse: unknown = { thread: { id: 'thread-1', sessionId: 'session-1' } };
   turnResponse: unknown = { turn: { id: 'turn-1', status: 'inProgress', items: [] } };
 
   public request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown> {
@@ -59,7 +59,7 @@ describe('Codex Manager turn controller', () => {
     });
     const first = await firstPromise;
 
-    expect(first).toMatchObject({ threadId: 'thread-1', turnId: 'turn-1', status: 'completed', text: 'OK' });
+    expect(first).toMatchObject({ threadId: 'thread-1', sessionId: 'session-1', turnId: 'turn-1', status: 'completed', text: 'OK' });
     expect(first.events.some((event) => event.kind === 'unknown')).toBe(true);
     expect(transport.count('thread/start')).toBe(1);
 
@@ -79,6 +79,7 @@ describe('Codex Manager turn controller', () => {
     expect(transport.count('thread/start')).toBe(1);
     expect(transport.count('turn/start')).toBe(2);
     expect(controller.managerThreadId).toBe('thread-1');
+    expect(controller.managerSession).toEqual({ threadId: 'thread-1', sessionId: 'session-1' });
     expect(controller.pendingTurnCount).toBe(0);
   });
 
