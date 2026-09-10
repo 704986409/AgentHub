@@ -104,9 +104,24 @@ export class CodexAppServerClient {
     for (const parsed of this.#parser.feed(chunk)) {
       if (parsed.raw !== undefined) this.diagnostics.record('inbound-stdout', { raw: redactProtocolLine(parsed.raw) });
       if (parsed.error !== undefined) {
+        this.requestManager.rejectAll(parsed.error);
         this.#onProtocolError?.(parsed.error);
       } else if (parsed.message !== undefined) {
-        if (isCodexResponse(parsed.message)) this.requestManager.handleResponse(parsed.message);
+        if (isCodexResponse(parsed.message)) {
+          const matched = this.requestManager.handleResponse(parsed.message);
+          if (!matched) {
+            const late = this.requestManager.wasSettled(parsed.message.id);
+            this.diagnostics.record('late-turn-event', {
+              kind: late ? 'late-response' : 'unmatched-response',
+              requestId: parsed.message.id,
+            });
+            if (!late) {
+              const error = new Error(`Unmatched Codex response id: ${String(parsed.message.id)}`);
+              this.requestManager.rejectAll(error);
+              this.#onProtocolError?.(error);
+            }
+          }
+        }
         else if (isCodexNotification(parsed.message)) this.#onNotification?.(parsed.message.method, parsed.message.params);
         else if (isCodexServerRequest(parsed.message)) this.#onServerRequest?.(parsed.message);
       }

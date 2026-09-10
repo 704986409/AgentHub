@@ -14,6 +14,8 @@ export interface CodexRequestTimeout {
 
 export class CodexRequestManager {
   readonly #pending = new Map<CodexRequestId, PendingRequest>();
+  readonly #settledIds = new Set<CodexRequestId>();
+  readonly #settledOrder: CodexRequestId[] = [];
   #nextId = 1;
 
   public constructor(
@@ -30,6 +32,7 @@ export class CodexRequestManager {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(id);
+        this.rememberSettled(id);
         this.onTimeout?.({ id, method, timeoutMs });
         reject(new Error(`Codex request timed out: ${method}`));
       }, timeoutMs);
@@ -48,6 +51,7 @@ export class CodexRequestManager {
     const pending = this.#pending.get(response.id);
     if (pending === undefined) return false;
     this.#pending.delete(response.id);
+    this.rememberSettled(response.id);
     clearTimeout(pending.timer);
     if (response.error !== undefined) pending.reject(new Error(`${String(response.error.code)}: ${response.error.message}`));
     else pending.resolve(response.result);
@@ -55,10 +59,25 @@ export class CodexRequestManager {
   }
 
   public rejectAll(reason: Error): void {
-    for (const pending of this.#pending.values()) {
+    for (const [id, pending] of this.#pending) {
       clearTimeout(pending.timer);
       pending.reject(reason);
+      this.rememberSettled(id);
     }
     this.#pending.clear();
+  }
+
+  public wasSettled(id: CodexRequestId): boolean {
+    return this.#settledIds.has(id);
+  }
+
+  private rememberSettled(id: CodexRequestId): void {
+    if (this.#settledIds.has(id)) return;
+    this.#settledIds.add(id);
+    this.#settledOrder.push(id);
+    if (this.#settledOrder.length > 256) {
+      const oldest = this.#settledOrder.shift();
+      if (oldest !== undefined) this.#settledIds.delete(oldest);
+    }
   }
 }

@@ -4,7 +4,10 @@ export type CodexDiagnosticEventType =
   | 'inbound-stdout'
   | 'stderr'
   | 'request-timeout'
-  | 'process-exit';
+  | 'process-exit'
+  | 'provider-state'
+  | 'turn-event'
+  | 'late-turn-event';
 
 export interface CodexDiagnosticEvent {
   timestamp: string;
@@ -56,8 +59,12 @@ export function redactProtocolLine(line: string): string {
 
 function redactValue(value: unknown, key?: string): unknown {
   if (key !== undefined && isSensitiveKey(key)) return '[REDACTED]';
+  if ((key === 'text' || key === 'delta') && typeof value === 'string') return `[TEXT ${String(value.length)} chars]`;
   if (Array.isArray(value)) return value.map((item) => redactValue(item));
   if (typeof value === 'object' && value !== null) {
+    if ('type' in value && value.type === 'reasoning') {
+      return { type: 'reasoning', id: 'id' in value ? value.id : undefined, content: '[REDACTED]' };
+    }
     return Object.fromEntries(
       Object.entries(value).map(([entryKey, entryValue]) => [entryKey, redactValue(entryValue, entryKey)]),
     );

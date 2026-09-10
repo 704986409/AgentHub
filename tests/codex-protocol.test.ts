@@ -54,7 +54,9 @@ describe('Codex protocol foundation', () => {
     const first = manager.request('first', undefined, 1_000);
     const second = manager.request('second', { value: 2 }, 1_000);
     expect(manager.handleResponse({ jsonrpc: '2.0', id: 999, result: 'ignored' })).toBe(false);
+    expect(manager.wasSettled(999)).toBe(false);
     manager.handleResponse({ jsonrpc: '2.0', id: 2, result: 'two' });
+    expect(manager.wasSettled(2)).toBe(true);
     manager.handleResponse({ jsonrpc: '2.0', id: 1, result: 'one' });
     await expect(first).resolves.toBe('one');
     await expect(second).resolves.toBe('two');
