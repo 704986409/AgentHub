@@ -13,18 +13,29 @@ export class SqliteEventRepository implements EventRepository {
     assertNonEmpty(input.entityType, 'entityType');
     assertNonEmpty(input.eventType, 'eventType');
     const id = input.id ?? randomUUID();
+    const eventId = input.eventId ?? id;
     const now = new Date().toISOString();
+    const timestamp = input.timestamp ?? now;
     this.database.connection
       .prepare(`INSERT INTO events
-        (id, project_id, entity_type, entity_id, event_type, payload, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        (id, event_id, project_id, agent_id, task_id, assignment_id, entity_type, entity_id, event_type, payload,
+         actor, old_status, new_status, timestamp, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         id,
+        eventId,
         input.projectId ?? null,
+        input.agentId ?? null,
+        input.taskId ?? null,
+        input.assignmentId ?? null,
         input.entityType.trim(),
         input.entityId ?? null,
         input.eventType.trim(),
         JSON.stringify(input.payload ?? {}),
+        input.actor ?? null,
+        input.oldStatus ?? null,
+        input.newStatus ?? null,
+        timestamp,
         now,
       );
     return this.findRequired(id);

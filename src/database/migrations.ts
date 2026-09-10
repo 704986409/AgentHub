@@ -142,4 +142,23 @@ export const migrations: readonly Migration[] = [
       PRAGMA foreign_keys = ON;
     `,
   },
+  {
+    version: 4,
+    name: 'event_foundation',
+    up: `
+      ALTER TABLE events ADD COLUMN event_id TEXT;
+      ALTER TABLE events ADD COLUMN agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL;
+      ALTER TABLE events ADD COLUMN task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL;
+      ALTER TABLE events ADD COLUMN assignment_id TEXT REFERENCES assignments(id) ON DELETE SET NULL;
+      ALTER TABLE events ADD COLUMN actor TEXT;
+      ALTER TABLE events ADD COLUMN old_status TEXT;
+      ALTER TABLE events ADD COLUMN new_status TEXT;
+      ALTER TABLE events ADD COLUMN timestamp TEXT;
+      UPDATE events SET event_id = id, timestamp = created_at WHERE event_id IS NULL;
+      CREATE UNIQUE INDEX idx_events_event_id ON events(event_id);
+      CREATE INDEX idx_events_agent_id ON events(agent_id);
+      CREATE INDEX idx_events_task_id ON events(task_id);
+      CREATE INDEX idx_events_assignment_id ON events(assignment_id);
+    `,
+  },
 ];

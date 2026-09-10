@@ -66,6 +66,19 @@ export enum AgentAuthority {
   ADMIN = 'ADMIN',
 }
 
+export enum DomainEventType {
+  AGENT_CREATED = 'AgentCreated',
+  AGENT_UPDATED = 'AgentUpdated',
+  AGENT_LOCKED = 'AgentLocked',
+  AGENT_UNLOCKED = 'AgentUnlocked',
+  TASK_CREATED = 'TaskCreated',
+  TASK_STATUS_CHANGED = 'TaskStatusChanged',
+  ASSIGNMENT_CREATED = 'AssignmentCreated',
+  ASSIGNMENT_ACCEPTED = 'AssignmentAccepted',
+  ASSIGNMENT_COMPLETED = 'AssignmentCompleted',
+  SYSTEM_ERROR = 'SystemError',
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -124,10 +137,18 @@ export interface Assignment {
 
 export interface AgentHubEvent {
   id: string;
+  eventId: string;
+  eventType: DomainEventType | string;
   projectId: string | null;
+  agentId: string | null;
+  taskId: string | null;
+  assignmentId: string | null;
   entityType: string;
   entityId: string | null;
-  eventType: string;
   payload: unknown;
+  actor: string | null;
+  oldStatus: string | null;
+  newStatus: string | null;
+  timestamp: string;
   createdAt: string;
 }

@@ -92,11 +92,19 @@ export interface UpdateAssignmentInput {
 
 export interface CreateEventInput {
   id?: string;
-  projectId?: string | null;
+  eventId?: string | undefined;
+  projectId?: string | null | undefined;
+  agentId?: string | null | undefined;
+  taskId?: string | null | undefined;
+  assignmentId?: string | null | undefined;
   entityType: string;
   entityId?: string | null;
   eventType: string;
   payload?: unknown;
+  actor?: string | null | undefined;
+  oldStatus?: string | null | undefined;
+  newStatus?: string | null | undefined;
+  timestamp?: string | undefined;
 }
 
 export interface ProjectRepository {

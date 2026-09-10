@@ -2,6 +2,8 @@ import { AssignmentStatus, AgentStatus, TaskStatus, type Assignment } from '../c
 import type { AssignmentRepository, CreateAssignmentInput } from '../repositories/interfaces.js';
 import type { AgentRegistry } from './agent-registry.js';
 import type { TaskManager } from './task-manager.js';
+import type { EventBus } from '../events/event-bus.js';
+import { DomainEventType } from '../core/types.js';
 
 export class AssignmentManager {
   public constructor(
@@ -9,6 +11,7 @@ export class AssignmentManager {
     private readonly tasks: TaskManager,
     private readonly agents: AgentRegistry,
     private readonly profileHashes: (agentId: string) => string,
+    private readonly eventBus?: EventBus,
   ) {}
 
   public createAssignment(input: Omit<CreateAssignmentInput, 'profileHash' | 'status'> & { profileHash?: string }): Assignment {
@@ -28,11 +31,27 @@ export class AssignmentManager {
       status: AssignmentStatus.DISPATCHING,
     });
     this.tasks.updateTask(input.taskId, { assignedAgentId: input.agentId, assignmentId: assignment.id });
+    this.eventBus?.publish({
+      eventType: DomainEventType.ASSIGNMENT_CREATED,
+      assignmentId: assignment.id,
+      taskId: assignment.taskId,
+      agentId: assignment.agentId,
+      payload: assignment,
+    });
     return assignment;
   }
 
   public acceptAssignment(id: string): Assignment {
-    return this.changeStatus(id, AssignmentStatus.ACCEPTED);
+    const assignment = this.changeStatus(id, AssignmentStatus.ACCEPTED);
+    this.eventBus?.publish({
+      eventType: DomainEventType.ASSIGNMENT_ACCEPTED,
+      assignmentId: assignment.id,
+      taskId: assignment.taskId,
+      agentId: assignment.agentId,
+      oldStatus: AssignmentStatus.DISPATCHING,
+      newStatus: assignment.status,
+    });
+    return assignment;
   }
 
   public activateAssignment(id: string): Assignment {
@@ -59,6 +78,14 @@ export class AssignmentManager {
     this.tasks.transitionTask(assignment.taskId, TaskStatus.COMPLETED);
     const result = this.repository.update(id, { status: AssignmentStatus.COMPLETED });
     this.releaseAgent(assignment.agentId);
+    this.eventBus?.publish({
+      eventType: DomainEventType.ASSIGNMENT_COMPLETED,
+      assignmentId: result.id,
+      taskId: result.taskId,
+      agentId: result.agentId,
+      oldStatus: AssignmentStatus.ACTIVE,
+      newStatus: result.status,
+    });
     return result;
   }
 

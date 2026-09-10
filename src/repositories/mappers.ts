@@ -125,20 +125,36 @@ export const mapAssignment = (row: AssignmentRow): Assignment => ({
 
 export interface EventRow {
   id: string;
+  event_id: string;
+  event_type: string;
   project_id: string | null;
+  agent_id: string | null;
+  task_id: string | null;
+  assignment_id: string | null;
   entity_type: string;
   entity_id: string | null;
-  event_type: string;
   payload: string;
+  actor: string | null;
+  old_status: string | null;
+  new_status: string | null;
+  timestamp: string;
   created_at: string;
 }
 
 export const mapEvent = (row: EventRow): AgentHubEvent => ({
   id: row.id,
+  eventId: row.event_id,
+  eventType: row.event_type,
   projectId: row.project_id,
+  agentId: row.agent_id,
+  taskId: row.task_id,
+  assignmentId: row.assignment_id,
   entityType: row.entity_type,
   entityId: row.entity_id,
-  eventType: row.event_type,
   payload: JSON.parse(row.payload) as unknown,
+  actor: row.actor,
+  oldStatus: row.old_status,
+  newStatus: row.new_status,
+  timestamp: row.timestamp,
   createdAt: row.created_at,
 });
