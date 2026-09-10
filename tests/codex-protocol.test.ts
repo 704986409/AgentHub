@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 
 import {
   CodexCapabilityDetector,
+  redactProtocolLine,
   CodexMessageParser,
   CodexRequestManager,
   CodexDoctor,
+  isCodexErrorResponse,
   isCodexNotification,
   isCodexServerRequest,
 } from '../src/index.js';
@@ -23,6 +25,19 @@ describe('Codex protocol foundation', () => {
     expect(parsed).toHaveLength(2);
     expect(parsed[0]?.message && isCodexNotification(parsed[0].message)).toBe(true);
     expect(parsed[1]?.message && isCodexServerRequest(parsed[1].message)).toBe(true);
+  });
+
+  it('accepts messages without a jsonrpc field and identifies error responses by shape', () => {
+    const parser = new CodexMessageParser();
+    const parsed = parser.feed('{"id":1,"error":{"code":-1,"message":"nope"}}\n');
+    expect(parsed[0]?.message && isCodexErrorResponse(parsed[0].message)).toBe(true);
+  });
+
+  it('redacts credential-shaped fields before a raw protocol line is logged', () => {
+    const json = redactProtocolLine('{"access_token":"sensitive","token":"also-sensitive","ok":true}');
+    expect(json).not.toContain('sensitive');
+    expect(json).toContain('[REDACTED]');
+    expect(redactProtocolLine('authorization: bearer-sensitive')).toBe('authorization: [REDACTED]');
   });
 
   it('reports invalid JSON and overlong messages without crashing', () => {

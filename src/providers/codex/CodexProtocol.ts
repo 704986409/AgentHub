@@ -14,6 +14,10 @@ export interface CodexResponse {
   error?: { code: number; message: string; data?: unknown };
 }
 
+export interface CodexErrorResponse extends CodexResponse {
+  error: { code: number; message: string; data?: unknown };
+}
+
 export interface CodexNotification {
   jsonrpc?: '2.0';
   method: string;
@@ -38,6 +42,10 @@ export function classifyCodexMessage(value: unknown): CodexInboundMessage {
 
 export function isCodexResponse(message: CodexInboundMessage): message is CodexResponse {
   return 'id' in message && !('method' in message);
+}
+
+export function isCodexErrorResponse(message: CodexInboundMessage): message is CodexErrorResponse {
+  return isCodexResponse(message) && message.error !== undefined;
 }
 
 export function isCodexNotification(message: CodexInboundMessage): message is CodexNotification {

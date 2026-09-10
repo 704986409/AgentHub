@@ -6,11 +6,20 @@ interface PendingRequest {
   timer: NodeJS.Timeout;
 }
 
+export interface CodexRequestTimeout {
+  id: CodexRequestId;
+  method: string;
+  timeoutMs: number;
+}
+
 export class CodexRequestManager {
   readonly #pending = new Map<CodexRequestId, PendingRequest>();
   #nextId = 1;
 
-  public constructor(private readonly write: (request: { id: CodexRequestId; method: string; params?: unknown }) => void) {}
+  public constructor(
+    private readonly write: (request: { id: CodexRequestId; method: string; params?: unknown }, timeoutMs: number) => void,
+    private readonly onTimeout?: (request: CodexRequestTimeout) => void,
+  ) {}
 
   public get pendingCount(): number {
     return this.#pending.size;
@@ -21,11 +30,12 @@ export class CodexRequestManager {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(id);
+        this.onTimeout?.({ id, method, timeoutMs });
         reject(new Error(`Codex request timed out: ${method}`));
       }, timeoutMs);
       this.#pending.set(id, { resolve, reject, timer });
       try {
-        this.write({ id, method, ...(params === undefined ? {} : { params }) });
+        this.write({ id, method, ...(params === undefined ? {} : { params }) }, timeoutMs);
       } catch (error) {
         clearTimeout(timer);
         this.#pending.delete(id);

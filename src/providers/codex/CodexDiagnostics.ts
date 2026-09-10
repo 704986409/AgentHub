@@ -1,0 +1,70 @@
+export type CodexDiagnosticEventType =
+  | 'process-started'
+  | 'outbound'
+  | 'inbound-stdout'
+  | 'stderr'
+  | 'request-timeout'
+  | 'process-exit';
+
+export interface CodexDiagnosticEvent {
+  timestamp: string;
+  type: CodexDiagnosticEventType;
+  details: Readonly<Record<string, unknown>>;
+}
+
+export type CodexDiagnosticSink = (event: CodexDiagnosticEvent) => void;
+
+/**
+ * An in-memory, opt-in protocol trace for diagnosing app-server connections.
+ * JSON values are redacted before they enter the trace so callers can safely
+ * attach it to support reports.
+ */
+export class CodexDiagnostics {
+  readonly #events: CodexDiagnosticEvent[] = [];
+
+  public constructor(
+    private readonly enabled = false,
+    private readonly sink?: CodexDiagnosticSink,
+  ) {}
+
+  public record(type: CodexDiagnosticEventType, details: Record<string, unknown>): void {
+    if (!this.enabled) return;
+    const event: CodexDiagnosticEvent = {
+      timestamp: new Date().toISOString(),
+      type,
+      details: redactValue(details) as Record<string, unknown>,
+    };
+    this.#events.push(event);
+    this.sink?.(event);
+  }
+
+  public snapshot(): readonly CodexDiagnosticEvent[] {
+    return [...this.#events];
+  }
+}
+
+export function redactProtocolLine(line: string): string {
+  try {
+    return JSON.stringify(redactValue(JSON.parse(line) as unknown));
+  } catch {
+    return line.replace(
+      /((?:authorization|auth|api[_-]?key|(?:access[_-]?|refresh[_-]?)?token|secret|password|cookie|credential)\s*[:=]\s*)\S+/gi,
+      '$1[REDACTED]',
+    );
+  }
+}
+
+function redactValue(value: unknown, key?: string): unknown {
+  if (key !== undefined && isSensitiveKey(key)) return '[REDACTED]';
+  if (Array.isArray(value)) return value.map((item) => redactValue(item));
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([entryKey, entryValue]) => [entryKey, redactValue(entryValue, entryKey)]),
+    );
+  }
+  return value;
+}
+
+function isSensitiveKey(key: string): boolean {
+  return /authorization|auth|api[_-]?key|(?:access[_-]?|refresh[_-]?)?token|secret|password|cookie|credential/i.test(key);
+}

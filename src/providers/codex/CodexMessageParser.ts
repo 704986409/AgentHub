@@ -1,6 +1,7 @@
 import { classifyCodexMessage, type CodexInboundMessage } from './CodexProtocol.js';
 
 export interface ParsedCodexMessage {
+  raw?: string;
   message?: CodexInboundMessage;
   error?: Error;
 }
@@ -24,12 +25,12 @@ export class CodexMessageParser {
       this.#buffer = this.#buffer.slice(newlineIndex + 1);
       if (line.trim().length > 0) {
         if (Buffer.byteLength(line, 'utf8') > this.maxMessageBytes) {
-          parsed.push({ error: new Error('JSONL message exceeds maximum size') });
+          parsed.push({ raw: line, error: new Error('JSONL message exceeds maximum size') });
         } else {
           try {
-            parsed.push({ message: classifyCodexMessage(JSON.parse(line) as unknown) });
+            parsed.push({ raw: line, message: classifyCodexMessage(JSON.parse(line) as unknown) });
           } catch (error) {
-            parsed.push({ error: error instanceof Error ? error : new Error(String(error)) });
+            parsed.push({ raw: line, error: error instanceof Error ? error : new Error(String(error)) });
           }
         }
       }

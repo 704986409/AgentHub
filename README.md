@@ -28,8 +28,15 @@ Application code should use repositories instead of executing SQL directly.
 
 ## Codex App Server
 
-V0.2.1 uses the locally installed Codex CLI as a long-running `codex app-server`
-child process. Protocol bindings can be regenerated for the current CLI with:
+V0.2.1.1 uses the locally installed Codex CLI as a long-running
+`codex app-server --listen stdio://` child process. On Windows, AgentHub resolves
+and executes the actual `codex.exe` directly; stdin, stdout, and stderr are all
+pipes. The provider does not become ready until it receives `initialize`, then
+sends the `initialized` notification.
+
+Pass `debug: true` to `CodexProvider` or `CodexAppServerClient` to retain a
+redacted in-memory protocol trace. Pass `onDiagnostic` to stream that trace to
+your own logger. Protocol bindings can be regenerated for the current CLI with:
 
 ```bash
 codex app-server generate-ts --out src/providers/codex/generated --experimental

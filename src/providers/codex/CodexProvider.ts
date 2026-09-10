@@ -53,14 +53,15 @@ export class CodexProvider {
     });
   }
 
-  public initialize(): void {
+  public async initialize(): Promise<unknown> {
     if (this.#status !== CodexProviderStatus.STOPPED) throw new Error(`Cannot initialize from ${this.#status}`);
     this.#status = CodexProviderStatus.STARTING;
     this.eventBus?.publish({ eventType: 'CodexProviderStarting' });
     try {
-      this.client.start();
+      const response = await this.client.initialize();
       this.#status = CodexProviderStatus.READY;
       this.eventBus?.publish({ eventType: 'CodexProviderReady' });
+      return response;
     } catch (error) {
       this.#status = CodexProviderStatus.ERROR;
       this.eventBus?.publishSystemError(error, { source: 'codex-start' });
@@ -80,13 +81,9 @@ export class CodexProvider {
     return this.#status;
   }
 
-  public async initializeProtocol(clientInfo = { name: 'agenthub', title: 'AgentHub', version: '0.2.1' }): Promise<unknown> {
-    const response = await this.sendRequest('initialize', {
-      clientInfo,
-      capabilities: { experimentalApi: true, requestAttestation: false },
-    });
-    this.client.notify('initialized');
-    return response;
+  public async initializeProtocol(): Promise<unknown> {
+    if (this.#status !== CodexProviderStatus.STOPPED) throw new Error(`Cannot initialize from ${this.#status}`);
+    return this.initialize();
   }
 
   public sendRequest(method: string, params?: unknown, timeoutMs?: number): Promise<unknown> {
