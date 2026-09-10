@@ -7,7 +7,13 @@ export type CodexDiagnosticEventType =
   | 'process-exit'
   | 'provider-state'
   | 'turn-event'
-  | 'late-turn-event';
+  | 'late-turn-event'
+  | 'directive.parse.start'
+  | 'directive.parse.success'
+  | 'directive.parse.failure'
+  | 'directive.repair.start'
+  | 'directive.repair.completed'
+  | 'directive.repair.failure';
 
 export interface CodexDiagnosticEvent {
   timestamp: string;

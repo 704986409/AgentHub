@@ -1,6 +1,7 @@
 export * from './CodexProtocol.js';
 export * from './CodexDiagnostics.js';
 export * from './CodexManagerTurn.js';
+export * from './CodexManagerDirective.js';
 export * from './CodexMessageParser.js';
 export * from './CodexProcessManager.js';
 export * from './CodexRequestManager.js';

@@ -7,6 +7,7 @@ import {
   type CodexTurnRequest,
   type CodexTurnResult,
 } from './CodexManagerTurn.js';
+import { CodexManagerDirectiveRunner, type ManagerDirectiveTurnResult } from './CodexManagerDirective.js';
 
 export interface CodexProviderOptions extends CodexAppServerClientOptions {
   managerThreadTimeoutMs?: number;
@@ -23,7 +24,7 @@ export enum CodexProviderStatus {
 
 export class NotImplementedInVersionError extends Error {
   public constructor(operation: string) {
-    super(`${operation} is not implemented in V0.2.1.2`);
+    super(`${operation} is not implemented in V0.2.1.3`);
     this.name = 'NotImplementedInVersionError';
   }
 }
@@ -31,6 +32,7 @@ export class NotImplementedInVersionError extends Error {
 export class CodexProvider {
   readonly client: CodexAppServerClient;
   readonly managerTurns: CodexManagerTurnController;
+  readonly managerDirectives: CodexManagerDirectiveRunner;
   #status = CodexProviderStatus.STOPPED;
 
   public constructor(
@@ -48,6 +50,7 @@ export class CodexProvider {
         diagnostics: this.client.diagnostics,
       },
     );
+    this.managerDirectives = new CodexManagerDirectiveRunner(this.managerTurns, this.client.diagnostics);
     this.client.onNotification((method, params) => {
       this.managerTurns.handleNotification(method, params);
       this.eventBus?.publish({ eventType: 'CodexNotificationReceived', payload: summarizeNotification(method, params) });
@@ -118,6 +121,10 @@ export class CodexProvider {
 
   public runTurn(request: CodexTurnRequest): Promise<CodexTurnResult> {
     return this.managerTurns.runTurn(request);
+  }
+
+  public runDirectiveTurn(request: CodexTurnRequest): Promise<ManagerDirectiveTurnResult> {
+    return this.managerDirectives.run(request);
   }
 
   public getManagerThreadId(): string | undefined {
