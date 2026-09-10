@@ -6,3 +6,4 @@ export * from './events/index.js';
 export * from './protocol/index.js';
 export * from './manager/index.js';
 export * from './providers/codex/index.js';
+export * from './providers/claude/index.js';
