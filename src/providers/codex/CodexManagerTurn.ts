@@ -111,6 +111,7 @@ export class CodexManagerTurnController {
   readonly #diagnostics: CodexDiagnostics | undefined;
   #managerSession: CodexManagerSession | undefined;
   #threadCreation: Promise<CodexManagerSession> | undefined;
+  #sessionChangeInProgress = false;
   #pendingTurn: PendingTurn | undefined;
   #lastSettledTurn: { threadId: string; turnId: string | undefined } | undefined;
   #active = false;
@@ -139,6 +140,7 @@ export class CodexManagerTurnController {
 
   public async createManagerThread(): Promise<CodexManagerSession> {
     this.ensureReady();
+    this.ensureNoSessionChangeInProgress();
     if (this.#managerSession !== undefined) return { ...this.#managerSession };
     if (this.#threadCreation !== undefined) return this.#threadCreation;
 
@@ -152,7 +154,7 @@ export class CodexManagerTurnController {
 
   public async startFreshThread(): Promise<CodexSession> {
     this.ensureSessionChangeAllowed();
-    return await this.runSessionRequest(() => this.createManagerThreadRequest());
+    return await this.runExplicitSessionChange(() => this.createManagerThreadRequest());
   }
 
   public async resumeThread(threadId: string): Promise<CodexSession> {
@@ -160,7 +162,7 @@ export class CodexManagerTurnController {
     if (threadId.trim().length === 0) {
       throw new CodexManagerError('provider_error', 'threadId must not be empty', 'INVALID_THREAD_ID');
     }
-    return await this.runSessionRequest(() => this.resumeThreadRequest(threadId));
+    return await this.runExplicitSessionChange(() => this.resumeThreadRequest(threadId));
   }
 
   public async runTurn(request: CodexTurnRequest): Promise<CodexTurnResult> {
@@ -171,6 +173,7 @@ export class CodexManagerTurnController {
     if (this.#active) {
       throw new CodexManagerError('provider_error', 'A Manager turn is already active', 'TURN_ALREADY_ACTIVE');
     }
+    this.ensureNoSessionChangeInProgress();
 
     this.#active = true;
     try {
@@ -330,16 +333,29 @@ export class CodexManagerTurnController {
     if (this.#active) {
       throw new CodexManagerError('provider_error', 'Cannot change session during an active turn', 'TURN_ALREADY_ACTIVE');
     }
+    if (this.#threadCreation !== undefined) this.throwSessionChangeInProgress();
   }
 
-  private async runSessionRequest(request: () => Promise<CodexSession>): Promise<CodexSession> {
-    if (this.#threadCreation !== undefined) return await this.#threadCreation;
-    this.#threadCreation = request();
+  private async runExplicitSessionChange(request: () => Promise<CodexSession>): Promise<CodexSession> {
+    this.ensureNoSessionChangeInProgress();
+    this.#sessionChangeInProgress = true;
     try {
-      return await this.#threadCreation;
+      return await request();
     } finally {
-      this.#threadCreation = undefined;
+      this.#sessionChangeInProgress = false;
     }
+  }
+
+  private ensureNoSessionChangeInProgress(): void {
+    if (this.#sessionChangeInProgress) this.throwSessionChangeInProgress();
+  }
+
+  private throwSessionChangeInProgress(): never {
+    throw new CodexManagerError(
+      'provider_error',
+      'A Codex session change is already in progress',
+      'SESSION_CHANGE_IN_PROGRESS',
+    );
   }
 
   private createPendingTurn(session: CodexManagerSession): PendingTurn {
