@@ -193,4 +193,41 @@ describe('Event Foundation E2E', () => {
     expect(storeJson).toContain('[REDACTED]');
     expect(storedEvents).toHaveLength(2);
   });
+
+  it('preserves audit authorship while redacting authorization through EventBus, EventStore, and SQLite', () => {
+    const observed: unknown[] = [];
+    bus.subscribe((event) => {
+      if (event.eventType === 'AgentAudit') observed.push(event.payload);
+    });
+    const agent = agents.createAgent({ name: 'Audited agent', provider: 'Codex', model: 'm', position: 'Reviewer' });
+    bus.publish({
+      eventType: 'AgentAudit',
+      agentId: agent.id,
+      payload: {
+        authority: 'ADMIN',
+        author: 'Codex',
+        authorId: 'author-1',
+        authenticationMode: 'oauth',
+        authorization: 'Bearer persistence-secret',
+      },
+    });
+
+    const expectedPayload = {
+      authority: 'ADMIN',
+      author: 'Codex',
+      authorId: 'author-1',
+      authenticationMode: 'oauth',
+      authorization: '[REDACTED]',
+    };
+    expect(observed).toContainEqual(expectedPayload);
+
+    const stored = eventStore.list().find((event) => event.eventType === 'AgentAudit');
+    expect(stored?.payload).toEqual(expectedPayload);
+
+    const row = database.connection.prepare(
+      `SELECT payload FROM events WHERE event_type = 'AgentAudit'`,
+    ).get() as { payload: string };
+    expect(JSON.parse(row.payload)).toEqual(expectedPayload);
+    expect(row.payload).not.toContain('persistence-secret');
+  });
 });
