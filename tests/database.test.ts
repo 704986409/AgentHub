@@ -38,9 +38,9 @@ describe('core data foundation', () => {
   });
 
   it('initializes the database and applies migrations idempotently', () => {
-    expect(database.migrationManager.currentVersion()).toBe(2);
+    expect(database.migrationManager.currentVersion()).toBe(3);
     database.initialize();
-    expect(database.migrationManager.currentVersion()).toBe(2);
+    expect(database.migrationManager.currentVersion()).toBe(3);
 
     const tables = database.connection
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")

@@ -55,15 +55,38 @@ export interface CreateTaskInput {
   projectId: string;
   title: string;
   description?: string | null;
+  requiredCapabilities?: string[];
+  requiredSpecialties?: string[];
+  acceptanceCriteria?: string[];
   status?: TaskStatus;
   complexity: TaskComplexity;
   risk: TaskRisk;
+}
+
+export interface UpdateTaskInput {
+  title?: string;
+  description?: string | null;
+  requiredCapabilities?: string[];
+  requiredSpecialties?: string[];
+  acceptanceCriteria?: string[];
+  complexity?: TaskComplexity;
+  risk?: TaskRisk;
+  assignedAgentId?: string | null;
+  assignmentId?: string | null;
 }
 
 export interface CreateAssignmentInput {
   id?: string;
   taskId: string;
   agentId: string;
+  specVersion?: string;
+  profileHash?: string;
+  status?: AssignmentStatus;
+}
+
+export interface UpdateAssignmentInput {
+  specVersion?: string;
+  profileHash?: string;
   status?: AssignmentStatus;
 }
 
@@ -94,12 +117,15 @@ export interface TaskRepository {
   create(input: CreateTaskInput): Task;
   findById(id: string): Task | null;
   list(): Task[];
+  update(id: string, input: UpdateTaskInput): Task;
+  setStatus(id: string, status: TaskStatus): Task;
 }
 
 export interface AssignmentRepository {
   create(input: CreateAssignmentInput): Assignment;
   findById(id: string): Assignment | null;
   list(): Assignment[];
+  update(id: string, input: UpdateAssignmentInput): Assignment;
 }
 
 export interface EventRepository {

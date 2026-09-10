@@ -71,9 +71,14 @@ export interface TaskRow {
   project_id: string;
   title: string;
   description: string | null;
+  required_capabilities: string;
+  required_specialties: string;
+  acceptance_criteria: string;
   status: TaskStatus;
   complexity: TaskComplexity;
   risk: TaskRisk;
+  assigned_agent_id: string | null;
+  assignment_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -83,9 +88,14 @@ export const mapTask = (row: TaskRow): Task => ({
   projectId: row.project_id,
   title: row.title,
   description: row.description,
+  requiredCapabilities: JSON.parse(row.required_capabilities) as string[],
+  requiredSpecialties: JSON.parse(row.required_specialties) as string[],
+  acceptanceCriteria: JSON.parse(row.acceptance_criteria) as string[],
   status: row.status,
   complexity: row.complexity,
   risk: row.risk,
+  assignedAgentId: row.assigned_agent_id,
+  assignmentId: row.assignment_id,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 });
@@ -94,6 +104,8 @@ export interface AssignmentRow {
   id: string;
   task_id: string;
   agent_id: string;
+  spec_version: string;
+  profile_hash: string;
   status: AssignmentStatus;
   created_at: string;
   updated_at: string;
@@ -101,8 +113,11 @@ export interface AssignmentRow {
 
 export const mapAssignment = (row: AssignmentRow): Assignment => ({
   id: row.id,
+  assignmentId: row.id,
   taskId: row.task_id,
   agentId: row.agent_id,
+  specVersion: row.spec_version,
+  profileHash: row.profile_hash,
   status: row.status,
   createdAt: row.created_at,
   updatedAt: row.updated_at,

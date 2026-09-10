@@ -6,12 +6,22 @@ export enum AgentStatus {
 }
 
 export enum TaskStatus {
-  PENDING = 'PENDING',
+  CREATED = 'CREATED',
+  QUEUED = 'QUEUED',
   ASSIGNED = 'ASSIGNED',
-  IN_PROGRESS = 'IN_PROGRESS',
-  COMPLETED = 'COMPLETED',
+  IMPLEMENTING = 'IMPLEMENTING',
+  REVIEWING = 'REVIEWING',
+  REVISION_REQUIRED = 'REVISION_REQUIRED',
+  WAITING_INPUT = 'WAITING_INPUT',
+  WAITING_APPROVAL = 'WAITING_APPROVAL',
+  WAITING_DEPENDENCY = 'WAITING_DEPENDENCY',
+  PAUSED = 'PAUSED',
+  BLOCKED = 'BLOCKED',
   FAILED = 'FAILED',
+  COMPLETED = 'COMPLETED',
   CANCELLED = 'CANCELLED',
+  PENDING = 'PENDING',
+  IN_PROGRESS = 'IN_PROGRESS',
 }
 
 export enum TaskComplexity {
@@ -30,10 +40,13 @@ export enum TaskRisk {
 }
 
 export enum AssignmentStatus {
-  PENDING = 'PENDING',
+  DISPATCHING = 'DISPATCHING',
   ACCEPTED = 'ACCEPTED',
   ACTIVE = 'ACTIVE',
   COMPLETED = 'COMPLETED',
+  RELEASED = 'RELEASED',
+  STALE = 'STALE',
+  PENDING = 'PENDING',
   REJECTED = 'REJECTED',
   CANCELLED = 'CANCELLED',
 }
@@ -85,17 +98,25 @@ export interface Task {
   projectId: string;
   title: string;
   description: string | null;
+  requiredCapabilities: string[];
+  requiredSpecialties: string[];
+  acceptanceCriteria: string[];
   status: TaskStatus;
   complexity: TaskComplexity;
   risk: TaskRisk;
+  assignedAgentId: string | null;
+  assignmentId: string | null;
   createdAt: string;
   updatedAt: string;
 }
 
 export interface Assignment {
   id: string;
+  assignmentId: string;
   taskId: string;
   agentId: string;
+  specVersion: string;
+  profileHash: string;
   status: AssignmentStatus;
   createdAt: string;
   updatedAt: string;

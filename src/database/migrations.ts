@@ -89,4 +89,57 @@ export const migrations: readonly Migration[] = [
       ALTER TABLE agents ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1));
     `,
   },
+  {
+    version: 3,
+    name: 'task_lifecycle_and_assignments',
+    up: `
+      PRAGMA foreign_keys = OFF;
+      CREATE TABLE tasks_new (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        title TEXT NOT NULL CHECK (length(trim(title)) > 0),
+        description TEXT,
+        required_capabilities TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(required_capabilities) AND json_type(required_capabilities) = 'array'),
+        required_specialties TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(required_specialties) AND json_type(required_specialties) = 'array'),
+        acceptance_criteria TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(acceptance_criteria) AND json_type(acceptance_criteria) = 'array'),
+        status TEXT NOT NULL CHECK (status IN ('CREATED','QUEUED','ASSIGNED','IMPLEMENTING','REVIEWING','REVISION_REQUIRED','COMPLETED','WAITING_INPUT','WAITING_APPROVAL','WAITING_DEPENDENCY','PAUSED','BLOCKED','FAILED','CANCELLED','PENDING','IN_PROGRESS')),
+        complexity TEXT NOT NULL CHECK (complexity IN ('TRIVIAL', 'SIMPLE', 'MEDIUM', 'COMPLEX', 'CRITICAL')),
+        risk TEXT NOT NULL CHECK (risk IN ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')),
+        assigned_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+        assignment_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO tasks_new (id, project_id, title, description, status, complexity, risk, created_at, updated_at)
+        SELECT id, project_id, title, description,
+          CASE status WHEN 'PENDING' THEN 'CREATED' WHEN 'IN_PROGRESS' THEN 'IMPLEMENTING' ELSE status END,
+          complexity, risk, created_at, updated_at FROM tasks;
+      CREATE TABLE assignments_backup AS SELECT * FROM assignments;
+      DROP TABLE assignments;
+      DROP TABLE tasks;
+      ALTER TABLE tasks_new RENAME TO tasks;
+      CREATE INDEX idx_tasks_project_id ON tasks(project_id);
+      CREATE INDEX idx_tasks_status ON tasks(status);
+
+      CREATE TABLE assignments (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        spec_version TEXT NOT NULL DEFAULT '1.0.0',
+        profile_hash TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL CHECK (status IN ('DISPATCHING','ACCEPTED','ACTIVE','COMPLETED','RELEASED','STALE','PENDING','REJECTED','CANCELLED')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (task_id, agent_id)
+      );
+      INSERT INTO assignments (id, task_id, agent_id, status, created_at, updated_at)
+        SELECT id, task_id, agent_id,
+          CASE status WHEN 'PENDING' THEN 'DISPATCHING' WHEN 'REJECTED' THEN 'RELEASED' WHEN 'CANCELLED' THEN 'RELEASED' ELSE status END,
+          created_at, updated_at FROM assignments_backup;
+      DROP TABLE assignments_backup;
+      CREATE INDEX idx_assignments_task_id ON assignments(task_id);
+      CREATE INDEX idx_assignments_agent_id ON assignments(agent_id);
+      PRAGMA foreign_keys = ON;
+    `,
+  },
 ];
