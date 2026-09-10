@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 
 import { resolveClaudeExecutable } from './ClaudeExecutableResolver.js';
+import { createClaudeSpawnInvocation } from './ClaudeProcessInvocation.js';
 
 export interface ClaudeCommandResult {
   exitCode: number | null;
@@ -126,7 +127,18 @@ export class SpawnSyncClaudeCommandRunner implements ClaudeCommandRunner {
   ) {}
 
   public run(executable: string, args: readonly string[]): ClaudeCommandResult {
-    const invocation = createSpawnInvocation(executable, args, this.env);
+    let invocation;
+    try {
+      invocation = createClaudeSpawnInvocation(executable, args);
+    } catch (error) {
+      return {
+        exitCode: null,
+        stdout: '',
+        stderr: '',
+        error: error instanceof Error ? error.message : String(error),
+        errorCode: 'CLAUDE_CMD_TARGET_UNRESOLVED',
+      };
+    }
     const result = spawnSync(invocation.executable, invocation.args, {
       encoding: 'utf8',
       env: this.env,
@@ -293,15 +305,6 @@ function unavailableReport(
     checks,
     diagnostics,
   };
-}
-
-function createSpawnInvocation(
-  executable: string,
-  args: readonly string[],
-  env: NodeJS.ProcessEnv,
-): { executable: string; args: readonly string[] } {
-  if (process.platform !== 'win32' || !/\.(?:cmd|bat)$/iu.test(executable)) return { executable, args };
-  return { executable: env.ComSpec ?? 'cmd.exe', args: ['/d', '/c', executable, ...args] };
 }
 
 function containsFlag(helpText: string, flag: string): boolean {
