@@ -144,7 +144,8 @@ export function resolveCodexExecutable(command = 'codex', env: NodeJS.ProcessEnv
       windowsHide: true,
       env,
     });
-    const candidate = result.stdout.split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0);
+    const candidates = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
+    const candidate = candidates.find((line) => /\.exe$/i.test(line)) ?? candidates[0];
     if (candidate !== undefined) return resolveExistingPath(candidate);
   }
 

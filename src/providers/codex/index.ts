@@ -6,4 +6,5 @@ export * from './CodexRequestManager.js';
 export * from './CodexAppServerClient.js';
 export * from './CodexCapabilityDetector.js';
 export * from './CodexProvider.js';
+export * from './CodexEventMapper.js';
 export * from './CodexDoctor.js';
