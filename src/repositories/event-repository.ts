@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { AgentHubEvent } from '../core/types.js';
 import { assertNonEmpty } from '../core/validation.js';
 import type { Database } from '../database/database.js';
+import { redactEventValue } from '../events/event-redaction.js';
 import type { CreateEventInput, EventRepository } from './interfaces.js';
 import { mapEvent, type EventRow } from './mappers.js';
 
@@ -31,7 +32,7 @@ export class SqliteEventRepository implements EventRepository {
         input.entityType.trim(),
         input.entityId ?? null,
         input.eventType.trim(),
-        JSON.stringify(input.payload ?? {}),
+        JSON.stringify(redactEventValue(input.payload ?? {})),
         input.actor ?? null,
         input.oldStatus ?? null,
         input.newStatus ?? null,

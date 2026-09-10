@@ -7,7 +7,15 @@ import {
   type CodexTurnRequest,
   type CodexTurnResult,
 } from '../providers/codex/CodexManagerTurn.js';
-import { CodexProvider, type CodexProviderOptions } from '../providers/codex/CodexProvider.js';
+import {
+  CodexProvider,
+  type CodexNotificationHandler,
+  type CodexProcessErrorHandler,
+  type CodexProcessExitHandler,
+  type CodexProtocolErrorHandler,
+  type CodexProviderOptions,
+  type CodexServerRequestHandler,
+} from '../providers/codex/CodexProvider.js';
 import { ManagerPromptBuilder } from './ManagerPromptBuilder.js';
 
 export interface CodexManagerUseCaseOptions {
@@ -19,6 +27,11 @@ export class CodexManagerUseCase {
   readonly turns: CodexManagerTurnController;
   readonly directives: CodexManagerDirectiveRunner;
   readonly promptBuilder: ManagerPromptBuilder;
+  readonly #notificationHandlers = new Set<CodexNotificationHandler>();
+  readonly #serverRequestHandlers = new Set<CodexServerRequestHandler>();
+  readonly #protocolErrorHandlers = new Set<CodexProtocolErrorHandler>();
+  readonly #processExitHandlers = new Set<CodexProcessExitHandler>();
+  readonly #processErrorHandlers = new Set<CodexProcessErrorHandler>();
   readonly #unsubscribe: Array<() => void>;
 
   public constructor(
@@ -33,10 +46,25 @@ export class CodexManagerUseCase {
     this.directives = new CodexManagerDirectiveRunner(this.turns, provider.client.diagnostics);
     this.promptBuilder = new ManagerPromptBuilder(provider.client.diagnostics);
     this.#unsubscribe = [
-      provider.onNotification((method, params) => this.turns.handleNotification(method, params)),
-      provider.onProtocolError((error) => this.turns.handleProtocolError(error)),
-      provider.onProcessExit((code, signal) => this.turns.handleProcessExit(code, signal)),
-      provider.onProcessError((error) => this.turns.handleProtocolError(error)),
+      provider.onNotification((method, params) => {
+        this.turns.handleNotification(method, params);
+        for (const handler of this.#notificationHandlers) handler(method, params);
+      }),
+      provider.onServerRequest((request) => {
+        for (const handler of this.#serverRequestHandlers) handler(request);
+      }),
+      provider.onProtocolError((error) => {
+        this.turns.handleProtocolError(error);
+        for (const handler of this.#protocolErrorHandlers) handler(error);
+      }),
+      provider.onProcessExit((code, signal) => {
+        this.turns.handleProcessExit(code, signal);
+        for (const handler of this.#processExitHandlers) handler(code, signal);
+      }),
+      provider.onProcessError((error) => {
+        this.turns.handleProtocolError(error);
+        for (const handler of this.#processErrorHandlers) handler(error);
+      }),
     ];
   }
 
@@ -68,6 +96,36 @@ export class CodexManagerUseCase {
   public dispose(): void {
     this.turns.stop();
     for (const unsubscribe of this.#unsubscribe.splice(0)) unsubscribe();
+    this.#notificationHandlers.clear();
+    this.#serverRequestHandlers.clear();
+    this.#protocolErrorHandlers.clear();
+    this.#processExitHandlers.clear();
+    this.#processErrorHandlers.clear();
+  }
+
+  public onNotification(handler: CodexNotificationHandler): () => void {
+    this.#notificationHandlers.add(handler);
+    return () => this.#notificationHandlers.delete(handler);
+  }
+
+  public onServerRequest(handler: CodexServerRequestHandler): () => void {
+    this.#serverRequestHandlers.add(handler);
+    return () => this.#serverRequestHandlers.delete(handler);
+  }
+
+  public onProtocolError(handler: CodexProtocolErrorHandler): () => void {
+    this.#protocolErrorHandlers.add(handler);
+    return () => this.#protocolErrorHandlers.delete(handler);
+  }
+
+  public onProcessExit(handler: CodexProcessExitHandler): () => void {
+    this.#processExitHandlers.add(handler);
+    return () => this.#processExitHandlers.delete(handler);
+  }
+
+  public onProcessError(handler: CodexProcessErrorHandler): () => void {
+    this.#processErrorHandlers.add(handler);
+    return () => this.#processErrorHandlers.delete(handler);
   }
 
   public createManagerThread(): Promise<CodexManagerSession> {

@@ -61,6 +61,37 @@ describe('Codex app-server process integration', () => {
     expect(provider.client.processManager.running).toBe(false);
   }, 30_000);
 
+  it('restarts the same Provider and Client with a fresh handshake and process', async () => {
+    const manager = createManagerUseCase('success', 2_000, true);
+
+    await manager.initialize();
+    const firstProcess = manager.client.processManager.process;
+    const firstPid = manager.client.processManager.pid;
+    expect(manager.getStatus()).toBe(CodexProviderStatus.READY);
+    await manager.shutdown();
+    expect(manager.getStatus()).toBe(CodexProviderStatus.STOPPED);
+    expect(manager.client.processManager.running).toBe(false);
+
+    await manager.initialize();
+    const secondProcess = manager.client.processManager.process;
+    const secondPid = manager.client.processManager.pid;
+    expect(manager.getStatus()).toBe(CodexProviderStatus.READY);
+    expect(secondProcess).not.toBe(firstProcess);
+    expect(secondPid).not.toBe(firstPid);
+    const outbound = manager.client.diagnostics.snapshot().filter((event) => event.type === 'outbound');
+    expect(outbound.filter((event) => event.details.method === 'initialize')).toHaveLength(2);
+    expect(outbound.filter((event) => event.details.method === 'initialized')).toHaveLength(2);
+    expect(manager.client.requestManager.pendingCount).toBe(0);
+    expect(manager.pendingTurnCount).toBe(0);
+
+    await manager.shutdown();
+    expect(manager.getStatus()).toBe(CodexProviderStatus.STOPPED);
+    expect(manager.client.processManager.process).toBeNull();
+    expect(manager.client.processManager.running).toBe(false);
+    expect(manager.client.requestManager.pendingCount).toBe(0);
+    expect(manager.pendingTurnCount).toBe(0);
+  });
+
   it('runs a complete Manager turn through the fake app-server and reuses its thread', async () => {
     const provider = createManagerUseCase('success', 2_000, true);
     await provider.initialize();

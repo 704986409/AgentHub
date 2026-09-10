@@ -2,6 +2,7 @@ import type { AgentHubEvent } from '../core/types.js';
 import type { EventRepository } from '../repositories/interfaces.js';
 import type { DomainEvent } from './event-bus.js';
 import type { EventBus } from './event-bus.js';
+import { redactEventValue } from './event-redaction.js';
 
 export class EventStore {
   readonly #unsubscribe: () => void;
@@ -22,9 +23,9 @@ export class EventStore {
       agentId: event.agentId,
       taskId: event.taskId,
       assignmentId: event.assignmentId,
-      entityType: event.agentId ? 'agent' : event.taskId ? 'task' : event.assignmentId ? 'assignment' : 'system',
-      entityId: event.agentId ?? event.taskId ?? event.assignmentId ?? null,
-      payload: event.payload,
+      entityType: event.assignmentId ? 'assignment' : event.taskId ? 'task' : event.agentId ? 'agent' : 'system',
+      entityId: event.assignmentId ?? event.taskId ?? event.agentId ?? null,
+      payload: redactEventValue(event.payload),
       actor: event.actor,
       oldStatus: event.oldStatus,
       newStatus: event.newStatus,

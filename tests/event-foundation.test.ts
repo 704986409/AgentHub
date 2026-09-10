@@ -9,6 +9,7 @@ import {
   AgentRegistry,
   AgentStatus,
   AssignmentManager,
+  CodexProvider,
   Database,
   DomainEventType,
   EventBus,
@@ -29,6 +30,7 @@ describe('Event Foundation E2E', () => {
   let database: Database;
   let directory: string;
   let eventStore: EventStore;
+  let bus: EventBus;
   let agents: AgentRegistry;
   let tasks: TaskManager;
   let assignments: AssignmentManager;
@@ -37,7 +39,7 @@ describe('Event Foundation E2E', () => {
     directory = mkdtempSync(join(tmpdir(), 'agenthub-event-'));
     database = new Database(join(directory, 'agenthub.db'));
     database.initialize();
-    const bus = new EventBus();
+    bus = new EventBus();
     eventStore = new EventStore(new SqliteEventRepository(database), bus);
     const profiles = new AgentProfileManager({ agentsDirectory: join(directory, 'data', 'agents') });
     agents = new AgentRegistry(new SqliteAgentRepository(database), profiles, bus);
@@ -125,5 +127,70 @@ describe('Event Foundation E2E', () => {
     expect(recoveredTasks.findById(task.id)?.status).toBe(TaskStatus.IMPLEMENTING);
     expect(recoveredAssignments.findById(assignment.id)?.status).toBe('ACTIVE');
     expect(recoveredEvents.list()).toHaveLength(before);
+  });
+
+  it('classifies assignment, task, agent, and system events by the most specific entity', () => {
+    const project = new SqliteProjectRepository(database).create({ name: 'Classification project' });
+    const agent = agents.createAgent({ name: 'Classifier', provider: 'Codex', model: 'm', position: 'Worker' });
+    const task = tasks.createTask({
+      projectId: project.id,
+      title: 'Classification task',
+      complexity: TaskComplexity.SIMPLE,
+      risk: TaskRisk.LOW,
+    });
+    const assignment = assignments.createAssignment({ taskId: task.id, agentId: agent.id });
+
+    bus.publish({ eventType: 'AssignmentAudit', agentId: agent.id, taskId: task.id, assignmentId: assignment.id });
+    bus.publish({ eventType: 'TaskAudit', agentId: agent.id, taskId: task.id });
+    bus.publish({ eventType: 'AgentAudit', agentId: agent.id });
+    bus.publish({ eventType: 'SystemAudit' });
+
+    const byType = new Map(eventStore.list().map((event) => [event.eventType, event]));
+    expect(byType.get('AssignmentAudit')).toMatchObject({ entityType: 'assignment', entityId: assignment.id });
+    expect(byType.get('TaskAudit')).toMatchObject({ entityType: 'task', entityId: task.id });
+    expect(byType.get('AgentAudit')).toMatchObject({ entityType: 'agent', entityId: agent.id });
+    expect(byType.get('SystemAudit')).toMatchObject({ entityType: 'system', entityId: null });
+  });
+
+  it('redacts sensitive Codex payloads on the bus and in EventStore and SQLite', () => {
+    const observed: unknown[] = [];
+    bus.subscribe((event) => observed.push(event.payload));
+    const provider = new CodexProvider({}, bus);
+    const secrets = [
+      'authorization-secret',
+      'token-secret',
+      'api-key-secret',
+      'nested-secret',
+      'password-secret',
+      'credential-secret',
+      'stderr-secret',
+    ];
+    provider.client.processManager.emit('stdout', Buffer.from(`${JSON.stringify({
+      id: 'sensitive-request',
+      method: 'item/permissions/requestApproval',
+      params: {
+        authorization: 'Bearer authorization-secret',
+        token: 'token-secret',
+        apiKey: 'api-key-secret',
+        nested: { secret: 'nested-secret', password: 'password-secret', credential: 'credential-secret' },
+      },
+    })}\n`));
+    provider.client.processManager.emit('stderr', Buffer.from('secret=stderr-secret\n'));
+
+    const busJson = JSON.stringify(observed);
+    const storedEvents = eventStore.list().filter((event) =>
+      event.eventType === 'CodexServerRequestReceived' || event.eventType === 'CodexProviderError');
+    const storeJson = JSON.stringify(storedEvents);
+    const rows = database.connection.prepare(
+      `SELECT payload FROM events WHERE event_type IN ('CodexServerRequestReceived', 'CodexProviderError')`,
+    ).all() as Array<{ payload: string }>;
+    const sqliteJson = JSON.stringify(rows);
+    for (const secret of secrets) {
+      expect(busJson).not.toContain(secret);
+      expect(storeJson).not.toContain(secret);
+      expect(sqliteJson).not.toContain(secret);
+    }
+    expect(storeJson).toContain('[REDACTED]');
+    expect(storedEvents).toHaveLength(2);
   });
 });

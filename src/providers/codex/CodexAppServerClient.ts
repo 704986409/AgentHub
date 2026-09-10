@@ -45,6 +45,7 @@ export class CodexAppServerClient {
     this.processManager.on('stderr', (chunk: Buffer) => this.handleStderr(chunk));
     this.processManager.on('exit', (exit: { code: number | null; signal: NodeJS.Signals | null }) => {
       this.requestManager.rejectAll(new Error(`Codex app-server exited (code=${String(exit.code)}, signal=${String(exit.signal)})`));
+      this.resetConnectionState();
     });
     this.processManager.on('error', (error: Error) => this.requestManager.rejectAll(error));
   }
@@ -97,7 +98,11 @@ export class CodexAppServerClient {
 
   public async stop(): Promise<void> {
     this.requestManager.rejectAll(new Error('Codex provider is stopping'));
-    await this.processManager.stop();
+    try {
+      await this.processManager.stop();
+    } finally {
+      this.resetConnectionState();
+    }
   }
 
   private handleChunk(chunk: Buffer): void {
@@ -140,5 +145,11 @@ export class CodexAppServerClient {
     const raw = JSON.stringify(message);
     this.diagnostics.record('outbound', { ...details, raw: redactProtocolLine(raw), newline: true });
     this.processManager.write(`${raw}\n`);
+  }
+
+  private resetConnectionState(): void {
+    this.#initializeResponseReceived = false;
+    this.#initialized = false;
+    this.#parser.reset();
   }
 }

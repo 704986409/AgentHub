@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type { DomainEventType } from '../core/types.js';
+import { redactEventValue } from './event-redaction.js';
 
 export interface DomainEvent {
   eventId: string;
@@ -29,6 +30,7 @@ export class EventBus {
   public publish(event: Omit<DomainEvent, 'eventId' | 'timestamp'> & Partial<Pick<DomainEvent, 'eventId' | 'timestamp'>>): DomainEvent {
     const complete: DomainEvent = {
       ...event,
+      ...(event.payload === undefined ? {} : { payload: redactEventValue(event.payload) }),
       eventId: event.eventId ?? randomUUID(),
       timestamp: event.timestamp ?? new Date().toISOString(),
       actor: event.actor ?? 'system',

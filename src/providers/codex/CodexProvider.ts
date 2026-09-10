@@ -1,4 +1,5 @@
 import type { EventBus } from '../../events/event-bus.js';
+import { redactEventValue } from '../../events/event-redaction.js';
 import type { CodexAppServerClientOptions } from './CodexAppServerClient.js';
 import { CodexAppServerClient } from './CodexAppServerClient.js';
 import type { CodexServerRequest } from './CodexProtocol.js';
@@ -39,7 +40,7 @@ export class CodexProvider {
     });
     this.client.onServerRequest((request) => {
       for (const handler of this.#serverRequestHandlers) handler(request);
-      this.eventBus?.publish({ eventType: 'CodexServerRequestReceived', payload: request, actor: 'codex' });
+      this.eventBus?.publish({ eventType: 'CodexServerRequestReceived', payload: redactEventValue(request), actor: 'codex' });
     });
     this.client.onProtocolError((error) => {
       for (const handler of this.#protocolErrorHandlers) handler(error);
@@ -61,7 +62,10 @@ export class CodexProvider {
       this.eventBus?.publish({ eventType: 'CodexProviderError', payload: { message: error.message } });
     });
     this.client.processManager.on('stderr', (chunk: Buffer) => {
-      this.eventBus?.publish({ eventType: 'CodexProviderError', payload: { stderr: chunk.toString('utf8').slice(-2_000) } });
+      this.eventBus?.publish({
+        eventType: 'CodexProviderError',
+        payload: { stderr: redactEventValue(chunk.toString('utf8').slice(-2_000)) },
+      });
     });
   }
 
