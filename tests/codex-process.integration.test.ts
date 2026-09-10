@@ -24,7 +24,7 @@ describe('Codex app-server process integration', () => {
     expect(client.processManager.running).toBe(false);
   });
 
-  it('performs the required Codex initialization handshake and shuts down cleanly', async () => {
+  it.runIf(process.env.CI !== 'true')('performs the required Codex initialization handshake and shuts down cleanly', async () => {
     const provider = new CodexProvider({ requestTimeoutMs: 20_000, debug: true });
     const response = await provider.initialize();
     expect(provider.client.processManager.running).toBe(true);

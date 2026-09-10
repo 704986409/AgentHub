@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   CodexCapabilityDetector,
+  CodexDiagnostics,
   redactProtocolLine,
   CodexMessageParser,
   CodexRequestManager,
@@ -55,10 +56,43 @@ describe('Codex protocol foundation', () => {
   });
 
   it('redacts credential-shaped fields before a raw protocol line is logged', () => {
-    const json = redactProtocolLine('{"access_token":"sensitive","token":"also-sensitive","ok":true}');
+    const json = redactProtocolLine('{"authority":"ADMIN","author":"Codex","authorId":"author-1","authenticationMode":"oauth","authorization":"Bearer secret","access_token":"sensitive","apiKey":"also-sensitive","ok":true}');
     expect(json).not.toContain('sensitive');
     expect(json).toContain('[REDACTED]');
+    expect(JSON.parse(json)).toMatchObject({
+      authority: 'ADMIN',
+      author: 'Codex',
+      authorId: 'author-1',
+      authenticationMode: 'oauth',
+      authorization: '[REDACTED]',
+      access_token: '[REDACTED]',
+      apiKey: '[REDACTED]',
+    });
     expect(redactProtocolLine('authorization: bearer-sensitive')).toBe('authorization: [REDACTED]');
+  });
+
+  it('uses precise shared redaction for diagnostics while hiding reasoning and text', () => {
+    const diagnostics = new CodexDiagnostics(true);
+    diagnostics.record('outbound', {
+      authority: 'ADMIN',
+      author: 'Codex',
+      authenticationMode: 'oauth',
+      authorization: 'Bearer secret',
+      credentials: 'secret credentials',
+      text: 'private prompt',
+      item: { type: 'reasoning', id: 'reason-1', content: ['private reasoning'] },
+    });
+    const details = diagnostics.snapshot()[0]?.details;
+    expect(details).toMatchObject({
+      authority: 'ADMIN',
+      author: 'Codex',
+      authenticationMode: 'oauth',
+      authorization: '[REDACTED]',
+      credentials: '[REDACTED]',
+      text: '[TEXT 14 chars]',
+      item: { type: 'reasoning', id: 'reason-1', content: '[REDACTED]' },
+    });
+    expect(JSON.stringify(details)).not.toContain('private');
   });
 
   it('reports invalid JSON and overlong messages without crashing', () => {
@@ -85,11 +119,41 @@ describe('Codex protocol foundation', () => {
     await expect(manager.request('timeout', undefined, 5)).rejects.toThrow(/timed out/);
   });
 
-  it('detects the installed Codex CLI and reports doctor output', () => {
+  it.runIf(process.env.CI !== 'true')('detects the installed Codex CLI and reports doctor output', () => {
     const capabilities = new CodexCapabilityDetector().detect();
     expect(capabilities.installed).toBe(true);
     expect(capabilities.version).toContain('0.153.4');
     expect(capabilities.appServer).toBe(true);
-    expect(new CodexDoctor().format()).toContain('Codex CLI          PASS');
+    const report = new CodexDoctor().run();
+    expect(report.ok).toBe(true);
+    expect(new CodexDoctor().format(report)).toContain('Codex executable');
+  });
+
+  it('returns a structured full Doctor report including handshake and schema checks', async () => {
+    const capabilities = {
+      executablePath: 'C:\\codex.exe',
+      executableResolved: true,
+      executableExists: true,
+      installed: true,
+      version: 'codex-cli fixture',
+      appServer: true,
+      generateTs: true,
+      generateJsonSchema: true,
+      environment: 'win32' as const,
+      windowsExecutableResolution: true,
+    };
+    let stopped = false;
+    const doctor = new CodexDoctor(
+      { detect: () => capabilities },
+      () => ({ initialize: () => Promise.resolve({}), stop: () => { stopped = true; return Promise.resolve(); } }),
+    );
+    const report = await doctor.runFull();
+    expect(report.ok).toBe(true);
+    expect(report.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'Handshake capability', status: 'PASS' }),
+      expect.objectContaining({ name: 'Schema generation capability', status: 'PASS' }),
+      expect.objectContaining({ name: 'Diagnostics redaction', status: 'PASS' }),
+    ]));
+    expect(stopped).toBe(true);
   });
 });

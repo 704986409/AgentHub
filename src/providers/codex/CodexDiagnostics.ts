@@ -1,4 +1,9 @@
 import type { ManagerPromptDiagnosticEventType } from '../../manager/ManagerPromptDiagnostics.js';
+import {
+  isSensitiveKey,
+  REDACTED_VALUE,
+  redactSensitiveAssignments,
+} from '../../events/sensitive-key-policy.js';
 
 export type CodexDiagnosticEventType =
   | ManagerPromptDiagnosticEventType
@@ -59,28 +64,21 @@ export function redactProtocolLine(line: string): string {
   try {
     return JSON.stringify(redactValue(JSON.parse(line) as unknown));
   } catch {
-    return line.replace(
-      /((?:authorization|auth|api[_-]?key|(?:access[_-]?|refresh[_-]?)?token|secret|password|cookie|credential)\s*[:=]\s*)\S+/gi,
-      '$1[REDACTED]',
-    );
+    return redactSensitiveAssignments(line, true);
   }
 }
 
 function redactValue(value: unknown, key?: string): unknown {
-  if (key !== undefined && isSensitiveKey(key)) return '[REDACTED]';
+  if (key !== undefined && isSensitiveKey(key)) return REDACTED_VALUE;
   if ((key === 'text' || key === 'delta') && typeof value === 'string') return `[TEXT ${String(value.length)} chars]`;
   if (Array.isArray(value)) return value.map((item) => redactValue(item));
   if (typeof value === 'object' && value !== null) {
     if ('type' in value && value.type === 'reasoning') {
-      return { type: 'reasoning', id: 'id' in value ? value.id : undefined, content: '[REDACTED]' };
+      return { type: 'reasoning', id: 'id' in value ? value.id : undefined, content: REDACTED_VALUE };
     }
     return Object.fromEntries(
       Object.entries(value).map(([entryKey, entryValue]) => [entryKey, redactValue(entryValue, entryKey)]),
     );
   }
   return value;
-}
-
-function isSensitiveKey(key: string): boolean {
-  return /authorization|auth|api[_-]?key|(?:access[_-]?|refresh[_-]?)?token|secret|password|cookie|credential/i.test(key);
 }

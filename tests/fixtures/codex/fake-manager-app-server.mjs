@@ -33,6 +33,10 @@ function handle(message) {
     return;
   }
   if (message.method === 'initialize') {
+    if (scenario === 'initialize-malformed') {
+      process.stdout.write('{not-json}\n');
+      return;
+    }
     send({ id: message.id, result: { platformFamily: 'fixture', platformOs: 'fixture' } });
     return;
   }
@@ -45,7 +49,41 @@ function handle(message) {
       send({ id: message.id, error: { code: -32000, message: 'not initialized' } });
       return;
     }
-    send({ id: message.id, result: { thread: { id: 'manager-thread-1', sessionId: 'manager-session-1' } } });
+    send({
+      id: message.id,
+      result: {
+        thread: scenario === 'start-missing-session'
+          ? { id: 'manager-thread-1' }
+          : { id: 'manager-thread-1', sessionId: 'manager-session-1' },
+      },
+    });
+    return;
+  }
+  if (message.method === 'thread/resume') {
+    if (!initialized) {
+      send({ id: message.id, error: { code: -32000, message: 'not initialized' } });
+      return;
+    }
+    if (scenario === 'resume-not-found') {
+      send({ id: message.id, error: { code: -32004, message: 'thread not found' } });
+      return;
+    }
+    if (scenario === 'resume-mismatched-thread') {
+      send({ id: message.id, result: { thread: { id: 'different-thread', sessionId: 'resume-session-different' } } });
+      return;
+    }
+    if (scenario === 'resume-missing-session') {
+      send({ id: message.id, result: { thread: { id: message.params.threadId } } });
+      return;
+    }
+    if (message.params.threadId !== 'manager-thread-1') {
+      send({ id: message.id, error: { code: -32004, message: 'unexpected thread id' } });
+      return;
+    }
+    send({
+      id: message.id,
+      result: { thread: { id: message.params.threadId, sessionId: 'manager-session-resumed-different' } },
+    });
     return;
   }
   if (message.method === 'turn/start') {

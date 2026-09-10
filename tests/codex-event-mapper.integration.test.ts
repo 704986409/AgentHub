@@ -48,6 +48,28 @@ describe('Codex event mapper integration', () => {
     mapper.dispose();
     await manager.shutdown();
   });
+
+  it('publishes one ProviderError and one codex-start SystemError for initialization protocol failure', async () => {
+    const bus = new EventBus();
+    const events: DomainEvent[] = [];
+    bus.subscribe((event) => events.push(event));
+    const manager = CodexManagerUseCase.create({
+      command: process.execPath,
+      args: [fixturePath, 'initialize-malformed'],
+    }, {}, bus);
+    const mapper = new CodexEventMapper({ eventBus: bus, source: manager, context: { provider: 'codex' } });
+    mapper.attach();
+
+    await expect(manager.initialize()).rejects.toThrow();
+    const runtimeTypes = events.map((event) => event.eventType);
+    expect(runtimeTypes.filter((type) => type === 'ProviderError')).toHaveLength(1);
+    expect(runtimeTypes.filter((type) => type === 'SystemError')).toHaveLength(1);
+    expect(runtimeTypes).not.toContain('CodexProviderError');
+    expect(runtimeTypes).not.toContain('CodexNotificationReceived');
+    await manager.shutdown();
+    mapper.dispose();
+    manager.dispose();
+  });
 });
 
 function createFixture(scenario: string): { manager: CodexManagerUseCase; events: DomainEvent[]; mapper: CodexEventMapper } {

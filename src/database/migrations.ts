@@ -161,4 +161,17 @@ export const migrations: readonly Migration[] = [
       CREATE INDEX idx_events_assignment_id ON events(assignment_id);
     `,
   },
+  {
+    version: 5,
+    name: 'codex_session_persistence',
+    up: `
+      CREATE TABLE codex_sessions (
+        session_key TEXT PRIMARY KEY CHECK (length(trim(session_key)) BETWEEN 1 AND 256),
+        thread_id TEXT NOT NULL CHECK (length(trim(thread_id)) > 0),
+        session_id TEXT NOT NULL CHECK (length(trim(session_id)) > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
 ];

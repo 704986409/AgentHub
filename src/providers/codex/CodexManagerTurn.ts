@@ -1,10 +1,8 @@
 import type { CodexDiagnostics } from './CodexDiagnostics.js';
 import { normalizeCodexErrorCode } from './CodexError.js';
+import type { CodexSession } from './session/CodexSessionStore.js';
 
-export interface CodexManagerSession {
-  threadId: string;
-  sessionId: string;
-}
+export type CodexManagerSession = CodexSession;
 
 export interface CodexTurnRequest {
   prompt: string;
@@ -152,6 +150,19 @@ export class CodexManagerTurnController {
     }
   }
 
+  public async startFreshThread(): Promise<CodexSession> {
+    this.ensureSessionChangeAllowed();
+    return await this.runSessionRequest(() => this.createManagerThreadRequest());
+  }
+
+  public async resumeThread(threadId: string): Promise<CodexSession> {
+    this.ensureSessionChangeAllowed();
+    if (threadId.trim().length === 0) {
+      throw new CodexManagerError('provider_error', 'threadId must not be empty', 'INVALID_THREAD_ID');
+    }
+    return await this.runSessionRequest(() => this.resumeThreadRequest(threadId));
+  }
+
   public async runTurn(request: CodexTurnRequest): Promise<CodexTurnResult> {
     this.ensureReady();
     if (request.prompt.trim().length === 0) {
@@ -275,6 +286,60 @@ export class CodexManagerTurnController {
     }
     this.#managerSession = { threadId, sessionId };
     return { ...this.#managerSession };
+  }
+
+  private async resumeThreadRequest(requestedThreadId: string): Promise<CodexSession> {
+    let response: unknown;
+    try {
+      response = await this.transport.request(
+        'thread/resume',
+        { threadId: requestedThreadId },
+        this.#threadRequestTimeoutMs,
+      );
+    } catch (error) {
+      const failure = classifyRequestFailure(error);
+      throw new CodexManagerError(
+        failure.kind,
+        `thread/resume failed: ${failure.message}`,
+        failure.code ?? 'THREAD_RESUME_FAILED',
+      );
+    }
+    const thread = readRecordField(response, 'thread');
+    const threadId = readNonEmptyString(thread, 'id');
+    const sessionId = readNonEmptyString(thread, 'sessionId');
+    if (threadId === undefined || sessionId === undefined) {
+      throw new CodexManagerError(
+        'protocol_error',
+        'thread/resume response is missing thread.id or thread.sessionId',
+        'INVALID_RESUME_RESPONSE',
+      );
+    }
+    if (threadId !== requestedThreadId) {
+      throw new CodexManagerError(
+        'protocol_error',
+        `thread/resume returned unexpected thread.id ${threadId}`,
+        'RESUME_THREAD_MISMATCH',
+      );
+    }
+    this.#managerSession = { threadId, sessionId };
+    return { ...this.#managerSession };
+  }
+
+  private ensureSessionChangeAllowed(): void {
+    this.ensureReady();
+    if (this.#active) {
+      throw new CodexManagerError('provider_error', 'Cannot change session during an active turn', 'TURN_ALREADY_ACTIVE');
+    }
+  }
+
+  private async runSessionRequest(request: () => Promise<CodexSession>): Promise<CodexSession> {
+    if (this.#threadCreation !== undefined) return await this.#threadCreation;
+    this.#threadCreation = request();
+    try {
+      return await this.#threadCreation;
+    } finally {
+      this.#threadCreation = undefined;
+    }
   }
 
   private createPendingTurn(session: CodexManagerSession): PendingTurn {

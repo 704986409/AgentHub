@@ -38,16 +38,16 @@ describe('core data foundation', () => {
   });
 
   it('initializes the database and applies migrations idempotently', () => {
-    expect(database.migrationManager.currentVersion()).toBe(4);
+    expect(database.migrationManager.currentVersion()).toBe(5);
     database.initialize();
-    expect(database.migrationManager.currentVersion()).toBe(4);
+    expect(database.migrationManager.currentVersion()).toBe(5);
 
     const tables = database.connection
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
       .all()
       .map((row) => (row as { name: string }).name);
     expect(tables).toEqual(
-      expect.arrayContaining(['agents', 'assignments', 'events', 'projects', 'schema_migrations', 'settings', 'tasks']),
+      expect.arrayContaining(['agents', 'assignments', 'codex_sessions', 'events', 'projects', 'schema_migrations', 'settings', 'tasks']),
     );
   });
 

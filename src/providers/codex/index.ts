@@ -9,3 +9,4 @@ export * from './CodexCapabilityDetector.js';
 export * from './CodexProvider.js';
 export * from './CodexEventMapper.js';
 export * from './CodexDoctor.js';
+export * from './session/index.js';

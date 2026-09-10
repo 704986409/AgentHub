@@ -1,7 +1,13 @@
 import type { EventBus } from '../events/event-bus.js';
 import type { ManagerPromptEnvelope } from '../protocol/PromptEnvelope.js';
 import { CodexManagerDirectiveRunner, type ManagerDirectiveTurnResult } from '../providers/codex/CodexManagerDirective.js';
+import type {
+  CodexSession,
+  CodexSessionRecord,
+  CodexSessionStore,
+} from '../providers/codex/session/CodexSessionStore.js';
 import {
+  CodexManagerError,
   CodexManagerTurnController,
   type CodexManagerSession,
   type CodexTurnRequest,
@@ -21,6 +27,11 @@ import { ManagerPromptBuilder } from './ManagerPromptBuilder.js';
 export interface CodexManagerUseCaseOptions {
   threadRequestTimeoutMs?: number;
   turnTimeoutMs?: number;
+  sessionStore?: CodexSessionStore;
+}
+
+export interface StartCodexSessionOptions {
+  replaceExisting?: boolean;
 }
 
 export class CodexManagerUseCase {
@@ -33,6 +44,7 @@ export class CodexManagerUseCase {
   readonly #processExitHandlers = new Set<CodexProcessExitHandler>();
   readonly #processErrorHandlers = new Set<CodexProcessErrorHandler>();
   readonly #unsubscribe: Array<() => void>;
+  readonly #sessionStore: CodexSessionStore | undefined;
 
   public constructor(
     readonly provider: CodexProvider,
@@ -45,6 +57,7 @@ export class CodexManagerUseCase {
     });
     this.directives = new CodexManagerDirectiveRunner(this.turns, provider.client.diagnostics);
     this.promptBuilder = new ManagerPromptBuilder(provider.client.diagnostics);
+    this.#sessionStore = options.sessionStore;
     this.#unsubscribe = [
       provider.onNotification((method, params) => {
         this.turns.handleNotification(method, params);
@@ -132,6 +145,35 @@ export class CodexManagerUseCase {
     return this.turns.createManagerThread();
   }
 
+  public async startSession(sessionKey: string, options: StartCodexSessionOptions = {}): Promise<CodexSession> {
+    const store = this.requireSessionStore();
+    if (store.get(sessionKey) !== undefined && options.replaceExisting !== true) {
+      throw new CodexManagerError('provider_error', `Codex session already exists: ${sessionKey}`, 'SESSION_EXISTS');
+    }
+    const session = await this.turns.startFreshThread();
+    store.save(sessionKey, session);
+    return session;
+  }
+
+  public async resumeSession(sessionKey: string): Promise<CodexSession> {
+    const store = this.requireSessionStore();
+    const persisted = store.get(sessionKey);
+    if (persisted === undefined) {
+      throw new CodexManagerError('provider_error', `Codex session was not found: ${sessionKey}`, 'SESSION_NOT_FOUND');
+    }
+    const session = await this.turns.resumeThread(persisted.threadId);
+    store.save(sessionKey, session);
+    return session;
+  }
+
+  public getPersistedSession(sessionKey: string): CodexSessionRecord | undefined {
+    return this.requireSessionStore().get(sessionKey);
+  }
+
+  public deletePersistedSession(sessionKey: string): void {
+    this.requireSessionStore().delete(sessionKey);
+  }
+
   public runTurn(request: CodexTurnRequest): Promise<CodexTurnResult> {
     return this.turns.runTurn(request);
   }
@@ -151,5 +193,12 @@ export class CodexManagerUseCase {
 
   public get pendingTurnCount(): number {
     return this.turns.pendingTurnCount;
+  }
+
+  private requireSessionStore(): CodexSessionStore {
+    if (this.#sessionStore === undefined) {
+      throw new CodexManagerError('provider_error', 'Codex session store is not configured', 'SESSION_STORE_REQUIRED');
+    }
+    return this.#sessionStore;
   }
 }
