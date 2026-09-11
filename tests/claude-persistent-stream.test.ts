@@ -187,6 +187,44 @@ describe('Claude persistent-stream transport', () => {
     await transport.shutdown();
   });
 
+  it('separates reused assistant IDs at user boundaries without cross-turn leakage', async () => {
+    const harness = new PersistentHarness(['persistent-same-id-collision']);
+    const transport = createTransport(harness);
+    await transport.start();
+
+    const first = await transport.runTurn({ prompt: 'one' });
+    const second = await transport.runTurn({ prompt: 'two' });
+
+    expect(first.resultText).toBe('FINAL_1');
+    expect(second.resultText).toBe('FINAL_2');
+    expect(first.resultText).not.toContain('INTERMEDIATE_1');
+    expect(second.resultText).not.toContain('INTERMEDIATE_2');
+    expect(second.resultText).not.toContain('FINAL_1');
+    expect(first.messageTypes).toEqual([
+      'system', 'assistant', 'user', 'assistant', 'user', 'assistant', 'assistant', 'result',
+    ]);
+    expect(second.messageTypes).toEqual([
+      'assistant', 'user', 'assistant', 'user', 'assistant', 'assistant', 'result',
+    ]);
+    expect(first.processId).toBe(second.processId);
+    await transport.shutdown();
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('resets the per-turn reconstruction size counter at a user boundary', async () => {
+    const harness = new PersistentHarness(['persistent-assistant-limit-reset']);
+    const transport = createTransport(harness);
+    await transport.start();
+
+    const first = await transport.runTurn({ prompt: 'one' });
+    const second = await transport.runTurn({ prompt: 'two' });
+
+    expect(first.resultText).toBe('FINAL_AFTER_RESET_1');
+    expect(second.resultText).toBe('FINAL_AFTER_RESET_2');
+    await transport.shutdown();
+    expect(harness.allStopped()).toBe(true);
+  });
+
   it('falls back to terminal result when no valid assistant message ID can be reconstructed', async () => {
     const harness = new PersistentHarness(['persistent-success']);
     const transport = createTransport(harness);

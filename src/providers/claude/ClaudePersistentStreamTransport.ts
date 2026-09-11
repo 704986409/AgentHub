@@ -406,6 +406,7 @@ export class ClaudePersistentStreamTransport {
     }
     const turn = this.#activeTurn;
     if (turn !== undefined && typeof message.type === 'string') turn.messageTypes.push(message.type);
+    if (turn !== undefined && message.type === 'user') resetAssistantText(turn.assistantText);
     if (turn !== undefined && message.type === 'assistant') collectAssistantText(turn.assistantText, message);
 
     if (message.type === 'result') {
@@ -596,9 +597,8 @@ function collectAssistantText(collection: AssistantTextCollection, message: Clau
   const messageId = nonBlankString(assistantMessage?.id);
   if (messageId === undefined) return;
   if (collection.messageId !== messageId) {
+    resetAssistantText(collection);
     collection.messageId = messageId;
-    collection.textParts = [];
-    collection.textLength = 0;
   }
   const content = assistantMessage?.content;
   if (!Array.isArray(content)) return;
@@ -612,6 +612,12 @@ function collectAssistantText(collection: AssistantTextCollection, message: Clau
     collection.textParts.push(block.text);
     collection.textLength = nextLength;
   }
+}
+
+function resetAssistantText(collection: AssistantTextCollection): void {
+  collection.messageId = undefined;
+  collection.textParts = [];
+  collection.textLength = 0;
 }
 
 function selectResultText(collection: AssistantTextCollection, result: ClaudeRawMessage): string {

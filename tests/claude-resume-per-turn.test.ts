@@ -135,6 +135,31 @@ describe('Claude resume-per-turn transport', () => {
     expect(harness.allStopped()).toBe(true);
   });
 
+  it('separates a reused assistant ID at every user boundary and keeps final fragments together', async () => {
+    const harness = new FixtureHarness(['turn-same-id-collision']);
+    const transport = createTransport(harness);
+
+    const result = await transport.runTurn({ prompt: 'same ID collision' });
+
+    expect(result.resultText).toBe('FINAL_C');
+    expect(result.resultText).not.toContain('INTERMEDIATE_A');
+    expect(result.resultText).not.toContain('INTERMEDIATE_B');
+    expect(result.messageTypes).toEqual([
+      'system', 'assistant', 'user', 'assistant', 'user', 'assistant', 'assistant', 'result',
+    ]);
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('resets the reconstruction size counter at a user boundary', async () => {
+    const harness = new FixtureHarness(['turn-assistant-limit-reset']);
+    const transport = createTransport(harness);
+
+    await expect(transport.runTurn({ prompt: 'limit reset' })).resolves.toMatchObject({
+      resultText: 'FINAL_AFTER_RESET',
+    });
+    expect(harness.allStopped()).toBe(true);
+  });
+
   it('falls back to result.result and keeps reconstruction state local to each call', async () => {
     const harness = new FixtureHarness(['turn-fragmented-assistant-result', 'turn-success']);
     const transport = createTransport(harness);

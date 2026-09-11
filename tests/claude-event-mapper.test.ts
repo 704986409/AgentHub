@@ -306,6 +306,66 @@ describe('Claude event mapper', () => {
     expectSerialized(events).not.toContainAny(['first', 'second-', 'done', 'PRIVATE_TOOL_INPUT_SENTINEL', 'PRIVATE_TOOL_OUTPUT_SENTINEL']);
   });
 
+  it('splits a reused assistant ID at arbitrary and tool-result user boundaries', () => {
+    const { mapper, events } = createMapper();
+    mapper.observeRawMessage({ type: 'assistant', message: { id: 'msg-collision', content: [{ type: 'text', text: 'first' }] } });
+    mapper.observeRawMessage({ type: 'user', message: { content: [{ type: 'text', text: 'PRIVATE_PROMPT_SENTINEL' }] } });
+    mapper.observeRawMessage({ type: 'assistant', message: { id: 'msg-collision', content: [{ type: 'text', text: 'second' }] } });
+    mapper.observeRawMessage({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'PRIVATE_TOOL_OUTPUT_SENTINEL' }] } });
+    mapper.observeRawMessage({ type: 'assistant', message: { id: 'msg-collision', content: [{ type: 'text', text: 'third-' }] } });
+    mapper.observeRawMessage({ type: 'assistant', message: { id: 'msg-collision', content: [{ type: 'text', text: 'done' }] } });
+    mapper.observeRawMessage({ type: 'result', result: 'PRIVATE_RESULT_SENTINEL' });
+
+    expect(events.map((event) => event.eventType)).toEqual([
+      AgentRuntimeEventType.AGENT_MESSAGE_COMPLETED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+      AgentRuntimeEventType.AGENT_MESSAGE_COMPLETED,
+      AgentRuntimeEventType.AGENT_OPERATION_COMPLETED,
+      AgentRuntimeEventType.AGENT_MESSAGE_COMPLETED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+    ]);
+    expect(events[0]?.payload).toMatchObject({ messageId: 'msg-collision', textLength: 5, textBlockCount: 1 });
+    expect(events[2]?.payload).toMatchObject({ messageId: 'msg-collision', textLength: 6, textBlockCount: 1 });
+    expect(events[4]?.payload).toMatchObject({ messageId: 'msg-collision', textLength: 10, textBlockCount: 2 });
+    expectSerialized(events).not.toContainAny([
+      'first', 'second', 'third-', 'done', 'PRIVATE_PROMPT_SENTINEL', 'PRIVATE_TOOL_OUTPUT_SENTINEL', 'PRIVATE_RESULT_SENTINEL',
+    ]);
+  });
+
+  it('drops stale assistant aggregation at new execution and WorkerResult terminal boundaries', () => {
+    const started = createMapper();
+    started.mapper.observeRawMessage({ type: 'assistant', message: { id: 'old', content: [{ type: 'text', text: 'private-old' }] } });
+    started.mapper.observeExecutionStarted({ sessionId: 'new-session' });
+    started.mapper.observeRawMessage({ type: 'result' });
+
+    const completed = createMapper();
+    completed.mapper.observeRawMessage({ type: 'assistant', message: { id: 'old', content: [{ type: 'text', text: 'private-completed' }] } });
+    completed.mapper.observeWorkerResult(createWorkerResult('COMPLETED'));
+    completed.mapper.observeRawMessage({ type: 'result' });
+
+    const failed = createMapper();
+    failed.mapper.observeRawMessage({ type: 'assistant', message: { id: 'old', content: [{ type: 'text', text: 'private-failed' }] } });
+    failed.mapper.observeWorkerResultFailure({ kind: 'missing_result', message: 'PRIVATE_ERROR_SENTINEL' });
+    failed.mapper.observeRawMessage({ type: 'result' });
+
+    expect(started.events.map((event) => event.eventType)).toEqual([
+      AgentRuntimeEventType.AGENT_EXECUTION_STARTED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+    ]);
+    expect(completed.events.map((event) => event.eventType)).toEqual([
+      AgentRuntimeEventType.AGENT_EXECUTION_COMPLETED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+    ]);
+    expect(failed.events.map((event) => event.eventType)).toEqual([
+      AgentRuntimeEventType.AGENT_RUNTIME_ERROR,
+      AgentRuntimeEventType.AGENT_EXECUTION_FAILED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+    ]);
+    expectSerialized([started.events, completed.events, failed.events]).not.toContainAny([
+      'private-old', 'private-completed', 'private-failed', 'PRIVATE_ERROR_SENTINEL',
+    ]);
+  });
+
   it('does not invent completions for anonymous or thinking-only assistant frames', () => {
     const { mapper, events } = createMapper();
     mapper.observeRawMessage({ type: 'assistant', message: { content: [{ type: 'text', text: 'PRIVATE_ASSISTANT_SENTINEL' }] } });

@@ -50,6 +50,7 @@ export class ClaudeEventMapper {
   }
 
   public observeExecutionStarted(metadata: ClaudeExecutionObservation = {}): void {
+    this.#pendingAssistantMessage = undefined;
     this.#publish(AgentRuntimeEventType.AGENT_EXECUTION_STARTED, {
       provider: 'claude',
       ...executionMetadata(metadata),
@@ -91,6 +92,7 @@ export class ClaudeEventMapper {
   }
 
   public observeWorkerResult(result: AgentHubWorkerResult, metadata: ClaudeExecutionObservation = {}): void {
+    this.#pendingAssistantMessage = undefined;
     const payload = {
       provider: 'claude',
       ...executionMetadata(metadata),
@@ -109,6 +111,7 @@ export class ClaudeEventMapper {
     failure: AgentHubWorkerResultFailure,
     metadata: ClaudeExecutionObservation = {},
   ): void {
+    this.#pendingAssistantMessage = undefined;
     const payload = {
       provider: 'claude',
       kind: 'worker_result_protocol',

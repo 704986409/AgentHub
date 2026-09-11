@@ -58,6 +58,25 @@ if (mode.startsWith('persistent-')) {
   emitAssistant('final-A', ['RESULT_']);
   emitAssistant('final-A', ['FINAL'], [{ type: 'thinking', thinking: 'ignored' }]);
   emit({ type: 'result', subtype: 'success', session_id: 'session-A', result: 'RESULT_' });
+} else if (mode === 'turn-same-id-collision') {
+  emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
+  emitAssistant('collision-A', ['INTERMEDIATE_A'], [
+    { type: 'tool_use', id: 'tool-1', name: 'Read', input: { secret: 'ignored' } },
+  ]);
+  emit({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ignored' }] } });
+  emitAssistant('collision-A', ['INTERMEDIATE_B'], [
+    { type: 'tool_use', id: 'tool-2', name: 'Read', input: { secret: 'ignored' } },
+  ]);
+  emit({ type: 'user', message: { content: [{ type: 'text', text: 'arbitrary boundary' }] } });
+  emitAssistant('collision-A', ['FINAL_']);
+  emitAssistant('collision-A', ['C'], [{ type: 'thinking', thinking: 'ignored' }]);
+  emit({ type: 'result', subtype: 'success', session_id: 'session-A', result: 'truncated' });
+} else if (mode === 'turn-assistant-limit-reset') {
+  emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
+  emitAssistant('collision-limit', ['x'.repeat(1024 * 1024)]);
+  emit({ type: 'user', message: { content: [{ type: 'text', text: 'boundary' }] } });
+  emitAssistant('collision-limit', ['FINAL_AFTER_RESET']);
+  emit({ type: 'result', subtype: 'success', session_id: 'session-A', result: 'truncated' });
 } else if (mode === 'turn-assistant-over-limit') {
   emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
   emitAssistant('large-A', ['x'.repeat(1024 * 1024), 'y']);
@@ -195,7 +214,9 @@ function runPersistent(scenario) {
       emit({ type: 'system', subtype: 'init', session_id: initSession, pid: process.pid });
     }
     if (scenario === 'persistent-fragmented-assistant-result') {
-      emitAssistant(`final-${String(turnCount)}`, ['RESULT_', 'PERSISTENT_', String(turnCount)]);
+      emitAssistant(`final-${String(turnCount)}`, ['RESULT_']);
+      emitAssistant(`final-${String(turnCount)}`, ['PERSISTENT_']);
+      emitAssistant(`final-${String(turnCount)}`, [String(turnCount)]);
     } else if (scenario === 'persistent-intermediate-final-fragmented') {
       emitAssistant(`tool-${String(turnCount)}`, ['I will inspect.'], [
         { type: 'tool_use', id: `tool-${String(turnCount)}`, name: 'Read', input: { secret: 'ignored' } },
@@ -207,6 +228,22 @@ function runPersistent(scenario) {
       emitAssistant(`final-${String(turnCount)}`, ['FINAL_', String(turnCount)], [
         { type: 'thinking', thinking: 'ignored' },
       ]);
+    } else if (scenario === 'persistent-same-id-collision') {
+      emitAssistant('persistent-collision', [`INTERMEDIATE_${String(turnCount)}_A`], [
+        { type: 'tool_use', id: `tool-${String(turnCount)}-1`, name: 'Read', input: { secret: 'ignored' } },
+      ]);
+      emit({
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: `tool-${String(turnCount)}-1`, content: 'ignored' }] },
+      });
+      emitAssistant('persistent-collision', [`INTERMEDIATE_${String(turnCount)}_B`]);
+      emit({ type: 'user', message: { content: [{ type: 'text', text: 'arbitrary boundary' }] } });
+      emitAssistant('persistent-collision', ['FINAL_']);
+      emitAssistant('persistent-collision', [String(turnCount)], [{ type: 'thinking', thinking: 'ignored' }]);
+    } else if (scenario === 'persistent-assistant-limit-reset') {
+      emitAssistant('persistent-collision-limit', ['x'.repeat(1024 * 1024)]);
+      emit({ type: 'user', message: { content: [{ type: 'text', text: 'boundary' }] } });
+      emitAssistant('persistent-collision-limit', [`FINAL_AFTER_RESET_${String(turnCount)}`]);
     } else if (scenario === 'persistent-assistant-over-limit') {
       emitAssistant(`large-${String(turnCount)}`, ['x'.repeat(1024 * 1024), 'y']);
     } else {
@@ -229,6 +266,8 @@ function runPersistent(scenario) {
           ? 'RESULT_'
           : scenario === 'persistent-intermediate-final-fragmented'
             ? 'FINAL_'
+            : scenario === 'persistent-same-id-collision' || scenario === 'persistent-assistant-limit-reset'
+              ? 'truncated'
             : scenario === 'persistent-assistant-over-limit'
               ? 'fallback'
               : `turn-${String(turnCount)}`;
