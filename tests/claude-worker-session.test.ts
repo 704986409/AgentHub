@@ -153,6 +153,26 @@ describe('Claude worker session', () => {
     expect(fake.startCalls).toBe(2);
   });
 
+  it('does not claim started when raw mapping fails during lower start', async () => {
+    const mapperError = new Error('start raw mapper failed');
+    const eventBus = new EventBus();
+    eventBus.subscribe((event) => {
+      if (event.eventType === providerObservedType) throw mapperError;
+    });
+    const { session, fake } = createFakeSession({ eventBus });
+    fake.start = () => {
+      fake.startCalls += 1;
+      fake.options.onRawMessage?.(rawInit());
+      return Promise.resolve();
+    };
+
+    await expect(session.start()).rejects.toBe(mapperError);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+    await session.shutdown();
+    expect(fake.shutdownCalls).toBe(1);
+  });
+
   it('rejects revision before start without constructing a prompt', async () => {
     const { session, fake } = createFakeSession();
     await expect(session.runRevision({ prompt: 'revision' })).rejects.toMatchObject({
@@ -226,6 +246,9 @@ describe('Claude worker session', () => {
     expect((await session.runTurn({ prompt: 'one' })).protocolValid).toBe(false);
     expect(session.active).toBe(false);
     await expect(session.runTurn({ prompt: 'two' })).resolves.toMatchObject({ protocolValid: true });
+    await session.shutdown();
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
   });
 
   it('does not retain or feed prior malformed output into an explicit revision prompt', async () => {
@@ -288,6 +311,8 @@ describe('Claude worker session', () => {
     } finally {
       await session.shutdown();
     }
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
   });
 
   it('preserves transport error identity, maps safe metadata, and never replays', async () => {
@@ -307,6 +332,9 @@ describe('Claude worker session', () => {
       AgentRuntimeEventType.AGENT_EXECUTION_FAILED,
     ]);
     expect(JSON.stringify(events)).not.toContain('PRIVATE_PROMPT');
+    await session.shutdown();
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
   });
 
   it('reflects Auto session identity after transport failure without synthesizing one', async () => {
@@ -371,6 +399,9 @@ describe('Claude worker session', () => {
     await parsed.session.start();
     await expect(parsed.session.runTurn({ prompt: 'four' })).rejects.toBe(parserError);
     expect(parsed.session.active).toBe(false);
+    await parsed.session.shutdown();
+    expect(parsed.session.started).toBe(false);
+    expect(parsed.session.active).toBe(false);
 
     const bus = new EventBus();
     let publishCount = 0;
@@ -378,6 +409,9 @@ describe('Claude worker session', () => {
     const mapped = createFakeSession({ eventBus: bus });
     await mapped.session.start();
     await expect(mapped.session.runTurn({ prompt: 'five' })).rejects.toThrow('mapper');
+    expect(mapped.session.active).toBe(false);
+    await mapped.session.shutdown();
+    expect(mapped.session.started).toBe(false);
     expect(mapped.session.active).toBe(false);
   });
 
@@ -397,6 +431,207 @@ describe('Claude worker session', () => {
     expect(session.started).toBe(false);
   });
 
+  it('serializes shutdown behind a successful start without resurrecting session state', async () => {
+    const startBarrier = deferred();
+    const { session, fake } = createFakeSession();
+    fake.start = async () => {
+      fake.startCalls += 1;
+      await startBarrier.promise;
+    };
+
+    const start = session.start();
+    const shutdown = session.shutdown();
+    await Promise.resolve();
+    expect(fake.startCalls).toBe(1);
+    expect(fake.shutdownCalls).toBe(0);
+    startBarrier.resolve();
+    await start;
+    await shutdown;
+
+    expect(fake.shutdownCalls).toBe(1);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+  });
+
+  it('continues shutdown after a concurrent start failure and permits a clean restart', async () => {
+    const startBarrier = deferred();
+    const startError = new Error('start failed');
+    const { session, fake } = createFakeSession();
+    fake.start = async () => {
+      fake.startCalls += 1;
+      await startBarrier.promise;
+      throw startError;
+    };
+
+    const start = session.start();
+    const shutdown = session.shutdown();
+    startBarrier.resolve();
+    await expect(start).rejects.toBe(startError);
+    await shutdown;
+    expect(fake.shutdownCalls).toBe(1);
+    expect(session.started).toBe(false);
+
+    fake.start = FakeAuto.prototype.start.bind(fake);
+    await session.start();
+    expect(session.started).toBe(true);
+    expect(fake.startCalls).toBe(2);
+  });
+
+  it('shares one concurrent shutdown operation and clears ownership for a later idle shutdown', async () => {
+    const shutdownBarrier = deferred();
+    const { session, fake } = createFakeSession();
+    fake.shutdown = async () => {
+      fake.shutdownCalls += 1;
+      await shutdownBarrier.promise;
+    };
+    await session.start();
+
+    const first = session.shutdown();
+    const second = session.shutdown();
+    expect(first).toBe(second);
+    await Promise.resolve();
+    expect(fake.shutdownCalls).toBe(1);
+    shutdownBarrier.resolve();
+    await Promise.all([first, second]);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+
+    fake.shutdown = FakeAuto.prototype.shutdown.bind(fake);
+    await session.shutdown();
+    expect(fake.shutdownCalls).toBe(2);
+
+    await session.start();
+    expect(session.started).toBe(true);
+    expect(fake.startCalls).toBe(2);
+    await session.shutdown();
+  });
+
+  it('shares a concurrent shutdown failure and permits one explicit retry on the same Auto', async () => {
+    const shutdownBarrier = deferred();
+    const shutdownError = new ClaudeAutoError('CLAUDE_AUTO_SHUTDOWN_FAILED', 'shutdown failed');
+    const { session, fake } = createFakeSession();
+    fake.shutdown = async () => {
+      fake.shutdownCalls += 1;
+      await shutdownBarrier.promise;
+      throw shutdownError;
+    };
+    await session.start();
+
+    const first = session.shutdown();
+    const second = session.shutdown();
+    expect(first).toBe(second);
+    await Promise.resolve();
+    expect(fake.shutdownCalls).toBe(1);
+    shutdownBarrier.resolve();
+    await expect(first).rejects.toBe(shutdownError);
+    await expect(second).rejects.toBe(shutdownError);
+    expect(session.started).toBe(true);
+
+    fake.shutdown = FakeAuto.prototype.shutdown.bind(fake);
+    await session.shutdown();
+    expect(fake.shutdownCalls).toBe(2);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+  });
+
+  it('blocks start, turn, and revision locally while shutdown is in progress', async () => {
+    const shutdownBarrier = deferred();
+    const { session, fake, events } = createFakeSession();
+    fake.shutdown = async () => {
+      fake.shutdownCalls += 1;
+      await shutdownBarrier.promise;
+    };
+    await session.start();
+    const eventCount = events.length;
+    const shutdown = session.shutdown();
+
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_LIFECYCLE_BUSY' });
+    await expect(session.runTurn({ prompt: 'blocked turn' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_LIFECYCLE_BUSY' });
+    await expect(session.runRevision({ prompt: 'blocked revision' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_LIFECYCLE_BUSY' });
+    await Promise.resolve();
+    expect(fake.startCalls).toBe(1);
+    expect(fake.runCalls).toBe(0);
+    expect(events).toHaveLength(eventCount);
+
+    shutdownBarrier.resolve();
+    await shutdown;
+  });
+
+  it('waits for the complete Session turn pipeline before successful shutdown resolves', async () => {
+    const turnBarrier = deferred();
+    const { session, fake, events } = createFakeSession();
+    fake.turns.push({ wait: turnBarrier.promise, result: autoResult(workerText('COMPLETED')) });
+    await session.start();
+    const turn = session.runTurn({ prompt: 'active' });
+    const shutdown = session.shutdown();
+    let shutdownSettled = false;
+    void shutdown.finally(() => { shutdownSettled = true; });
+
+    await Promise.resolve();
+    expect(shutdownSettled).toBe(false);
+    expect(session.active).toBe(true);
+    turnBarrier.resolve();
+    await expect(turn).resolves.toMatchObject({ protocolValid: true });
+    await shutdown;
+    const eventCountAtShutdown = events.length;
+
+    expect(session.active).toBe(false);
+    expect(session.started).toBe(false);
+    await Promise.resolve();
+    expect(events).toHaveLength(eventCountAtShutdown);
+  });
+
+  it('preserves active ownership when lower shutdown fails and quiesces on retry', async () => {
+    const turnBarrier = deferred();
+    const shutdownError = new ClaudeAutoError('CLAUDE_AUTO_SHUTDOWN_FAILED', 'shutdown failed');
+    const { session, fake } = createFakeSession();
+    fake.turns.push({ wait: turnBarrier.promise, error: new Error('stopped on retry') });
+    await session.start();
+    const turn = session.runTurn({ prompt: 'active' });
+    fake.shutdownError = shutdownError;
+
+    await expect(session.shutdown()).rejects.toBe(shutdownError);
+    expect(session.started).toBe(true);
+    expect(session.active).toBe(true);
+    expect(fake.shutdownCalls).toBe(1);
+
+    fake.shutdownError = undefined;
+    const retry = session.shutdown();
+    turnBarrier.resolve();
+    await expect(turn).rejects.toThrow('stopped on retry');
+    await retry;
+    expect(fake.shutdownCalls).toBe(2);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+  });
+
+  it('registers the active turn before synchronous execution-start observers can request shutdown', async () => {
+    const turnBarrier = deferred();
+    const eventBus = new EventBus();
+    const { session, fake } = createFakeSession({ eventBus });
+    fake.turns.push({ wait: turnBarrier.promise, error: new Error('observer shutdown') });
+    let shutdown: Promise<void> | undefined;
+    eventBus.subscribe((event) => {
+      if (event.eventType === executionStartedType) shutdown = session.shutdown();
+    });
+    await session.start();
+
+    const turn = session.runTurn({ prompt: 'active' });
+    await Promise.resolve();
+    expect(shutdown).toBeDefined();
+    let shutdownSettled = false;
+    void shutdown?.finally(() => { shutdownSettled = true; });
+    await Promise.resolve();
+    expect(shutdownSettled).toBe(false);
+    turnBarrier.resolve();
+
+    await expect(turn).rejects.toThrow('observer shutdown');
+    await shutdown;
+    expect(session.active).toBe(false);
+    expect(session.started).toBe(false);
+    expect(fake.shutdownCalls).toBe(1);
+  });
+
   it('delegates shutdown during an active turn to the same Auto instance and releases the guard', async () => {
     let rejectTurn!: (error: Error) => void;
     const turnWait = new Promise<void>((_resolve, reject) => { rejectTurn = reject; });
@@ -413,6 +648,7 @@ describe('Claude worker session', () => {
     await expect(turn).rejects.toThrow('stopped by shutdown');
     expect(fake.shutdownCalls).toBe(1);
     expect(session.active).toBe(false);
+    expect(session.started).toBe(false);
   });
 
   it('does not persist prompt, raw result, or WorkerResult claims through EventStore/SQLite', async () => {
@@ -594,6 +830,20 @@ function createFakeSession(options: {
   return { session, fake, events };
 }
 
+function deferred(): {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: () => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function autoResult(resultText: string, overrides: Partial<ClaudeAutoTurnResult> = {}): ClaudeAutoTurnResult {
   return {
     transport: 'persistent-stream', sessionId: 'session-A', resultText,
@@ -638,6 +888,7 @@ const executionTerminalTypes = new Set<string>([
   AgentRuntimeEventType.AGENT_EXECUTION_COMPLETED,
   AgentRuntimeEventType.AGENT_EXECUTION_FAILED,
 ]);
+const executionStartedType: string = AgentRuntimeEventType.AGENT_EXECUTION_STARTED;
 const providerObservedType: string = AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED;
 const inputRequiredType: string = AgentRuntimeEventType.AGENT_INPUT_REQUIRED;
 

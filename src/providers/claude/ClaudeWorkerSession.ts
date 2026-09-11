@@ -57,6 +57,7 @@ export type ClaudeWorkerSessionErrorCode =
   | 'CLAUDE_WORKER_SESSION_NOT_STARTED'
   | 'CLAUDE_WORKER_SESSION_ALREADY_STARTED'
   | 'CLAUDE_WORKER_SESSION_TURN_ALREADY_ACTIVE'
+  | 'CLAUDE_WORKER_SESSION_LIFECYCLE_BUSY'
   | 'CLAUDE_WORKER_SESSION_INVALID_REQUEST';
 
 export class ClaudeWorkerSessionError extends Error {
@@ -74,8 +75,10 @@ export class ClaudeWorkerSession {
   readonly #mapper: ClaudeEventMapper;
   readonly #resultParser: AgentHubWorkerResultParser;
   #started = false;
-  #starting = false;
   #active = false;
+  #startPromise: Promise<void> | undefined;
+  #shutdownPromise: Promise<void> | undefined;
+  #activeTurnPromise: Promise<ClaudeWorkerTurnResult> | undefined;
   #rawMappingError: Error | undefined;
 
   public constructor(options: ClaudeWorkerSessionOptions) {
@@ -114,21 +117,35 @@ export class ClaudeWorkerSession {
     return this.#auto.selectedTransport;
   }
 
-  public async start(): Promise<void> {
-    if (this.#started || this.#starting) {
-      throw new ClaudeWorkerSessionError(
+  public start(): Promise<void> {
+    if (this.#shutdownPromise !== undefined) {
+      return Promise.reject(new ClaudeWorkerSessionError(
+        'CLAUDE_WORKER_SESSION_LIFECYCLE_BUSY',
+        'Claude worker session shutdown is in progress',
+      ));
+    }
+    if (this.#started || this.#startPromise !== undefined) {
+      return Promise.reject(new ClaudeWorkerSessionError(
         'CLAUDE_WORKER_SESSION_ALREADY_STARTED',
         'Claude worker session is already started',
-      );
+      ));
     }
-    this.#starting = true;
-    try {
+
+    const current = Promise.resolve().then(async () => {
       await this.#auto.start();
-      this.#started = true;
       this.#throwRawMappingError();
-    } finally {
-      this.#starting = false;
-    }
+      this.#started = true;
+    });
+    this.#startPromise = current;
+    void current.then(
+      () => {
+        if (this.#startPromise === current) this.#startPromise = undefined;
+      },
+      () => {
+        if (this.#startPromise === current) this.#startPromise = undefined;
+      },
+    );
+    return current;
   }
 
   public runTurn(request: ClaudeWorkerTurnRequest): Promise<ClaudeWorkerTurnResult> {
@@ -139,27 +156,62 @@ export class ClaudeWorkerSession {
     return this.#runWorkerTurn(request);
   }
 
-  public async shutdown(): Promise<void> {
-    await this.#auto.shutdown();
-    this.#started = false;
+  public shutdown(): Promise<void> {
+    if (this.#shutdownPromise !== undefined) return this.#shutdownPromise;
+
+    const current = Promise.resolve().then(() => this.#performShutdown());
+    this.#shutdownPromise = current;
+    void current.then(
+      () => {
+        if (this.#shutdownPromise === current) this.#shutdownPromise = undefined;
+      },
+      () => {
+        if (this.#shutdownPromise === current) this.#shutdownPromise = undefined;
+      },
+    );
+    return current;
   }
 
-  async #runWorkerTurn(request: ClaudeWorkerTurnRequest): Promise<ClaudeWorkerTurnResult> {
+  #runWorkerTurn(request: ClaudeWorkerTurnRequest): Promise<ClaudeWorkerTurnResult> {
+    if (this.#shutdownPromise !== undefined) {
+      return Promise.reject(new ClaudeWorkerSessionError(
+        'CLAUDE_WORKER_SESSION_LIFECYCLE_BUSY',
+        'Claude worker session shutdown is in progress',
+      ));
+    }
     if (!this.#started) {
-      throw new ClaudeWorkerSessionError(
+      return Promise.reject(new ClaudeWorkerSessionError(
         'CLAUDE_WORKER_SESSION_NOT_STARTED',
         'Claude worker session is not started',
-      );
+      ));
     }
-    validateRequest(request);
+    try {
+      validateRequest(request);
+    } catch (error) {
+      return Promise.reject(asError(error, 'Claude worker request validation failed'));
+    }
     if (this.#active) {
-      throw new ClaudeWorkerSessionError(
+      return Promise.reject(new ClaudeWorkerSessionError(
         'CLAUDE_WORKER_SESSION_TURN_ALREADY_ACTIVE',
         'A Claude worker session turn is already active',
-      );
+      ));
     }
 
     this.#active = true;
+    const current = Promise.resolve().then(() => this.#executeWorkerTurn(request));
+    this.#activeTurnPromise = current;
+    void current.then(
+      () => {
+        if (this.#activeTurnPromise === current) this.#activeTurnPromise = undefined;
+      },
+      () => {
+        if (this.#activeTurnPromise === current) this.#activeTurnPromise = undefined;
+      },
+    );
+    return current;
+  }
+
+  async #executeWorkerTurn(request: ClaudeWorkerTurnRequest): Promise<ClaudeWorkerTurnResult> {
     try {
       this.#throwRawMappingError();
       this.#mapper.observeExecutionStarted(sessionObservation(this.#auto.sessionId));
@@ -193,6 +245,20 @@ export class ClaudeWorkerSession {
     } finally {
       this.#active = false;
     }
+  }
+
+  async #performShutdown(): Promise<void> {
+    const start = this.#startPromise;
+    if (start !== undefined) await start.catch(() => undefined);
+
+    const activeTurn = this.#activeTurnPromise;
+    const activeTurnSettled = activeTurn?.then(
+      () => undefined,
+      () => undefined,
+    );
+    await this.#auto.shutdown();
+    await activeTurnSettled;
+    this.#started = false;
   }
 
   #throwRawMappingError(): void {
