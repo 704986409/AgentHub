@@ -88,9 +88,15 @@ function utf8ByteLength(value: string): number {
 }
 
 function summarizeIssues(issues: readonly SchemaIssue[]): string {
-  return issues.slice(0, 3).map((issue) => `${issue.path}: ${issue.message}`).join('; ');
+  return limitFailureMessage(issues.slice(0, 3).map((issue) => `${issue.path}: ${issue.message}`).join('; '));
 }
 
 function failure(kind: AgentHubWorkerResultFailureKind, message: string): AgentHubWorkerResultParseResult {
-  return { success: false, failure: { kind, message } };
+  return { success: false, failure: { kind, message: limitFailureMessage(message) } };
+}
+
+function limitFailureMessage(message: string): string {
+  const limit = agentHubWorkerResultLimits.maxFailureMessageChars;
+  if (message.length <= limit) return message;
+  return `${message.slice(0, limit - 1)}…`;
 }

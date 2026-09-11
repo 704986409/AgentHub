@@ -45,6 +45,7 @@ export const agentHubWorkerResultLimits = {
   maxCheckNameChars: 256,
   maxDetailChars: 4096,
   maxListItemChars: 4096,
+  maxFailureMessageChars: 1024,
 } as const;
 
 const topLevelKeys = new Set([
@@ -306,7 +307,7 @@ function rejectUnknownKeys(
 ): void {
   for (const key of Object.keys(record)) {
     if (!allowedKeys.has(key)) {
-      issues.push({ path: parentPath === '$' ? `$.${key}` : `${parentPath}.${key}`, message: 'Unknown field' });
+      issues.push({ path: parentPath === '$' ? '$.*' : `${parentPath}.*`, message: 'Unknown field' });
     }
   }
 }

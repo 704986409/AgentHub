@@ -96,13 +96,94 @@ describe('AgentHub worker result parser', () => {
     });
   });
 
-  it('rejects unknown top-level fields, including prototype-sensitive names', () => {
-    for (const key of ['unexpectedField', '__proto__', 'constructor']) {
-      const value = JSON.parse(JSON.stringify(createResult())) as Record<string, unknown>;
-      Object.defineProperty(value, key, { value: true, enumerable: true });
-      const result = parser.parse(block(value));
-      expect(result, key).toMatchObject({ success: false, failure: { kind: 'schema_invalid' } });
+  it('rejects unknown top-level fields without exposing their names', () => {
+    for (const secret of [
+      'PRIVATE_UNKNOWN_KEY_SENTINEL',
+      '未知秘密字段',
+      'CONTROL\nCHARACTER\tKEY',
+      '__proto__',
+      'constructor',
+      'prototype',
+      'toString',
+      '__defineGetter__',
+    ]) {
+      const value = addUnknownField(createResult(), secret);
+      const parsed = parser.parse(block(value));
+      const schemaResult = AgentHubWorkerResultSchema.safeParse(value);
+
+      expect(parsed, secret).toMatchObject({
+        success: false,
+        failure: { kind: 'schema_invalid', message: '$.*: Unknown field' },
+      });
+      const escapedSecret = JSON.stringify(secret).slice(1, -1);
+      expect(JSON.stringify(parsed), secret).not.toContain(escapedSecret);
+      expect(JSON.stringify(schemaResult), secret).not.toContain(escapedSecret);
+      expect(schemaResult).toMatchObject({ success: false, issues: [{ path: '$.*', message: 'Unknown field' }] });
     }
+  });
+
+  it('rejects an unknown nested check field without exposing its name', () => {
+    const secret = 'PRIVATE_NESTED_KEY_SENTINEL';
+    const check = addUnknownField({ name: 'test', status: 'PASSED', detail: '' }, secret);
+    const value = createResult({ checks: [check] });
+    const parsed = parser.parse(block(value));
+    const schemaResult = AgentHubWorkerResultSchema.safeParse(value);
+    const checkSchemaResult = AgentHubWorkerCheckClaimSchema.safeParse(check);
+
+    expect(parsed).toMatchObject({
+      success: false,
+      failure: { kind: 'schema_invalid', message: 'checks[0].*: Unknown field' },
+    });
+    for (const diagnostic of [parsed, schemaResult, checkSchemaResult]) {
+      expect(JSON.stringify(diagnostic)).not.toContain(secret);
+    }
+    expect(schemaResult).toMatchObject({ success: false, issues: [{ path: 'checks[0].*' }] });
+    expect(checkSchemaResult).toMatchObject({ success: false, issues: [{ path: 'checks[0].*' }] });
+  });
+
+  it('keeps a huge unknown key private and the parser failure bounded', () => {
+    const secret = `HUGE_PRIVATE_KEY_${'x'.repeat(agentHubWorkerResultLimits.maxFailureMessageChars * 4)}`;
+    const value = addUnknownField(createResult(), secret);
+    const parsed = parser.parse(block(value));
+    const schemaResult = AgentHubWorkerResultSchema.safeParse(value);
+
+    expect(parsed).toMatchObject({ success: false, failure: { kind: 'schema_invalid' } });
+    if (parsed.success) throw new Error('Expected parser failure');
+    expect(parsed.failure.message.length).toBeLessThanOrEqual(agentHubWorkerResultLimits.maxFailureMessageChars);
+    expect(JSON.stringify(parsed)).not.toContain(secret);
+    expect(JSON.stringify(schemaResult)).not.toContain(secret);
+  });
+
+  it('does not expose any of several unknown property names', () => {
+    const secrets = ['PRIVATE_ONE', 'PRIVATE_TWO', 'PRIVATE_THREE', 'PRIVATE_FOUR'];
+    let value: object = createResult();
+    for (const secret of secrets) value = addUnknownField(value, secret);
+
+    const parsed = parser.parse(block(value));
+    const schemaResult = AgentHubWorkerResultSchema.safeParse(value);
+    for (const secret of secrets) {
+      expect(JSON.stringify(parsed)).not.toContain(secret);
+      expect(JSON.stringify(schemaResult)).not.toContain(secret);
+    }
+    expect(parsed).toMatchObject({ success: false, failure: { kind: 'schema_invalid' } });
+  });
+
+  it('retains safe structural diagnostics for mixed top-level, nested, and known-field errors', () => {
+    const topSecret = 'PRIVATE_TOP_LEVEL_KEY';
+    const nestedSecret = 'PRIVATE_NESTED_LEVEL_KEY';
+    const check = addUnknownField({ name: 'test', status: 'PASSED', detail: '' }, nestedSecret);
+    const value = addUnknownField(createResult({ summary: 42, checks: [check] }), topSecret);
+    const parsed = parser.parse(block(value));
+    const schemaResult = AgentHubWorkerResultSchema.safeParse(value);
+
+    expect(parsed).toMatchObject({ success: false, failure: { kind: 'schema_invalid' } });
+    if (parsed.success || schemaResult.success) throw new Error('Expected validation failures');
+    expect(parsed.failure.message).toContain('$.*: Unknown field');
+    expect(parsed.failure.message).toContain('summary: summary must be a string');
+    expect(parsed.failure.message).toContain('checks[0].*: Unknown field');
+    expect(schemaResult.issues.map((issue) => issue.path)).toEqual(expect.arrayContaining(['$.*', 'summary', 'checks[0].*']));
+    expect(JSON.stringify([parsed, schemaResult])).not.toContain(topSecret);
+    expect(JSON.stringify([parsed, schemaResult])).not.toContain(nestedSecret);
   });
 
   it.each([
@@ -226,6 +307,38 @@ describe('AgentHub worker result parser', () => {
     expect(JSON.stringify(oversized)).not.toContain(secret);
   });
 
+  it('does not leak schema-invalid or semantic-invalid values', () => {
+    const schemaSecret = 'PRIVATE_INVALID_OUTCOME_VALUE';
+    const semanticSecret = 'PRIVATE_BLOCKER_VALUE';
+    const schemaFailure = parser.parse(block(createResult({ outcome: schemaSecret })));
+    const semanticFailure = parser.parse(block(createResult({ blockers: [semanticSecret] })));
+
+    expect(schemaFailure).toMatchObject({ success: false, failure: { kind: 'schema_invalid' } });
+    expect(semanticFailure).toMatchObject({
+      success: false,
+      failure: { kind: 'semantic_invalid', message: 'blockers: COMPLETED must not include blockers' },
+    });
+    expect(JSON.stringify(schemaFailure)).not.toContain(schemaSecret);
+    expect(JSON.stringify(semanticFailure)).not.toContain(semanticSecret);
+  });
+
+  it('keeps every public parser failure message within the configured limit', () => {
+    const failures = [
+      parser.parse('no result'),
+      parser.parse(`${block(createResult())}${block(createResult())}`),
+      parser.parse(`${agentHubResultOpenTag}${'x'.repeat(agentHubWorkerResultLimits.maxBlockBytes + 1)}${agentHubResultCloseTag}`),
+      parser.parse(`${agentHubResultOpenTag}{bad}${agentHubResultCloseTag}`),
+      parser.parse(block(createResult({ outcome: 'PRIVATE_INVALID_OUTCOME_VALUE' }))),
+      parser.parse(block(createResult({ blockers: ['PRIVATE_BLOCKER_VALUE'] }))),
+    ];
+
+    for (const result of failures) {
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error('Expected parser failure');
+      expect(result.failure.message.length).toBeLessThanOrEqual(agentHubWorkerResultLimits.maxFailureMessageChars);
+    }
+  });
+
   it('is deterministic for repeated parsing', () => {
     const text = block(createResult());
     expect(parser.parse(text)).toEqual(parser.parse(text));
@@ -304,4 +417,10 @@ function createResult(overrides: Record<string, unknown> = {}): AgentHubWorkerRe
 
 function block(value: unknown): string {
   return `${agentHubResultOpenTag}\n${JSON.stringify(value)}\n${agentHubResultCloseTag}`;
+}
+
+function addUnknownField(value: object, key: string): Record<string, unknown> {
+  const result = { ...value } as Record<string, unknown>;
+  Object.defineProperty(result, key, { value: true, enumerable: true });
+  return result;
 }
