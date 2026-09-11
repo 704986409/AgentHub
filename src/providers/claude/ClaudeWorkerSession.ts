@@ -131,11 +131,7 @@ export class ClaudeWorkerSession {
       ));
     }
 
-    const current = Promise.resolve().then(async () => {
-      await this.#auto.start();
-      this.#throwRawMappingError();
-      this.#started = true;
-    });
+    const current = Promise.resolve().then(() => this.#performStart());
     this.#startPromise = current;
     void current.then(
       () => {
@@ -222,6 +218,7 @@ export class ClaudeWorkerSession {
           ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
         });
       } catch (error) {
+        this.#takeRawMappingError();
         this.#mapper.observeExecutionFailure(error, failureObservation(error, this.#auto));
         throw error;
       }
@@ -247,6 +244,31 @@ export class ClaudeWorkerSession {
     }
   }
 
+  async #performStart(): Promise<void> {
+    this.#takeRawMappingError();
+    try {
+      await this.#auto.start();
+    } catch (error) {
+      this.#takeRawMappingError();
+      throw error;
+    }
+
+    const rawMappingError = this.#takeRawMappingError();
+    if (rawMappingError === undefined) {
+      this.#started = true;
+      return;
+    }
+
+    try {
+      await this.#auto.shutdown();
+    } catch (cleanupError) {
+      this.#started = true;
+      throw cleanupError;
+    }
+    this.#takeRawMappingError();
+    throw rawMappingError;
+  }
+
   async #performShutdown(): Promise<void> {
     const start = this.#startPromise;
     if (start !== undefined) await start.catch(() => undefined);
@@ -258,12 +280,18 @@ export class ClaudeWorkerSession {
     );
     await this.#auto.shutdown();
     await activeTurnSettled;
+    this.#takeRawMappingError();
     this.#started = false;
   }
 
-  #throwRawMappingError(): void {
+  #takeRawMappingError(): Error | undefined {
     const error = this.#rawMappingError;
     this.#rawMappingError = undefined;
+    return error;
+  }
+
+  #throwRawMappingError(): void {
+    const error = this.#takeRawMappingError();
     if (error !== undefined) throw error;
   }
 }

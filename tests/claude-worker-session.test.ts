@@ -153,8 +153,37 @@ describe('Claude worker session', () => {
     expect(fake.startCalls).toBe(2);
   });
 
-  it('does not claim started when raw mapping fails during lower start', async () => {
+  it('atomically cleans up and permits retry when raw mapping fails after lower start', async () => {
     const mapperError = new Error('start raw mapper failed');
+    const eventBus = new EventBus();
+    let failMapping = true;
+    eventBus.subscribe((event) => {
+      if (event.eventType === providerObservedType && failMapping) {
+        failMapping = false;
+        throw mapperError;
+      }
+    });
+    const { session, fake } = createFakeSession({ eventBus });
+    fake.start = () => {
+      fake.startCalls += 1;
+      if (fake.startCalls === 1) fake.options.onRawMessage?.(rawInit());
+      return Promise.resolve();
+    };
+
+    await expect(session.start()).rejects.toBe(mapperError);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+    expect(fake.shutdownCalls).toBe(1);
+    await session.start();
+    expect(session.started).toBe(true);
+    expect(fake.startCalls).toBe(2);
+    await session.shutdown();
+    expect(fake.shutdownCalls).toBe(2);
+  });
+
+  it('retains ownership for same-Auto shutdown retry when atomic start cleanup fails', async () => {
+    const mapperError = new Error('start raw mapper failed');
+    const cleanupError = new ClaudeAutoError('CLAUDE_AUTO_SHUTDOWN_FAILED', 'start cleanup failed');
     const eventBus = new EventBus();
     eventBus.subscribe((event) => {
       if (event.eventType === providerObservedType) throw mapperError;
@@ -165,11 +194,161 @@ describe('Claude worker session', () => {
       fake.options.onRawMessage?.(rawInit());
       return Promise.resolve();
     };
+    fake.shutdownError = cleanupError;
 
-    await expect(session.start()).rejects.toBe(mapperError);
+    await expect(session.start()).rejects.toBe(cleanupError);
+    expect(session.started).toBe(true);
+    expect(fake.startCalls).toBe(1);
+    expect(fake.shutdownCalls).toBe(1);
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_ALREADY_STARTED' });
+
+    fake.shutdownError = undefined;
+    await session.shutdown();
+    expect(fake.shutdownCalls).toBe(2);
+    expect(session.started).toBe(false);
+  });
+
+  it('preserves lower start failure and clears raw mapping state before retry', async () => {
+    const mapperError = new Error('raw mapper failed during rejected start');
+    const startError = new ClaudeAutoError('CLAUDE_AUTO_NO_USABLE_TRANSPORT', 'unavailable');
+    const eventBus = new EventBus();
+    eventBus.subscribe((event) => {
+      if (event.eventType === providerObservedType) throw mapperError;
+    });
+    const { session, fake } = createFakeSession({ eventBus });
+    fake.start = () => {
+      fake.startCalls += 1;
+      if (fake.startCalls === 1) {
+        fake.options.onRawMessage?.(rawInit());
+        return Promise.reject(startError);
+      }
+      return Promise.resolve();
+    };
+
+    await expect(session.start()).rejects.toBe(startError);
+    expect(session.started).toBe(false);
+    await session.start();
+    expect(session.started).toBe(true);
+    expect(fake.startCalls).toBe(2);
+  });
+
+  it('preserves transport failure over raw mapping failure without leaking into the next turn', async () => {
+    const mapperError = new Error('raw mapper failed');
+    const transportError = new ClaudeAutoError(
+      'CLAUDE_AUTO_TURN_FAILED', 'transport failed', 'persistent-stream', 'session-A', 'ambiguous',
+    );
+    const eventBus = new EventBus();
+    let failMapping = true;
+    eventBus.subscribe((event) => {
+      if (event.eventType === providerObservedType && failMapping) {
+        failMapping = false;
+        throw mapperError;
+      }
+    });
+    const { session, fake, events } = createFakeSession({ eventBus });
+    fake.turns.push(
+      { raw: [rawInit()], error: transportError },
+      { result: autoResult(workerText('COMPLETED')) },
+    );
+    await session.start();
+
+    await expect(session.runTurn({ prompt: 'first' })).rejects.toBe(transportError);
+    expect(session.active).toBe(false);
+    await expect(session.runTurn({ prompt: 'second' })).resolves.toMatchObject({ protocolValid: true });
+    expect(fake.runCalls).toBe(2);
+    expect(events.map((event) => event.eventType).filter(isExecutionTerminal)).toEqual([
+      AgentRuntimeEventType.AGENT_EXECUTION_FAILED,
+      AgentRuntimeEventType.AGENT_EXECUTION_COMPLETED,
+    ]);
+  });
+
+  it('does not leak a dual-failure raw mapping error across shutdown and restart', async () => {
+    const mapperError = new Error('old raw mapper failed');
+    const transportError = new Error('old transport failed');
+    const eventBus = new EventBus();
+    let failMapping = true;
+    eventBus.subscribe((event) => {
+      if (event.eventType === providerObservedType && failMapping) {
+        failMapping = false;
+        throw mapperError;
+      }
+    });
+    const { session, fake } = createFakeSession({ eventBus });
+    fake.turns.push(
+      { raw: [rawInit()], error: transportError },
+      { result: autoResult(workerText('COMPLETED')) },
+    );
+    await session.start();
+    await expect(session.runTurn({ prompt: 'first generation' })).rejects.toBe(transportError);
+    await session.shutdown();
+
+    await session.start();
+    await expect(session.runTurn({ prompt: 'second generation' })).resolves.toMatchObject({ protocolValid: true });
+    expect(fake.startCalls).toBe(2);
+    expect(fake.runCalls).toBe(2);
+    expect(fake.shutdownCalls).toBe(1);
+  });
+
+  it('clears raw mapping errors emitted during successful shutdown before restart', async () => {
+    const mapperError = new Error('shutdown raw mapper failed');
+    const eventBus = new EventBus();
+    let failMapping = true;
+    eventBus.subscribe((event) => {
+      if (event.eventType === providerObservedType && failMapping) {
+        failMapping = false;
+        throw mapperError;
+      }
+    });
+    const { session, fake } = createFakeSession({ eventBus });
+    fake.shutdown = () => {
+      fake.shutdownCalls += 1;
+      if (fake.shutdownCalls === 1) fake.options.onRawMessage?.(rawInit());
+      return Promise.resolve();
+    };
+    await session.start();
+    await session.shutdown();
+
+    await session.start();
+    await expect(session.runTurn({ prompt: 'clean generation' })).resolves.toMatchObject({ protocolValid: true });
+    expect(fake.startCalls).toBe(2);
+    expect(fake.runCalls).toBe(1);
+  });
+
+  it('clears active-turn raw mapping state when shutdown terminates the generation', async () => {
+    const mapperError = new Error('active raw mapper failed');
+    const transportError = new Error('stopped by shutdown');
+    const turnBarrier = deferred();
+    const eventBus = new EventBus();
+    let failMapping = true;
+    eventBus.subscribe((event) => {
+      if (event.eventType === providerObservedType && failMapping) {
+        failMapping = false;
+        throw mapperError;
+      }
+    });
+    const { session, fake } = createFakeSession({ eventBus });
+    fake.turns.push(
+      { raw: [rawInit()], wait: turnBarrier.promise },
+      { result: autoResult(workerText('COMPLETED')) },
+    );
+    fake.shutdown = () => {
+      fake.shutdownCalls += 1;
+      turnBarrier.reject(transportError);
+      return Promise.resolve();
+    };
+    await session.start();
+    const turn = session.runTurn({ prompt: 'active generation' });
+    await Promise.resolve();
+
+    await session.shutdown();
+    await expect(turn).rejects.toBe(transportError);
     expect(session.started).toBe(false);
     expect(session.active).toBe(false);
-    await session.shutdown();
+
+    await session.start();
+    await expect(session.runTurn({ prompt: 'clean generation' })).resolves.toMatchObject({ protocolValid: true });
+    expect(fake.startCalls).toBe(2);
+    expect(fake.runCalls).toBe(2);
     expect(fake.shutdownCalls).toBe(1);
   });
 
