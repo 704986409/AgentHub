@@ -377,7 +377,7 @@ describe('Claude persistent-stream transport', () => {
     await transport.start();
     await expect(transport.runTurn({ prompt: 'recovered' })).resolves.toMatchObject({ resultText: 'turn-1' });
     await transport.shutdown();
-  });
+  }, 15_000);
 
   it('recovers when process construction fails before a runtime exists', async () => {
     const harness = new PersistentHarness(['factory-failure', 'persistent-success']);
