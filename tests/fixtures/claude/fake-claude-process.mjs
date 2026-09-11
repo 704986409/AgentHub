@@ -286,16 +286,19 @@ function runPersistent(scenario) {
             : scenario === 'persistent-assistant-over-limit'
               ? 'fallback'
               : `turn-${String(turnCount)}`;
-    emit({
+    const resultMessage = {
       type: 'result',
       subtype: 'success',
       session_id: resultSession,
       result,
       is_error: scenario === 'persistent-error-result',
       input_frame_count: turnCount,
-    });
+    };
     if (scenario === 'persistent-duplicate-result') {
-      emit({ type: 'result', subtype: 'success', session_id: resultSession, result: 'duplicate' });
+      const duplicateResult = { type: 'result', subtype: 'success', session_id: resultSession, result: 'duplicate' };
+      process.stdout.write(`${JSON.stringify(resultMessage)}\n${JSON.stringify(duplicateResult)}\n`);
+    } else {
+      emit(resultMessage);
     }
     if (scenario === 'persistent-exit-after-result') setTimeout(() => process.exit(0), 50);
   });
