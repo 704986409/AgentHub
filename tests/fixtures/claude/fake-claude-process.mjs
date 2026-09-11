@@ -81,6 +81,17 @@ if (mode.startsWith('persistent-')) {
   emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
   emitAssistant('large-A', ['x'.repeat(1024 * 1024), 'y']);
   emit({ type: 'result', subtype: 'success', session_id: 'session-A', result: 'fallback' });
+} else if (mode === 'worker-valid' || mode === 'worker-needs-input-then-valid') {
+  const args = process.argv.slice(3);
+  const resumedSession = readOption(args, '--resume');
+  const sessionId = resumedSession ?? 'session-A';
+  const outcome = mode === 'worker-needs-input-then-valid' && resumedSession === undefined
+    ? 'NEEDS_INPUT'
+    : 'COMPLETED';
+  const result = workerResult(outcome);
+  emit({ type: 'system', subtype: 'init', session_id: sessionId, pid: process.pid });
+  emitAssistant(`worker-${outcome}`, [result]);
+  emit({ type: 'result', subtype: 'success', session_id: sessionId, result });
 } else if (mode === 'missing-result') {
   emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
   emit({ type: 'assistant', text: 'no terminal result' });
@@ -258,7 +269,11 @@ function runPersistent(scenario) {
     const resultSession = scenario === 'persistent-conflicting-session'
       ? 'persistent-session-B'
       : scenario === 'persistent-missing-session' ? undefined : initSession;
-    const result = scenario === 'persistent-input-roundtrip'
+    const result = scenario === 'persistent-worker-valid'
+      ? workerResult('COMPLETED')
+      : scenario === 'persistent-worker-malformed-then-valid'
+        ? turnCount === 1 ? '<AGENTHUB_RESULT>{bad}</AGENTHUB_RESULT>' : workerResult('COMPLETED')
+      : scenario === 'persistent-input-roundtrip'
       ? prompt
       : scenario === 'persistent-context' && turnCount > 1
         ? marker ?? 'missing-marker'
@@ -284,4 +299,18 @@ function runPersistent(scenario) {
     }
     if (scenario === 'persistent-exit-after-result') setTimeout(() => process.exit(0), 50);
   });
+}
+
+function workerResult(outcome) {
+  return `<AGENTHUB_RESULT>${JSON.stringify({
+    protocolVersion: 1,
+    outcome,
+    summary: `fixture-${outcome}`,
+    changedFiles: [],
+    checks: [],
+    blockers: outcome === 'BLOCKED' ? ['fixture blocker'] : [],
+    questions: outcome === 'NEEDS_INPUT' ? ['fixture question'] : [],
+    risks: [],
+    notes: [],
+  })}</AGENTHUB_RESULT>`;
 }

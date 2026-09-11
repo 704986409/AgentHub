@@ -6,3 +6,4 @@ export * from './ClaudeResumePerTurnTransport.js';
 export * from './ClaudePersistentStreamTransport.js';
 export * from './ClaudeAutoTransport.js';
 export * from './ClaudeEventMapper.js';
+export * from './ClaudeWorkerSession.js';
