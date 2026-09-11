@@ -4,3 +4,4 @@ export * from './ClaudeProcessManager.js';
 export * from './ClaudeJsonlParser.js';
 export * from './ClaudeResumePerTurnTransport.js';
 export * from './ClaudePersistentStreamTransport.js';
+export * from './ClaudeAutoTransport.js';
