@@ -23,19 +23,33 @@ class FixtureHarness {
     const scenario = this.scenarios[this.calls.length];
     if (scenario === undefined) throw new Error('No fixture scenario configured');
     this.calls.push(options);
-    const manager = new ClaudeProcessManager({
+    const managerOptions: ClaudeProcessManagerOptions = {
       command: process.execPath,
       args: [fixturePath, scenario, ...(options.args ?? [])],
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
       ...(options.env === undefined ? {} : { env: options.env }),
       stopTimeoutMs: 75,
-    });
+    };
+    const manager = scenario === 'stop-failure'
+      ? new StopFailureClaudeProcessManager(managerOptions)
+      : new ClaudeProcessManager(managerOptions);
     this.managers.push(manager);
     return manager;
   };
 
   public allStopped(): boolean {
     return this.managers.every((manager) => !manager.running && manager.pid === undefined);
+  }
+}
+
+class StopFailureClaudeProcessManager extends ClaudeProcessManager {
+  #stopFailed = false;
+
+  public override async stop(): Promise<void> {
+    await super.stop();
+    if (this.#stopFailed) return;
+    this.#stopFailed = true;
+    throw new Error('simulated stop failure');
   }
 }
 
@@ -105,6 +119,63 @@ describe('Claude resume-per-turn transport', () => {
     expect(error.cause).toMatchObject({ code: 'CLAUDE_JSONL_INVALID_JSON' });
     expect(harness.allStopped()).toBe(true);
     await expect(transport.runTurn({ prompt: 'after failure' })).resolves.toMatchObject({ resultText: 'first-ok' });
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('ignores stdout after a parser failure without an uncaught EventEmitter exception', async () => {
+    const harness = new FixtureHarness(['parser-error-extra-output']);
+    const transport = createTransport(harness);
+
+    const error = await captureFailure(transport.runTurn({ prompt: 'bad stream', timeoutMs: 2_000 }));
+    expect(error).toBeInstanceOf(ClaudeTurnError);
+    expect(error).toMatchObject({ code: 'CLAUDE_STREAM_PROTOCOL_ERROR' });
+    if (!(error instanceof Error)) throw new Error('Expected ClaudeTurnError');
+    expect(error.cause).toMatchObject({ code: 'CLAUDE_JSONL_INVALID_JSON' });
+    expect(harness.allStopped()).toBe(true);
+    expect(transport.active).toBe(false);
+  });
+
+  it('releases the turn guard when process stop cleanup fails', async () => {
+    const harness = new FixtureHarness(['stop-failure', 'turn-success']);
+    const transport = createTransport(harness);
+
+    await expect(transport.runTurn({ prompt: 'stop fails' })).rejects.toThrow('simulated stop failure');
+    expect(transport.active).toBe(false);
+    await expect(transport.runTurn({ prompt: 'after stop failure' })).resolves.toMatchObject({
+      resultText: 'first-ok',
+    });
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('isolates raw message observer failures from a successful turn', async () => {
+    const harness = new FixtureHarness(['turn-success']);
+    const transport = createTransport(harness, {
+      onRawMessage: () => {
+        throw new Error('observer failed');
+      },
+    });
+
+    await expect(transport.runTurn({ prompt: 'observer failure' })).resolves.toMatchObject({
+      sessionId: 'session-A',
+      resultText: 'first-ok',
+      exitCode: 0,
+    });
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('isolates stderr observer failures from a successful turn', async () => {
+    const harness = new FixtureHarness(['turn-success-with-stderr']);
+    const transport = createTransport(harness, {
+      onStderr: () => {
+        throw new Error('stderr observer failed');
+      },
+    });
+
+    await expect(transport.runTurn({ prompt: 'stderr observer failure' })).resolves.toMatchObject({
+      sessionId: 'session-A',
+      resultText: 'first-ok',
+      exitCode: 0,
+    });
     expect(harness.allStopped()).toBe(true);
   });
 
@@ -187,6 +258,7 @@ function createTransport(
   options: {
     env?: NodeJS.ProcessEnv;
     onRawMessage?: (message: ClaudeRawMessage) => void;
+    onStderr?: (chunk: Buffer) => void;
   } = {},
 ): ClaudeResumePerTurnTransport {
   return new ClaudeResumePerTurnTransport({

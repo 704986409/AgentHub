@@ -30,7 +30,7 @@ if (mode === 'quick') {
 } else if (mode === 'hang') {
   process.stdin.resume();
   setInterval(() => undefined, 1_000);
-} else if (mode === 'turn-success' || mode === 'prompt-args' || mode === 'env-overlay') {
+} else if (mode === 'turn-success' || mode === 'turn-success-with-stderr' || mode === 'prompt-args' || mode === 'env-overlay') {
   const args = process.argv.slice(3);
   const resumedSession = readOption(args, '--resume');
   const sessionId = resumedSession ?? 'session-A';
@@ -40,6 +40,7 @@ if (mode === 'quick') {
     : mode === 'env-overlay'
       ? JSON.stringify({ inheritedPath: typeof process.env.PATH === 'string', custom: process.env.AGENTHUB_TEST_ENV })
       : resumedSession === undefined ? 'first-ok' : 'second-ok';
+  if (mode === 'turn-success-with-stderr') process.stderr.write('INFO observer diagnostic\n');
   emitTurn(sessionId, sessionId, result);
 } else if (mode === 'missing-result') {
   emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
@@ -65,6 +66,14 @@ if (mode === 'quick') {
 } else if (mode === 'parser-error-hang') {
   process.stdout.write('{bad json}\n');
   setInterval(() => undefined, 1_000);
+} else if (mode === 'parser-error-extra-output') {
+  process.stdout.write('{bad json}\n');
+  setTimeout(() => {
+    emit({ type: 'assistant', text: 'late' });
+  }, 0);
+  setInterval(() => undefined, 1_000);
+} else if (mode === 'stop-failure') {
+  emitTurn('session-A', 'session-A', 'stop-failure-result');
 } else if (mode === 'result-hang') {
   emitTurn('session-A', 'session-A', 'present');
   setInterval(() => undefined, 1_000);

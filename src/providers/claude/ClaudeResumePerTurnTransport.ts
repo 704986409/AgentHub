@@ -1,5 +1,5 @@
 import type { ClaudeRawMessage } from './ClaudeJsonlParser.js';
-import { ClaudeJsonlParser, type ClaudeJsonlParseError } from './ClaudeJsonlParser.js';
+import { ClaudeJsonlParseError, ClaudeJsonlParser } from './ClaudeJsonlParser.js';
 import {
   ClaudeProcessManager,
   type ClaudeProcessExit,
@@ -124,18 +124,37 @@ export class ClaudeResumePerTurnTransport {
     const collection: TurnCollection = { sessionIds: [], messageTypes: [], result: undefined, duplicateResult: false };
     let parseError: ClaudeJsonlParseError | undefined;
     let processError: Error | undefined;
+    let terminalFailure = false;
+    const failOnce = (error: unknown): void => {
+      if (terminalFailure) return;
+      terminalFailure = true;
+      parseError = error instanceof ClaudeJsonlParseError
+        ? error
+        : new ClaudeJsonlParseError(
+          'CLAUDE_JSONL_PARSER_FAILED',
+          'Claude JSONL parser failed while consuming stdout',
+          parser.lineNumber,
+          0,
+          { cause: error },
+        );
+      void processManager.stop().catch(() => undefined);
+    };
     const parser = new ClaudeJsonlParser({
       onMessage: (message) => {
         collectMessage(collection, message);
-        this.#onRawMessage?.(message);
+        notifyObserver(this.#onRawMessage, message);
       },
-      onError: (error) => {
-        parseError = error;
-        void processManager.stop().catch(() => undefined);
-      },
+      onError: failOnce,
     });
-    processManager.on('stdout', (chunk: Buffer) => parser.push(chunk));
-    processManager.on('stderr', (chunk: Buffer) => this.#onStderr?.(chunk));
+    processManager.on('stdout', (chunk: Buffer) => {
+      if (terminalFailure) return;
+      try {
+        parser.push(chunk);
+      } catch (error) {
+        failOnce(error);
+      }
+    });
+    processManager.on('stderr', (chunk: Buffer) => notifyObserver(this.#onStderr, chunk));
     processManager.on('error', (error: Error) => {
       processError = error;
     });
@@ -186,10 +205,16 @@ export class ClaudeResumePerTurnTransport {
         cause: error,
       });
     } finally {
-      await processManager.stop();
-      parser.end();
-      this.#activeProcess = undefined;
-      this.#active = false;
+      try {
+        await processManager.stop();
+      } finally {
+        try {
+          parser.end();
+        } finally {
+          this.#activeProcess = undefined;
+          this.#active = false;
+        }
+      }
     }
   }
 
@@ -285,5 +310,13 @@ function validateRequest(request: ClaudeTurnRequest): void {
 function validateTimeout(timeoutMs: number): void {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
     throw new ClaudeTurnError('CLAUDE_INVALID_TURN_REQUEST', 'Claude turn timeout must be a positive safe integer');
+  }
+}
+
+function notifyObserver<T>(callback: ((value: T) => void) | undefined, value: T): void {
+  try {
+    callback?.(value);
+  } catch {
+    // Observer callbacks are diagnostic side channels and cannot affect the turn lifecycle.
   }
 }
