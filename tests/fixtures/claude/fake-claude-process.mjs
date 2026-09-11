@@ -1,10 +1,13 @@
 import { Buffer } from 'node:buffer';
 import process from 'node:process';
+import { createInterface } from 'node:readline';
 import { setInterval, setTimeout } from 'node:timers';
 
 const mode = process.argv[2] ?? 'quick';
 
-if (mode === 'quick') {
+if (mode.startsWith('persistent-')) {
+  runPersistent(mode);
+} else if (mode === 'quick') {
   process.stdout.write('{"type":"result","ok":true}\n');
 } else if (mode === 'exit') {
   process.exitCode = Number(process.argv[3] ?? '7');
@@ -100,4 +103,89 @@ function readOption(args, name) {
 function readPrintPrompt(args) {
   const index = args.indexOf('-p');
   return index < 0 ? undefined : args[index + 1];
+}
+
+function runPersistent(scenario) {
+  const args = process.argv.slice(3);
+  const resumedSession = readOption(args, '--resume');
+  const baseSession = resumedSession ?? 'persistent-session-A';
+  let turnCount = 0;
+  let marker;
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+
+  if (scenario === 'persistent-unexpected-idle-result') {
+    setTimeout(() => emit({ type: 'result', session_id: baseSession, result: 'idle' }), 25);
+  }
+  if (scenario === 'persistent-idle-parser-error') {
+    setTimeout(() => process.stdout.write('{bad idle json}\n'), 25);
+  }
+  if (scenario === 'persistent-idle-assistant') {
+    setTimeout(() => emit({ type: 'assistant', text: 'idle output' }), 25);
+  }
+
+  input.on('line', (line) => {
+    let frame;
+    try {
+      frame = JSON.parse(line);
+    } catch {
+      process.exitCode = 65;
+      input.close();
+      return;
+    }
+    if (frame?.type !== 'user' || frame?.message?.role !== 'user' || typeof frame?.message?.content !== 'string') {
+      process.exitCode = 66;
+      input.close();
+      return;
+    }
+    turnCount += 1;
+    const prompt = frame.message.content;
+
+    if (scenario === 'persistent-hang') return;
+    if (scenario === 'persistent-parser-error') {
+      process.stdout.write('{bad json}\n');
+      setTimeout(() => emit({ type: 'assistant', text: 'late' }), 0);
+      return;
+    }
+    if (scenario === 'persistent-exit-busy') {
+      process.exit(9);
+    }
+
+    const initSession = scenario === 'persistent-initial-resume-mismatch'
+      ? 'persistent-session-B'
+      : scenario === 'persistent-conflicting-init' && turnCount === 2
+        ? 'persistent-session-B'
+        : baseSession;
+    if ((turnCount === 1 && scenario !== 'persistent-missing-session') ||
+      scenario === 'persistent-repeated-init' || scenario === 'persistent-conflicting-init' ||
+      scenario === 'persistent-initial-resume-mismatch') {
+      emit({ type: 'system', subtype: 'init', session_id: initSession, pid: process.pid });
+    }
+    emit({ type: 'assistant', text: 'fixture assistant' });
+
+    if (scenario === 'persistent-context') {
+      const match = prompt.match(/AGENTHUB_PERSISTENT_[A-Za-z0-9-]+/u);
+      if (match !== null) marker = match[0];
+    }
+    if (scenario === 'persistent-stderr') process.stderr.write(`INFO turn ${String(turnCount)} diagnostic\n`);
+    const resultSession = scenario === 'persistent-conflicting-session'
+      ? 'persistent-session-B'
+      : scenario === 'persistent-missing-session' ? undefined : initSession;
+    const result = scenario === 'persistent-input-roundtrip'
+      ? prompt
+      : scenario === 'persistent-context' && turnCount > 1
+        ? marker ?? 'missing-marker'
+        : `turn-${String(turnCount)}`;
+    emit({
+      type: 'result',
+      subtype: 'success',
+      session_id: resultSession,
+      result,
+      is_error: scenario === 'persistent-error-result',
+      input_frame_count: turnCount,
+    });
+    if (scenario === 'persistent-duplicate-result') {
+      emit({ type: 'result', subtype: 'success', session_id: resultSession, result: 'duplicate' });
+    }
+    if (scenario === 'persistent-exit-after-result') setTimeout(() => process.exit(0), 50);
+  });
 }
