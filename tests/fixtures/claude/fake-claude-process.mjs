@@ -108,7 +108,9 @@ function readPrintPrompt(args) {
 function runPersistent(scenario) {
   const args = process.argv.slice(3);
   const resumedSession = readOption(args, '--resume');
-  const baseSession = resumedSession ?? 'persistent-session-A';
+  const baseSession = resumedSession ?? (scenario === 'persistent-session-B'
+    ? 'persistent-session-B'
+    : 'persistent-session-A');
   let turnCount = 0;
   let marker;
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -121,6 +123,9 @@ function runPersistent(scenario) {
   }
   if (scenario === 'persistent-idle-assistant') {
     setTimeout(() => emit({ type: 'assistant', text: 'idle output' }), 25);
+  }
+  if (scenario === 'persistent-natural-exit') {
+    setTimeout(() => process.exit(0), 250);
   }
 
   input.on('line', (line) => {

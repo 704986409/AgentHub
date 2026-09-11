@@ -88,6 +88,11 @@ interface RuntimeGeneration {
   onExit: (exit: ClaudeProcessExit) => void;
 }
 
+interface StopRuntimeResult {
+  released: boolean;
+  error: unknown;
+}
+
 export class ClaudePersistentStreamTransport {
   readonly #command: string;
   readonly #env: NodeJS.ProcessEnv | undefined;
@@ -125,8 +130,7 @@ export class ClaudePersistentStreamTransport {
   }
 
   public get running(): boolean {
-    return this.#runtime?.manager.running === true &&
-      (this.#state === 'IDLE' || this.#state === 'BUSY');
+    return this.#runtime?.manager.running === true;
   }
 
   public get active(): boolean {
@@ -138,6 +142,10 @@ export class ClaudePersistentStreamTransport {
   }
 
   public get sessionId(): string | undefined {
+    return this.#runtime?.sessionId;
+  }
+
+  public get lastSessionId(): string | undefined {
     return this.#lastSessionId;
   }
 
@@ -185,22 +193,18 @@ export class ClaudePersistentStreamTransport {
       }
       this.#state = 'IDLE';
     } catch (cause) {
-      try {
-        await manager.stop();
-      } catch {
-        // Startup failure is primary.
-      } finally {
-        this.cleanupRuntime(runtime);
-        this.#state = 'STOPPED';
-      }
-      if (cause instanceof ClaudePersistentError) throw cause;
-      throw new ClaudePersistentError(
-        'CLAUDE_PERSISTENT_PROCESS_FAILED',
-        'Unable to start Claude persistent process',
-        undefined,
-        undefined,
-        { cause },
-      );
+      const error = cause instanceof ClaudePersistentError
+        ? cause
+        : new ClaudePersistentError(
+          'CLAUDE_PERSISTENT_PROCESS_FAILED',
+          'Unable to start Claude persistent process',
+          undefined,
+          undefined,
+          { cause },
+        );
+      this.failRuntime(runtime, error);
+      await runtime.cleanupPromise;
+      throw runtime.failure ?? error;
     }
   }
 
@@ -229,6 +233,7 @@ export class ClaudePersistentStreamTransport {
       resolveTurn = resolve;
       rejectTurn = reject;
     });
+    resultPromise.catch(() => undefined);
     if (resolveTurn === undefined || rejectTurn === undefined) throw new Error('Unable to create persistent turn completion');
     const turn: ActiveTurn = {
       startedAt: Date.now(),
@@ -281,25 +286,25 @@ export class ClaudePersistentStreamTransport {
     );
     if (this.#activeTurn !== undefined && runtime.failure === undefined) runtime.failure = shutdownError;
     this.#shutdownPromise = (async () => {
-      let cleanupError: unknown;
       try {
-        await runtime.manager.stop();
-      } catch (error) {
-        cleanupError = error;
-      } finally {
-        this.cleanupRuntime(runtime);
+        const outcome = await this.stopRuntime(runtime);
         if (this.#activeTurn !== undefined) this.rejectActiveTurn(runtime.failure ?? shutdownError);
-        this.#state = 'STOPPED';
+        this.#state = outcome.released ? 'STOPPED' : 'FAILED';
+        if (outcome.error !== undefined || !outcome.released) {
+          const cleanupError = new ClaudePersistentError(
+            'CLAUDE_PERSISTENT_PROCESS_FAILED',
+            outcome.error === undefined
+              ? 'Claude persistent process remained running after stop completed'
+              : 'Unable to stop Claude persistent process',
+            undefined,
+            undefined,
+            outcome.error === undefined ? undefined : { cause: outcome.error },
+          );
+          if (!outcome.released) runtime.failure ??= cleanupError;
+          throw cleanupError;
+        }
+      } finally {
         this.#shutdownPromise = undefined;
-      }
-      if (cleanupError !== undefined && runtime.failure === undefined) {
-        throw new ClaudePersistentError(
-          'CLAUDE_PERSISTENT_PROCESS_FAILED',
-          'Unable to stop Claude persistent process',
-          undefined,
-          undefined,
-          { cause: cleanupError },
-        );
       }
     })();
     return this.#shutdownPromise;
@@ -330,7 +335,9 @@ export class ClaudePersistentStreamTransport {
       failure: undefined,
       cleanupPromise: undefined,
       onStdout: (chunk: Buffer) => {
-        if (this.#runtime !== runtime || runtime.terminal) return;
+        if (this.#runtime !== runtime || runtime.terminal || runtime.failure !== undefined || this.#state === 'STOPPING') {
+          return;
+        }
         try {
           parser.push(chunk);
         } catch (cause) {
@@ -382,7 +389,7 @@ export class ClaudePersistentStreamTransport {
   }
 
   private handleMessage(runtime: RuntimeGeneration, message: ClaudeRawMessage): void {
-    if (this.#runtime !== runtime || runtime.terminal) return;
+    if (this.#runtime !== runtime || runtime.terminal || runtime.failure !== undefined) return;
     notifyObserver(this.#onRawMessage, message);
     if ((message.type === 'system' && message.subtype === 'init') || message.type === 'result') {
       if (!this.observeSessionId(runtime, message.session_id)) return;
@@ -489,17 +496,17 @@ export class ClaudePersistentStreamTransport {
   }
 
   private handleExit(runtime: RuntimeGeneration, exit: ClaudeProcessExit): void {
-    if (this.#runtime !== runtime || runtime.terminal || runtime.failure !== undefined || this.#state === 'STOPPING') return;
-    const error = new ClaudePersistentError(
+    if (this.#runtime !== runtime || runtime.terminal) return;
+    const error = runtime.failure ?? new ClaudePersistentError(
       'CLAUDE_PERSISTENT_PROCESS_EXITED',
       'Claude persistent process exited unexpectedly',
       exit.code,
       exit.signal,
     );
-    runtime.failure = error;
-    this.#state = 'FAILED';
+    runtime.failure ??= error;
     this.cleanupRuntime(runtime);
     if (this.#activeTurn !== undefined) this.rejectActiveTurn(error);
+    this.#state = 'STOPPED';
   }
 
   private failRuntime(runtime: RuntimeGeneration, error: ClaudePersistentError): void {
@@ -508,15 +515,22 @@ export class ClaudePersistentStreamTransport {
     this.#state = 'FAILED';
     if (this.#activeTurn !== undefined) clearTimeout(this.#activeTurn.timer);
     runtime.cleanupPromise = (async () => {
-      try {
-        await runtime.manager.stop();
-      } catch {
-        // The primary runtime/protocol error must remain visible.
-      } finally {
-        this.cleanupRuntime(runtime);
-        if (this.#activeTurn !== undefined) this.rejectActiveTurn(error);
-      }
+      const outcome = await this.stopRuntime(runtime);
+      if (this.#activeTurn !== undefined) this.rejectActiveTurn(error);
+      this.#state = outcome.released ? 'STOPPED' : 'FAILED';
     })();
+  }
+
+  private async stopRuntime(runtime: RuntimeGeneration): Promise<StopRuntimeResult> {
+    let error: unknown;
+    try {
+      await runtime.manager.stop();
+    } catch (cause) {
+      error = cause;
+    }
+    if (runtime.manager.running) return { released: false, error };
+    this.cleanupRuntime(runtime);
+    return { released: true, error };
   }
 
   private rejectActiveTurn(error: ClaudePersistentError): void {

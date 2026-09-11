@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ClaudePersistentError,
   ClaudePersistentStreamTransport,
+  ClaudeProcessError,
   ClaudeProcessManager,
   buildClaudePersistentArgs,
   encodeClaudeUserInput,
@@ -17,6 +18,7 @@ const fixturePath = fileURLToPath(new URL('./fixtures/claude/fake-claude-process
 class PersistentHarness {
   readonly calls: ClaudeProcessManagerOptions[] = [];
   readonly managers: ClaudeProcessManager[] = [];
+  readonly liveStopManagers: NonStoppingProcessManager[] = [];
 
   public constructor(private readonly scenarios: string[]) {}
 
@@ -25,8 +27,11 @@ class PersistentHarness {
     if (requestedScenario === undefined) throw new Error('No persistent fixture scenario configured');
     this.calls.push(options);
     if (requestedScenario === 'factory-failure') throw new Error('simulated process factory failure');
-    const stopFailure = requestedScenario.endsWith('-stop-failure');
-    const scenario = stopFailure ? requestedScenario.replace(/-stop-failure$/u, '') : requestedScenario;
+    const liveStopFailure = requestedScenario.endsWith('-live-stop-failure');
+    const stopFailure = !liveStopFailure && requestedScenario.endsWith('-stop-failure');
+    const scenario = liveStopFailure
+      ? requestedScenario.replace(/-live-stop-failure$/u, '')
+      : stopFailure ? requestedScenario.replace(/-stop-failure$/u, '') : requestedScenario;
     const managerOptions: ClaudeProcessManagerOptions = requestedScenario === 'spawn-failure'
       ? { command: 'agenthub-definitely-missing-claude-command' }
       : {
@@ -36,9 +41,10 @@ class PersistentHarness {
         ...(options.env === undefined ? {} : { env: options.env }),
         stopTimeoutMs: 100,
       };
-    const manager = stopFailure
-      ? new StopFailureProcessManager(managerOptions)
-      : new ClaudeProcessManager(managerOptions);
+    const manager = liveStopFailure
+      ? new NonStoppingProcessManager(managerOptions)
+      : stopFailure ? new StopFailureProcessManager(managerOptions) : new ClaudeProcessManager(managerOptions);
+    if (manager instanceof NonStoppingProcessManager) this.liveStopManagers.push(manager);
     this.managers.push(manager);
     return manager;
   };
@@ -52,6 +58,20 @@ class StopFailureProcessManager extends ClaudeProcessManager {
   public override async stop(): Promise<void> {
     await super.stop();
     throw new Error('simulated persistent stop failure');
+  }
+}
+
+class NonStoppingProcessManager extends ClaudeProcessManager {
+  public allowStop = false;
+
+  public override async stop(): Promise<void> {
+    if (!this.allowStop) {
+      throw new ClaudeProcessError(
+        'CLAUDE_PROCESS_STOP_TIMEOUT',
+        'simulated live process stop timeout',
+      );
+    }
+    await super.stop();
   }
 }
 
@@ -155,13 +175,39 @@ describe('Claude persistent-stream transport', () => {
     const harness = new PersistentHarness(['persistent-success']);
     const transport = createTransport(harness, { initialSessionId: 'session-X' });
     await transport.start();
+    expect(transport.sessionId).toBe('session-X');
+    expect(transport.lastSessionId).toBeUndefined();
     const first = await transport.runTurn({ prompt: 'one' });
     const second = await transport.runTurn({ prompt: 'two' });
 
     expect(first.sessionId).toBe('session-X');
     expect(second.sessionId).toBe('session-X');
+    expect(transport.lastSessionId).toBe('session-X');
     expect(readOption(argsFor(harness, 0), '--resume')).toBe('session-X');
     expect(harness.calls).toHaveLength(1);
+    await transport.shutdown();
+    expect(transport.sessionId).toBeUndefined();
+    expect(transport.lastSessionId).toBe('session-X');
+  });
+
+  it('separates the current generation session from the last confirmed session', async () => {
+    const harness = new PersistentHarness(['persistent-success', 'persistent-session-B']);
+    const transport = createTransport(harness);
+
+    await transport.start();
+    await transport.runTurn({ prompt: 'generation A' });
+    expect(transport.sessionId).toBe('persistent-session-A');
+    expect(transport.lastSessionId).toBe('persistent-session-A');
+    await transport.shutdown();
+    expect(transport.sessionId).toBeUndefined();
+    expect(transport.lastSessionId).toBe('persistent-session-A');
+
+    await transport.start();
+    expect(transport.sessionId).toBeUndefined();
+    expect(transport.lastSessionId).toBe('persistent-session-A');
+    await transport.runTurn({ prompt: 'generation B' });
+    expect(transport.sessionId).toBe('persistent-session-B');
+    expect(transport.lastSessionId).toBe('persistent-session-B');
     await transport.shutdown();
   });
 
@@ -402,6 +448,123 @@ describe('Claude persistent-stream transport', () => {
     await expect(transport.runTurn({ prompt: 'after stop failure' })).resolves.toMatchObject({ resultText: 'turn-1' });
     await transport.shutdown();
     expect(harness.allStopped()).toBe(true);
+  });
+
+  it('retains an idle live child after stop failure and retries the same runtime', async () => {
+    const harness = new PersistentHarness(['persistent-success-live-stop-failure']);
+    const transport = createTransport(harness);
+    await transport.start();
+    await transport.runTurn({ prompt: 'confirm session' });
+
+    const error = await captureFailure(transport.shutdown());
+    expect(error).toMatchObject({
+      code: 'CLAUDE_PERSISTENT_PROCESS_FAILED',
+      cause: { code: 'CLAUDE_PROCESS_STOP_TIMEOUT' },
+    });
+    expect(transport.running).toBe(true);
+    expect(transport.active).toBe(false);
+    expect(transport.sessionId).toBe('persistent-session-A');
+    expect(transport.lastSessionId).toBe('persistent-session-A');
+    await expect(transport.start()).rejects.toMatchObject({ code: 'CLAUDE_PERSISTENT_ALREADY_RUNNING' });
+    await expect(transport.runTurn({ prompt: 'blocked' })).rejects.toMatchObject({
+      code: 'CLAUDE_PERSISTENT_NOT_STARTED',
+    });
+    expect(harness.calls).toHaveLength(1);
+
+    const manager = harness.liveStopManagers[0];
+    if (manager === undefined) throw new Error('Missing live-stop manager');
+    expect(manager.listenerCount('exit')).toBe(1);
+    manager.allowStop = true;
+    await transport.shutdown();
+    expect(transport.running).toBe(false);
+    expect(transport.sessionId).toBeUndefined();
+    expect(transport.lastSessionId).toBe('persistent-session-A');
+    expect(manager.listenerCount('exit')).toBe(0);
+    expect(harness.calls).toHaveLength(1);
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('settles a busy turn separately from a live-child shutdown failure', async () => {
+    const harness = new PersistentHarness(['persistent-hang-live-stop-failure']);
+    const transport = createTransport(harness);
+    await transport.start();
+    const turn = captureFailure(transport.runTurn({ prompt: 'busy' }));
+    const shutdown = captureFailure(transport.shutdown());
+
+    await expect(turn).resolves.toMatchObject({ code: 'CLAUDE_PERSISTENT_SHUTDOWN' });
+    await expect(shutdown).resolves.toMatchObject({
+      code: 'CLAUDE_PERSISTENT_PROCESS_FAILED',
+      cause: { code: 'CLAUDE_PROCESS_STOP_TIMEOUT' },
+    });
+    expect(transport.running).toBe(true);
+    expect(transport.active).toBe(false);
+    await expect(transport.start()).rejects.toMatchObject({ code: 'CLAUDE_PERSISTENT_ALREADY_RUNNING' });
+    expect(harness.calls).toHaveLength(1);
+
+    const manager = harness.liveStopManagers[0];
+    if (manager === undefined) throw new Error('Missing live-stop manager');
+    manager.allowStop = true;
+    await transport.shutdown();
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('preserves timeout as primary while retaining a child that failed to stop', async () => {
+    const harness = new PersistentHarness(['persistent-hang-live-stop-failure']);
+    const transport = createTransport(harness);
+    await transport.start();
+
+    await expect(transport.runTurn({ prompt: 'timeout', timeoutMs: 30 })).rejects.toMatchObject({
+      code: 'CLAUDE_PERSISTENT_TURN_TIMEOUT',
+    });
+    expect(transport.running).toBe(true);
+    expect(transport.active).toBe(false);
+    await expect(transport.start()).rejects.toMatchObject({ code: 'CLAUDE_PERSISTENT_ALREADY_RUNNING' });
+    expect(harness.calls).toHaveLength(1);
+
+    const manager = harness.liveStopManagers[0];
+    if (manager === undefined) throw new Error('Missing live-stop manager');
+    manager.allowStop = true;
+    await transport.shutdown();
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('preserves parser failure while retaining a child that failed to stop', async () => {
+    const harness = new PersistentHarness(['persistent-parser-error-live-stop-failure']);
+    const transport = createTransport(harness);
+    await transport.start();
+
+    const error = await captureFailure(transport.runTurn({ prompt: 'bad stream' }));
+    expect(error).toMatchObject({ code: 'CLAUDE_PERSISTENT_STREAM_PROTOCOL_ERROR' });
+    if (!(error instanceof Error)) throw new Error('Expected persistent parser error');
+    expect(error.cause).toMatchObject({ code: 'CLAUDE_JSONL_INVALID_JSON' });
+    expect(transport.running).toBe(true);
+    expect(transport.active).toBe(false);
+    expect(harness.calls).toHaveLength(1);
+
+    const manager = harness.liveStopManagers[0];
+    if (manager === undefined) throw new Error('Missing live-stop manager');
+    manager.allowStop = true;
+    await transport.shutdown();
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('finalizes retained ownership when a child exits after stop failure', async () => {
+    const harness = new PersistentHarness([
+      'persistent-natural-exit-live-stop-failure',
+      'persistent-success',
+    ]);
+    const transport = createTransport(harness);
+    await transport.start();
+
+    await expect(transport.shutdown()).rejects.toMatchObject({ code: 'CLAUDE_PERSISTENT_PROCESS_FAILED' });
+    expect(transport.running).toBe(true);
+    await waitFor(() => !transport.running);
+    expect(harness.allStopped()).toBe(true);
+
+    await transport.start();
+    await expect(transport.runTurn({ prompt: 'new generation' })).resolves.toMatchObject({ resultText: 'turn-1' });
+    expect(harness.calls).toHaveLength(2);
+    await transport.shutdown();
   });
 
   it('runs 25 turns with one process, one session, and no listener growth', async () => {
