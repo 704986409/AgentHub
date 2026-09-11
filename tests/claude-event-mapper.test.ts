@@ -123,11 +123,13 @@ describe('Claude event mapper', () => {
         ],
       },
     });
+    mapper.observeRawMessage({ type: 'result', session_id: 's1', result: 'PRIVATE_RESULT_SENTINEL' });
 
     expect(events.map((event) => event.eventType)).toEqual([
       AgentRuntimeEventType.AGENT_OPERATION_STARTED,
       AgentRuntimeEventType.AGENT_OPERATION_STARTED,
       AgentRuntimeEventType.AGENT_MESSAGE_COMPLETED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
     ]);
     expect(events[0]?.payload).toMatchObject({ provider: 'claude', sourceType: 'assistant', messageId: 'm1', operationType: 'tool_use', toolUseId: 'tool-1', toolName: 'Read' });
     expect(events[1]?.payload).toMatchObject({ toolUseId: 'tool-2', toolName: 'Write' });
@@ -231,14 +233,135 @@ describe('Claude event mapper', () => {
     });
     expectSerialized(events).not.toContainAny(['PRIVATE_RESULT_SENTINEL', 'PRIVATE_ERROR_SENTINEL']);
   });
-  it('maps rate-limit metadata and excludes malformed numeric values', () => {
+  it('maps current camelCase rate-limit metadata with snake_case compatibility fallback', () => {
     const { mapper, events } = createMapper();
-    mapper.observeRawMessage({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', type: 'tokens', resets_at: 123, is_using_overage: true, secret: 'PRIVATE_ERROR_SENTINEL' } });
+    mapper.observeRawMessage({
+      type: 'rate_limit_event',
+      rate_limit_info: {
+        status: 'allowed', rateLimitType: 'five_hour', resetsAt: 1_788_465_600,
+        isUsingOverage: false, rate_limit_type: 'legacy', resets_at: 123, is_using_overage: true,
+        secret: 'PRIVATE_ERROR_SENTINEL',
+      },
+    });
+    mapper.observeRawMessage({
+      type: 'rate_limit_event',
+      rate_limit_info: { status: 'allowed', type: 'tokens', resets_at: 123, is_using_overage: true },
+    });
     mapper.observeRawMessage({ type: 'result', duration_ms: Number.NaN, duration_api_ms: Number.POSITIVE_INFINITY, num_turns: 1.5, total_cost_usd: Number.NEGATIVE_INFINITY, usage: { input_tokens: Number.NaN } });
 
-    expect(events[0]?.payload).toEqual({ provider: 'claude', sourceType: 'rate_limit_event', rateLimitStatus: 'allowed', rateLimitType: 'tokens', resetsAt: 123, isUsingOverage: true });
-    expect(events[1]?.payload).toEqual({ provider: 'claude', sourceType: 'result' });
+    expect(events[0]?.payload).toEqual({
+      provider: 'claude', sourceType: 'rate_limit_event', rateLimitStatus: 'allowed',
+      rateLimitType: 'five_hour', resetsAt: 1_788_465_600, isUsingOverage: false,
+    });
+    expect(events[1]?.payload).toEqual({
+      provider: 'claude', sourceType: 'rate_limit_event', rateLimitStatus: 'allowed',
+      rateLimitType: 'tokens', resetsAt: 123, isUsingOverage: true,
+    });
+    expect(events[2]?.payload).toEqual({ provider: 'claude', sourceType: 'result' });
     expectSerialized(events).not.toContain('PRIVATE_ERROR_SENTINEL');
+  });
+
+  it('aggregates same-ID assistant frames and flushes once before the result observation', () => {
+    const { mapper, events } = createMapper();
+    mapper.observeRawMessage({ type: 'assistant', session_id: 's1', message: { id: 'msg-A', content: [{ type: 'text', text: 'abc' }] } });
+    mapper.observeRawMessage({ type: 'assistant', session_id: 's1', message: { id: 'msg-A', content: [{ type: 'text', text: 'def' }] } });
+    mapper.observeRawMessage({ type: 'assistant', session_id: 's1', message: { id: 'msg-A', content: [{ type: 'text', text: 'ghi' }] } });
+    mapper.observeRawMessage({ type: 'result', session_id: 's1', result: 'PRIVATE_RESULT_SENTINEL' });
+
+    expect(events.map((event) => event.eventType)).toEqual([
+      AgentRuntimeEventType.AGENT_MESSAGE_COMPLETED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+    ]);
+    expect(events[0]?.payload).toMatchObject({
+      messageId: 'msg-A', textLength: 9, textBlockCount: 3, contentBlockCount: 3,
+    });
+    expect(events[1]?.payload).toMatchObject({ sourceType: 'result' });
+    expectSerialized(events).not.toContainAny(['abcdefghi', 'PRIVATE_RESULT_SENTINEL']);
+  });
+
+  it('flushes distinct logical messages at ID and user boundaries in deterministic order', () => {
+    const { mapper, events } = createMapper();
+    mapper.observeRawMessage({
+      type: 'assistant', message: { id: 'msg-A', content: [
+        { type: 'text', text: 'first' },
+        { type: 'tool_use', id: 'tool-1', name: 'Read', input: { secret: 'PRIVATE_TOOL_INPUT_SENTINEL' } },
+      ] },
+    });
+    mapper.observeRawMessage({ type: 'assistant', message: { id: 'msg-B', content: [{ type: 'text', text: 'second-' }] } });
+    mapper.observeRawMessage({ type: 'assistant', message: { id: 'msg-B', content: [{ type: 'text', text: 'done' }] } });
+    mapper.observeRawMessage({
+      type: 'user', message: { content: [
+        { type: 'tool_result', tool_use_id: 'tool-1', content: 'PRIVATE_TOOL_OUTPUT_SENTINEL' },
+      ] },
+    });
+
+    expect(events.map((event) => event.eventType)).toEqual([
+      AgentRuntimeEventType.AGENT_OPERATION_STARTED,
+      AgentRuntimeEventType.AGENT_MESSAGE_COMPLETED,
+      AgentRuntimeEventType.AGENT_MESSAGE_COMPLETED,
+      AgentRuntimeEventType.AGENT_OPERATION_COMPLETED,
+    ]);
+    expect(events[1]?.payload).toMatchObject({ messageId: 'msg-A', textLength: 5, textBlockCount: 1 });
+    expect(events[2]?.payload).toMatchObject({ messageId: 'msg-B', textLength: 11, textBlockCount: 2 });
+    expectSerialized(events).not.toContainAny(['first', 'second-', 'done', 'PRIVATE_TOOL_INPUT_SENTINEL', 'PRIVATE_TOOL_OUTPUT_SENTINEL']);
+  });
+
+  it('does not invent completions for anonymous or thinking-only assistant frames', () => {
+    const { mapper, events } = createMapper();
+    mapper.observeRawMessage({ type: 'assistant', message: { content: [{ type: 'text', text: 'PRIVATE_ASSISTANT_SENTINEL' }] } });
+    mapper.observeRawMessage({ type: 'assistant', message: { id: 'thinking-only', content: [{ type: 'thinking', thinking: 'PRIVATE_THINKING_SENTINEL' }] } });
+    mapper.observeRawMessage({ type: 'result', result: 'PRIVATE_RESULT_SENTINEL' });
+
+    expect(events.map((event) => event.eventType)).toEqual([
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+    ]);
+    expect(events.map((event) => event.eventType)).not.toContain(AgentRuntimeEventType.AGENT_MESSAGE_COMPLETED);
+    expectSerialized(events).not.toContainAny(['PRIVATE_ASSISTANT_SENTINEL', 'PRIVATE_THINKING_SENTINEL', 'PRIVATE_RESULT_SENTINEL']);
+  });
+
+  it('drops pending assistant aggregation on execution failure and process exit', () => {
+    const failure = createMapper();
+    failure.mapper.observeRawMessage({ type: 'assistant', message: { id: 'msg-fail', content: [{ type: 'text', text: 'private-fail' }] } });
+    failure.mapper.observeExecutionFailure(new Error('private-error'));
+    failure.mapper.observeRawMessage({ type: 'result' });
+
+    const exit = createMapper();
+    exit.mapper.observeRawMessage({ type: 'assistant', message: { id: 'msg-exit', content: [{ type: 'text', text: 'private-exit' }] } });
+    exit.mapper.observeProcessExit({ exitCode: 1, expected: false });
+    exit.mapper.observeRawMessage({ type: 'result' });
+
+    expect(failure.events.map((event) => event.eventType)).toEqual([
+      AgentRuntimeEventType.AGENT_EXECUTION_FAILED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+    ]);
+    expect(exit.events.map((event) => event.eventType)).toEqual([
+      AgentRuntimeEventType.PROVIDER_PROCESS_EXITED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+    ]);
+  });
+
+  it('degrades malformed semantic event shapes to metadata-only observations', () => {
+    const { mapper, events } = createMapper();
+    mapper.observeRawMessage({ type: 'assistant', message: { id: 'm1', content: [
+      { type: 'tool_use' },
+      { type: 'tool_use', id: '', name: 'Read' },
+      { type: 'tool_use', id: 'tool-1', name: 'x'.repeat(257) },
+    ] } });
+    mapper.observeRawMessage({ type: 'user', message: { content: [{ type: 'tool_result' }] } });
+    mapper.observeRawMessage({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta' } } });
+
+    expect(events.map((event) => event.eventType)).toEqual([
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+      AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED,
+    ]);
+    expect(events[0]?.payload).toMatchObject({ malformedToolUseCount: 3 });
+    expect(events[1]?.payload).toMatchObject({ malformedToolResultCount: 1 });
+    expect(events.map((event) => event.eventType)).not.toContain(AgentRuntimeEventType.AGENT_OPERATION_STARTED);
+    expect(events.map((event) => event.eventType)).not.toContain(AgentRuntimeEventType.AGENT_OPERATION_COMPLETED);
+    expect(events.map((event) => event.eventType)).not.toContain(AgentRuntimeEventType.AGENT_MESSAGE_DELTA);
   });
 
   it('handles unknown, missing, wrong, and malformed shapes without throwing or leaking', () => {
@@ -357,7 +480,7 @@ describe('Claude event mapper', () => {
       });
       mapper.observeRawMessage({
         type: 'assistant',
-        message: { content: [
+        message: { id: 'privacy-message', content: [
           { type: 'text', text: 'PRIVATE_ASSISTANT_SENTINEL' },
           { type: 'thinking', thinking: 'PRIVATE_THINKING_SENTINEL' },
           { type: 'tool_use', id: 'tool-1', name: 'Read', input: { prompt: 'PRIVATE_PROMPT_SENTINEL' } },

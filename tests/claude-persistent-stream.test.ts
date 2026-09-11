@@ -158,6 +158,55 @@ describe('Claude persistent-stream transport', () => {
     expect(harness.allStopped()).toBe(true);
   });
 
+  it('reconstructs fragmented same-ID assistant text for every turn without leakage', async () => {
+    const harness = new PersistentHarness(['persistent-fragmented-assistant-result']);
+    const transport = createTransport(harness);
+    await transport.start();
+
+    const first = await transport.runTurn({ prompt: 'one' });
+    const second = await transport.runTurn({ prompt: 'two' });
+
+    expect(first.resultText).toBe('RESULT_PERSISTENT_1');
+    expect(second.resultText).toBe('RESULT_PERSISTENT_2');
+    expect(second.resultText).not.toContain('RESULT_PERSISTENT_1');
+    expect(first.processId).toBe(second.processId);
+    await transport.shutdown();
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('selects the final logical assistant message and ignores tool and thinking content', async () => {
+    const harness = new PersistentHarness(['persistent-intermediate-final-fragmented']);
+    const transport = createTransport(harness);
+    await transport.start();
+
+    const result = await transport.runTurn({ prompt: 'tool then final' });
+
+    expect(result.resultText).toBe('FINAL_1');
+    expect(result.resultText).not.toContain('I will inspect.');
+    expect(result.resultText).not.toContain('ignored');
+    await transport.shutdown();
+  });
+
+  it('falls back to terminal result when no valid assistant message ID can be reconstructed', async () => {
+    const harness = new PersistentHarness(['persistent-success']);
+    const transport = createTransport(harness);
+    await transport.start();
+
+    await expect(transport.runTurn({ prompt: 'fallback' })).resolves.toMatchObject({ resultText: 'turn-1' });
+    await transport.shutdown();
+  });
+
+  it('fails with the existing protocol error when reconstructed assistant text exceeds the bound', async () => {
+    const harness = new PersistentHarness(['persistent-assistant-over-limit']);
+    const transport = createTransport(harness);
+    await transport.start();
+
+    await expect(transport.runTurn({ prompt: 'too large' })).rejects.toMatchObject({
+      code: 'CLAUDE_PERSISTENT_STREAM_PROTOCOL_ERROR',
+    });
+    expect(transport.running).toBe(false);
+  });
+
   it('retains in-process context across turns', async () => {
     const harness = new PersistentHarness(['persistent-context']);
     const transport = createTransport(harness);

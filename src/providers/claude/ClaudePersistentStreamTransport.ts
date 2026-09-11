@@ -65,10 +65,17 @@ export class ClaudePersistentError extends Error {
 
 type PersistentState = 'STOPPED' | 'STARTING' | 'IDLE' | 'BUSY' | 'STOPPING' | 'FAILED';
 
+interface AssistantTextCollection {
+  messageId: string | undefined;
+  textParts: string[];
+  textLength: number;
+}
+
 interface ActiveTurn {
   startedAt: number;
   messageTypes: string[];
   result: ClaudeRawMessage | undefined;
+  assistantText: AssistantTextCollection;
   settled: boolean;
   timer: NodeJS.Timeout;
   resolve: (result: ClaudePersistentTurnResult) => void;
@@ -87,6 +94,8 @@ interface RuntimeGeneration {
   onError: (error: Error) => void;
   onExit: (exit: ClaudeProcessExit) => void;
 }
+
+const maxReconstructedAssistantChars = 1024 * 1024;
 
 interface StopRuntimeResult {
   released: boolean;
@@ -239,6 +248,7 @@ export class ClaudePersistentStreamTransport {
       startedAt: Date.now(),
       messageTypes: [],
       result: undefined,
+      assistantText: { messageId: undefined, textParts: [], textLength: 0 },
       settled: false,
       timer: setTimeout(() => {
         this.failRuntime(
@@ -396,6 +406,7 @@ export class ClaudePersistentStreamTransport {
     }
     const turn = this.#activeTurn;
     if (turn !== undefined && typeof message.type === 'string') turn.messageTypes.push(message.type);
+    if (turn !== undefined && message.type === 'assistant') collectAssistantText(turn.assistantText, message);
 
     if (message.type === 'result') {
       if (turn === undefined) {
@@ -486,7 +497,7 @@ export class ClaudePersistentStreamTransport {
     this.#state = 'IDLE';
     turn.resolve({
       sessionId,
-      resultText: typeof result.result === 'string' ? result.result : '',
+      resultText: selectResultText(turn.assistantText, result),
       messageTypes: [...turn.messageTypes],
       processId: runtime.manager.pid,
       durationMs: Date.now() - turn.startedAt,
@@ -576,6 +587,47 @@ export function encodeClaudeUserInput(prompt: string): Buffer {
     type: 'user',
     message: { role: 'user', content: prompt },
   })}\n`, 'utf8');
+}
+
+// Claude Code can split one logical assistant message across frames sharing
+// message.id while terminal result.result contains only an earlier fragment.
+function collectAssistantText(collection: AssistantTextCollection, message: ClaudeRawMessage): void {
+  const assistantMessage = asRecord(message.message);
+  const messageId = nonBlankString(assistantMessage?.id);
+  if (messageId === undefined) return;
+  if (collection.messageId !== messageId) {
+    collection.messageId = messageId;
+    collection.textParts = [];
+    collection.textLength = 0;
+  }
+  const content = assistantMessage?.content;
+  if (!Array.isArray(content)) return;
+  for (const value of content) {
+    const block = asRecord(value);
+    if (block?.type !== 'text' || typeof block.text !== 'string' || block.text.length === 0) continue;
+    const nextLength = collection.textLength + block.text.length;
+    if (nextLength > maxReconstructedAssistantChars) {
+      throw new Error(`Claude reconstructed assistant text exceeds ${String(maxReconstructedAssistantChars)} characters`);
+    }
+    collection.textParts.push(block.text);
+    collection.textLength = nextLength;
+  }
+}
+
+function selectResultText(collection: AssistantTextCollection, result: ClaudeRawMessage): string {
+  return collection.textLength > 0
+    ? collection.textParts.join('')
+    : typeof result.result === 'string' ? result.result : '';
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function nonBlankString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
 }
 
 function validatePrompt(prompt: string): void {

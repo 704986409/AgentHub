@@ -27,12 +27,23 @@ export interface ClaudeProcessExitObservation extends ClaudeExecutionObservation
 type ClaudeSafeMetadata = Record<string, string | number | boolean | null>;
 type ProviderErrorKind = 'process' | 'protocol' | 'transport';
 
+interface PendingAssistantMessage {
+  messageId: string;
+  sessionId?: string;
+  model?: string;
+  textLength: number;
+  textBlockCount: number;
+  contentBlockCount: number;
+  unknownBlockCount: number;
+}
+
 const maxMetadataStringChars = 256;
 const retrySafetyValues = new Set(['safe', 'ambiguous', 'not-applicable']);
 const transportValues = new Set<ClaudeMapperTransport>(['persistent-stream', 'resume-per-turn']);
 
 export class ClaudeEventMapper {
   readonly #context: Readonly<AgentRuntimeContext>;
+  #pendingAssistantMessage: PendingAssistantMessage | undefined;
 
   public constructor(private readonly options: ClaudeEventMapperOptions) {
     this.#context = Object.freeze({ ...options.context, provider: 'claude' });
@@ -56,12 +67,14 @@ export class ClaudeEventMapper {
         this.#observeAssistant(record);
         return;
       case 'user':
+        this.#flushPendingAssistantMessage();
         this.#observeUser(record);
         return;
       case 'stream_event':
         this.#observeStreamEvent(record);
         return;
       case 'result':
+        this.#flushPendingAssistantMessage();
         this.#observeResult(record);
         return;
       case 'rate_limit_event':
@@ -107,6 +120,7 @@ export class ClaudeEventMapper {
   }
 
   public observeExecutionFailure(error: unknown, metadata: ClaudeExecutionObservation = {}): void {
+    this.#pendingAssistantMessage = undefined;
     this.#publish(AgentRuntimeEventType.AGENT_EXECUTION_FAILED, {
       provider: 'claude',
       ...executionMetadata(metadata),
@@ -128,6 +142,7 @@ export class ClaudeEventMapper {
   }
 
   public observeProcessExit(exit: ClaudeProcessExitObservation): void {
+    this.#pendingAssistantMessage = undefined;
     this.#publish(AgentRuntimeEventType.PROVIDER_PROCESS_EXITED, {
       provider: 'claude',
       ...executionMetadata(exit),
@@ -170,14 +185,19 @@ export class ClaudeEventMapper {
 
   #observeAssistant(record: Record<string, unknown> | undefined): void {
     const message = asRecord(read(record, 'message'));
+    const messageId = safeRequiredString(read(message, 'id'));
+    if (messageId !== undefined && this.#pendingAssistantMessage?.messageId !== messageId) {
+      this.#flushPendingAssistantMessage();
+    }
     const base: ClaudeSafeMetadata = {
       provider: 'claude',
       sourceType: 'assistant',
       ...sessionMetadata(record),
-      ...optionalString('messageId', safeString(read(message, 'id'))),
+      ...optionalString('messageId', messageId),
       ...optionalString('model', safeString(read(message, 'model')) ?? safeString(read(record, 'model'))),
     };
     if (read(record, 'isApiErrorMessage') === true || read(message, 'isApiErrorMessage') === true) {
+      if (this.#pendingAssistantMessage?.messageId === messageId) this.#pendingAssistantMessage = undefined;
       this.#publish(AgentRuntimeEventType.AGENT_RUNTIME_ERROR, { ...base, kind: 'api_error_message' });
       return;
     }
@@ -191,46 +211,82 @@ export class ClaudeEventMapper {
     let textLength = 0;
     let textBlockCount = 0;
     let unknownBlockCount = 0;
-    const toolBlocks: Record<string, unknown>[] = [];
+    let malformedToolUseCount = 0;
+    let validToolUseCount = 0;
     for (const value of content) {
       const block = asRecord(value);
       const blockType = safeString(read(block, 'type'));
       if (blockType === 'text') {
         const text = rawString(read(block, 'text'));
         if (text !== undefined) {
-          textLength += text.length;
-          textBlockCount += 1;
+          textLength = saturatingAdd(textLength, text.length);
+          textBlockCount = saturatingAdd(textBlockCount, 1);
+        } else {
+          unknownBlockCount = saturatingAdd(unknownBlockCount, 1);
         }
-      } else if (blockType === 'tool_use' && block !== undefined) {
-        toolBlocks.push(block);
+      } else if (blockType === 'tool_use') {
+        const toolUseId = safeRequiredString(read(block, 'id'));
+        const toolName = safeRequiredString(read(block, 'name'));
+        if (toolUseId === undefined || toolName === undefined) {
+          malformedToolUseCount = saturatingAdd(malformedToolUseCount, 1);
+          unknownBlockCount = saturatingAdd(unknownBlockCount, 1);
+          continue;
+        }
+        validToolUseCount = saturatingAdd(validToolUseCount, 1);
+        this.#publish(AgentRuntimeEventType.AGENT_OPERATION_STARTED, {
+          ...base,
+          operationType: 'tool_use',
+          toolUseId,
+          toolName,
+        });
       } else {
-        unknownBlockCount += 1;
+        unknownBlockCount = saturatingAdd(unknownBlockCount, 1);
       }
     }
 
-    for (const block of toolBlocks) {
-      this.#publish(AgentRuntimeEventType.AGENT_OPERATION_STARTED, {
-        ...base,
-        operationType: 'tool_use',
-        ...optionalString('toolUseId', safeString(read(block, 'id'))),
-        ...optionalString('toolName', safeString(read(block, 'name'))),
-      });
+    if (messageId !== undefined) {
+      const pending = this.#pendingAssistantMessage ?? {
+        messageId,
+        ...optionalString('sessionId', safeString(read(record, 'session_id')) ?? safeString(read(record, 'sessionId'))),
+        ...optionalString('model', safeString(read(message, 'model')) ?? safeString(read(record, 'model'))),
+        textLength: 0,
+        textBlockCount: 0,
+        contentBlockCount: 0,
+        unknownBlockCount: 0,
+      };
+      pending.textLength = saturatingAdd(pending.textLength, textLength);
+      pending.textBlockCount = saturatingAdd(pending.textBlockCount, textBlockCount);
+      pending.contentBlockCount = saturatingAdd(pending.contentBlockCount, content.length);
+      pending.unknownBlockCount = saturatingAdd(pending.unknownBlockCount, unknownBlockCount);
+      this.#pendingAssistantMessage = pending;
     }
-    if (textBlockCount > 0) {
-      this.#publish(AgentRuntimeEventType.AGENT_MESSAGE_COMPLETED, {
-        ...base,
-        textLength,
-        textBlockCount,
-        contentBlockCount: content.length,
-        ...(unknownBlockCount === 0 ? {} : { unknownBlockCount }),
-      });
-    } else if (toolBlocks.length === 0) {
+
+    if (messageId === undefined || malformedToolUseCount > 0 ||
+      (textBlockCount === 0 && validToolUseCount === 0 && unknownBlockCount > 0)) {
       this.#publish(AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED, {
         ...base,
         contentBlockCount: content.length,
         ...(unknownBlockCount === 0 ? {} : { unknownBlockCount }),
+        ...(malformedToolUseCount === 0 ? {} : { malformedToolUseCount }),
       });
     }
+  }
+
+  #flushPendingAssistantMessage(): void {
+    const pending = this.#pendingAssistantMessage;
+    this.#pendingAssistantMessage = undefined;
+    if (pending === undefined || pending.textBlockCount === 0) return;
+    this.#publish(AgentRuntimeEventType.AGENT_MESSAGE_COMPLETED, {
+      provider: 'claude',
+      sourceType: 'assistant',
+      messageId: pending.messageId,
+      ...optionalString('sessionId', pending.sessionId),
+      ...optionalString('model', pending.model),
+      textLength: pending.textLength,
+      textBlockCount: pending.textBlockCount,
+      contentBlockCount: pending.contentBlockCount,
+      ...(pending.unknownBlockCount === 0 ? {} : { unknownBlockCount: pending.unknownBlockCount }),
+    });
   }
 
   #observeUser(record: Record<string, unknown> | undefined): void {
@@ -241,18 +297,29 @@ export class ClaudeEventMapper {
       ...sessionMetadata(record),
     };
     let recognized = 0;
+    let malformedToolResultCount = 0;
     for (const value of content ?? []) {
       const block = asRecord(value);
       if (safeString(read(block, 'type')) !== 'tool_result') continue;
-      recognized += 1;
+      const toolUseId = safeRequiredString(read(block, 'tool_use_id'));
+      if (toolUseId === undefined) {
+        malformedToolResultCount = saturatingAdd(malformedToolResultCount, 1);
+        continue;
+      }
+      recognized = saturatingAdd(recognized, 1);
       this.#publish(AgentRuntimeEventType.AGENT_OPERATION_COMPLETED, {
         ...base,
         operationType: 'tool_use',
-        ...optionalString('toolUseId', safeString(read(block, 'tool_use_id'))),
+        toolUseId,
         status: read(block, 'is_error') === true ? 'failed' : 'completed',
       });
     }
-    if (recognized === 0) this.#publish(AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED, base);
+    if (recognized === 0 || malformedToolResultCount > 0) {
+      this.#publish(AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED, {
+        ...base,
+        ...(malformedToolResultCount === 0 ? {} : { malformedToolResultCount }),
+      });
+    }
   }
 
   #observeStreamEvent(record: Record<string, unknown> | undefined): void {
@@ -266,12 +333,14 @@ export class ClaudeEventMapper {
     const delta = asRecord(read(event, 'delta'));
     if (streamEventType === 'content_block_delta' && safeString(read(delta, 'type')) === 'text_delta') {
       const text = rawString(read(delta, 'text'));
-      this.#publish(AgentRuntimeEventType.AGENT_MESSAGE_DELTA, {
-        ...base,
-        textLength: text?.length ?? 0,
-        ...optionalSafeInteger('contentBlockIndex', read(event, 'index')),
-      });
-      return;
+      if (text !== undefined) {
+        this.#publish(AgentRuntimeEventType.AGENT_MESSAGE_DELTA, {
+          ...base,
+          textLength: text.length,
+          ...optionalSafeInteger('contentBlockIndex', read(event, 'index')),
+        });
+        return;
+      }
     }
     this.#publish(AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED, {
       ...base,
@@ -307,9 +376,12 @@ export class ClaudeEventMapper {
       provider: 'claude',
       sourceType: 'rate_limit_event',
       ...optionalString('rateLimitStatus', safeString(read(info, 'status'))),
-      ...optionalString('rateLimitType', safeString(read(info, 'rate_limit_type')) ?? safeString(read(info, 'type'))),
-      ...optionalNumber('resetsAt', safeNumber(read(info, 'resets_at'))),
-      ...optionalBoolean('isUsingOverage', read(info, 'is_using_overage')),
+      ...optionalString('rateLimitType', safeString(read(info, 'rateLimitType'))
+        ?? safeString(read(info, 'rate_limit_type'))
+        ?? safeString(read(info, 'type'))),
+      ...optionalNumber('resetsAt', safeNumber(read(info, 'resetsAt')) ?? safeNumber(read(info, 'resets_at'))),
+      ...optionalBoolean('isUsingOverage', safeBoolean(read(info, 'isUsingOverage'))
+        ?? safeBoolean(read(info, 'is_using_overage'))),
     });
   }
 
@@ -407,6 +479,21 @@ function asArray(value: unknown): readonly unknown[] | undefined {
 
 function rawString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
+}
+
+
+function safeRequiredString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= maxMetadataStringChars
+    ? value
+    : undefined;
+}
+
+function safeBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function saturatingAdd(left: number, right: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, left + right);
 }
 
 function safeString(value: unknown): string | undefined {

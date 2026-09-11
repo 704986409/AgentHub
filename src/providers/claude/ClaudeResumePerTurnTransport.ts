@@ -64,12 +64,21 @@ export interface ClaudeResumePerTurnTransportOptions {
   processFactory?: (options: ClaudeProcessManagerOptions) => ClaudeProcessManager;
 }
 
+interface AssistantTextCollection {
+  messageId: string | undefined;
+  textParts: string[];
+  textLength: number;
+}
+
 interface TurnCollection {
   sessionIds: string[];
   messageTypes: string[];
   result: ClaudeRawMessage | undefined;
   duplicateResult: boolean;
+  assistantText: AssistantTextCollection;
 }
+
+const maxReconstructedAssistantChars = 1024 * 1024;
 
 interface ClaudeResumeOwnedProcess {
   manager: ClaudeProcessManager;
@@ -145,7 +154,13 @@ export class ClaudeResumePerTurnTransport {
       ...(this.#env === undefined ? {} : { env: this.#env }),
     });
     this.#active = true;
-    const collection: TurnCollection = { sessionIds: [], messageTypes: [], result: undefined, duplicateResult: false };
+    const collection: TurnCollection = {
+      sessionIds: [],
+      messageTypes: [],
+      result: undefined,
+      duplicateResult: false,
+      assistantText: { messageId: undefined, textParts: [], textLength: 0 },
+    };
     let parseError: ClaudeJsonlParseError | undefined;
     let processError: Error | undefined;
     let terminalFailure = false;
@@ -247,7 +262,7 @@ export class ClaudeResumePerTurnTransport {
       const validated = validateCollection(collection, request.sessionId);
       result = {
         sessionId: validated.sessionId,
-        resultText: typeof validated.message.result === 'string' ? validated.message.result : '',
+        resultText: selectResultText(collection.assistantText, validated.message),
         exitCode: exit.code,
         messageTypes: [...collection.messageTypes],
         resumed,
@@ -360,12 +375,54 @@ async function runProcessTurn(
 
 function collectMessage(collection: TurnCollection, message: ClaudeRawMessage): void {
   if (typeof message.type === 'string') collection.messageTypes.push(message.type);
+  if (message.type === 'assistant') collectAssistantText(collection.assistantText, message);
   if (message.type === 'system' && message.subtype === 'init') addSessionId(collection, message.session_id);
   if (message.type === 'result') {
     if (collection.result !== undefined) collection.duplicateResult = true;
     else collection.result = message;
     addSessionId(collection, message.session_id);
   }
+}
+
+// Claude Code can split one logical assistant message across frames sharing
+// message.id while terminal result.result contains only an earlier fragment.
+function collectAssistantText(collection: AssistantTextCollection, message: ClaudeRawMessage): void {
+  const assistantMessage = asRecord(message.message);
+  const messageId = nonBlankString(assistantMessage?.id);
+  if (messageId === undefined) return;
+  if (collection.messageId !== messageId) {
+    collection.messageId = messageId;
+    collection.textParts = [];
+    collection.textLength = 0;
+  }
+  const content = assistantMessage?.content;
+  if (!Array.isArray(content)) return;
+  for (const value of content) {
+    const block = asRecord(value);
+    if (block?.type !== 'text' || typeof block.text !== 'string' || block.text.length === 0) continue;
+    const nextLength = collection.textLength + block.text.length;
+    if (nextLength > maxReconstructedAssistantChars) {
+      throw new Error(`Claude reconstructed assistant text exceeds ${String(maxReconstructedAssistantChars)} characters`);
+    }
+    collection.textParts.push(block.text);
+    collection.textLength = nextLength;
+  }
+}
+
+function selectResultText(collection: AssistantTextCollection, result: ClaudeRawMessage): string {
+  return collection.textLength > 0
+    ? collection.textParts.join('')
+    : typeof result.result === 'string' ? result.result : '';
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function nonBlankString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
 }
 
 function addSessionId(collection: TurnCollection, value: unknown): void {

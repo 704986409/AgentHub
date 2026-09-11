@@ -45,6 +45,23 @@ if (mode.startsWith('persistent-')) {
       : resumedSession === undefined ? 'first-ok' : 'second-ok';
   if (mode === 'turn-success-with-stderr') process.stderr.write('INFO observer diagnostic\n');
   emitTurn(sessionId, sessionId, result);
+} else if (mode === 'turn-fragmented-assistant-result') {
+  emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
+  emitAssistant('final-A', ['<AGENTHUB_']);
+  emitAssistant('final-A', ['RESULT>{"outcome":"COMPLETED"}']);
+  emitAssistant('final-A', ['</AGENTHUB_RESULT>']);
+  emit({ type: 'result', subtype: 'success', session_id: 'session-A', result: '<AGENTHUB_' });
+} else if (mode === 'turn-intermediate-final-fragmented') {
+  emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
+  emitAssistant('tool-A', ['I will inspect.'], [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { secret: 'ignored' } }]);
+  emit({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ignored' }] } });
+  emitAssistant('final-A', ['RESULT_']);
+  emitAssistant('final-A', ['FINAL'], [{ type: 'thinking', thinking: 'ignored' }]);
+  emit({ type: 'result', subtype: 'success', session_id: 'session-A', result: 'RESULT_' });
+} else if (mode === 'turn-assistant-over-limit') {
+  emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
+  emitAssistant('large-A', ['x'.repeat(1024 * 1024), 'y']);
+  emit({ type: 'result', subtype: 'success', session_id: 'session-A', result: 'fallback' });
 } else if (mode === 'missing-result') {
   emit({ type: 'system', subtype: 'init', session_id: 'session-A', pid: process.pid });
   emit({ type: 'assistant', text: 'no terminal result' });
@@ -91,6 +108,16 @@ function emitTurn(initSessionId, resultSessionId, result) {
   emit({ type: 'system', subtype: 'init', session_id: initSessionId, pid: process.pid });
   emit({ type: 'assistant', text: 'fixture assistant' });
   emit({ type: 'result', subtype: 'success', session_id: resultSessionId, result });
+}
+
+function emitAssistant(messageId, textParts, extraBlocks = []) {
+  emit({
+    type: 'assistant',
+    message: {
+      id: messageId,
+      content: [...textParts.map((text) => ({ type: 'text', text })), ...extraBlocks],
+    },
+  });
 }
 
 function emit(message) {
@@ -167,7 +194,24 @@ function runPersistent(scenario) {
       scenario === 'persistent-initial-resume-mismatch') {
       emit({ type: 'system', subtype: 'init', session_id: initSession, pid: process.pid });
     }
-    emit({ type: 'assistant', text: 'fixture assistant' });
+    if (scenario === 'persistent-fragmented-assistant-result') {
+      emitAssistant(`final-${String(turnCount)}`, ['RESULT_', 'PERSISTENT_', String(turnCount)]);
+    } else if (scenario === 'persistent-intermediate-final-fragmented') {
+      emitAssistant(`tool-${String(turnCount)}`, ['I will inspect.'], [
+        { type: 'tool_use', id: `tool-${String(turnCount)}`, name: 'Read', input: { secret: 'ignored' } },
+      ]);
+      emit({
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: `tool-${String(turnCount)}`, content: 'ignored' }] },
+      });
+      emitAssistant(`final-${String(turnCount)}`, ['FINAL_', String(turnCount)], [
+        { type: 'thinking', thinking: 'ignored' },
+      ]);
+    } else if (scenario === 'persistent-assistant-over-limit') {
+      emitAssistant(`large-${String(turnCount)}`, ['x'.repeat(1024 * 1024), 'y']);
+    } else {
+      emit({ type: 'assistant', text: 'fixture assistant' });
+    }
 
     if (scenario === 'persistent-context') {
       const match = prompt.match(/AGENTHUB_PERSISTENT_[A-Za-z0-9-]+/u);
@@ -181,7 +225,13 @@ function runPersistent(scenario) {
       ? prompt
       : scenario === 'persistent-context' && turnCount > 1
         ? marker ?? 'missing-marker'
-        : `turn-${String(turnCount)}`;
+        : scenario === 'persistent-fragmented-assistant-result'
+          ? 'RESULT_'
+          : scenario === 'persistent-intermediate-final-fragmented'
+            ? 'FINAL_'
+            : scenario === 'persistent-assistant-over-limit'
+              ? 'fallback'
+              : `turn-${String(turnCount)}`;
     emit({
       type: 'result',
       subtype: 'success',

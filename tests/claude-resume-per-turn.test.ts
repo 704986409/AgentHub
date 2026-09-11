@@ -112,6 +112,52 @@ describe('Claude resume-per-turn transport', () => {
     expect(harness.allStopped()).toBe(true);
   });
 
+  it('reconstructs fragmented same-ID assistant text instead of a truncated terminal result', async () => {
+    const harness = new FixtureHarness(['turn-fragmented-assistant-result']);
+    const transport = createTransport(harness);
+
+    const result = await transport.runTurn({ prompt: 'fragmented' });
+
+    expect(result.resultText).toBe('<AGENTHUB_RESULT>{"outcome":"COMPLETED"}</AGENTHUB_RESULT>');
+    expect(result.messageTypes).toEqual(['system', 'assistant', 'assistant', 'assistant', 'result']);
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('selects only the final logical assistant message and ignores non-text content', async () => {
+    const harness = new FixtureHarness(['turn-intermediate-final-fragmented']);
+    const transport = createTransport(harness);
+
+    const result = await transport.runTurn({ prompt: 'tool then final' });
+
+    expect(result.resultText).toBe('RESULT_FINAL');
+    expect(result.resultText).not.toContain('I will inspect.');
+    expect(result.resultText).not.toContain('ignored');
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('falls back to result.result and keeps reconstruction state local to each call', async () => {
+    const harness = new FixtureHarness(['turn-fragmented-assistant-result', 'turn-success']);
+    const transport = createTransport(harness);
+
+    const first = await transport.runTurn({ prompt: 'first' });
+    const second = await transport.runTurn({ prompt: 'second', sessionId: first.sessionId });
+
+    expect(first.resultText).toContain('AGENTHUB_RESULT');
+    expect(second.resultText).toBe('second-ok');
+    expect(second.resultText).not.toContain('AGENTHUB_RESULT');
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('fails with the existing protocol error when reconstructed assistant text exceeds the bound', async () => {
+    const harness = new FixtureHarness(['turn-assistant-over-limit']);
+    const transport = createTransport(harness);
+
+    await expect(transport.runTurn({ prompt: 'too large' })).rejects.toMatchObject({
+      code: 'CLAUDE_STREAM_PROTOCOL_ERROR',
+    });
+    expect(harness.allStopped()).toBe(true);
+  });
+
   it.each([
     ['missing-result', undefined, 'CLAUDE_RESULT_MISSING'],
     ['missing-session', undefined, 'CLAUDE_SESSION_ID_MISSING'],
