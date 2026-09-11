@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ClaudeAutoTransport,
   ClaudePersistentStreamTransport,
+  ClaudeProcessError,
   ClaudeProcessManager,
   ClaudeResumePerTurnTransport,
   claudeCapabilityNames,
@@ -328,6 +329,82 @@ describe('Claude Auto transport', () => {
     await auto.shutdown();
   });
 
+  it('detects Resume live ownership, blocks every new child, and retries cleanup through Auto', async () => {
+    const calls: ClaudeProcessManagerOptions[] = [];
+    let manager: AutoNonStoppingProcessManager | undefined;
+    let persistentFactoryCalls = 0;
+    const resume = new ClaudeResumePerTurnTransport({
+      command: 'fixture-claude',
+      defaultTimeoutMs: 30,
+      processFactory: (options) => {
+        calls.push(options);
+        manager = new AutoNonStoppingProcessManager({
+          command: process.execPath,
+          args: [fixturePath, 'hang', ...(options.args ?? [])],
+          stopTimeoutMs: 75,
+        });
+        return manager;
+      },
+    });
+    const auto = new ClaudeAutoTransport({
+      mode: 'resume-per-turn',
+      resumeFactory: () => resume,
+      persistentFactory: () => {
+        persistentFactoryCalls += 1;
+        return new ClaudePersistentStreamTransport();
+      },
+    });
+    await auto.start();
+
+    await expect(auto.runTurn({ prompt: 'timeout', timeoutMs: 30 })).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED',
+      transport: 'resume-per-turn',
+      retrySafety: 'ambiguous',
+      cause: { code: 'CLAUDE_TURN_TIMEOUT' },
+    });
+    expect(resume.running).toBe(true);
+    await expect(auto.runTurn({ prompt: 'blocked' })).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED',
+    });
+    expect(calls).toHaveLength(1);
+    expect(persistentFactoryCalls).toBe(0);
+    await expect(auto.shutdown()).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_SHUTDOWN_FAILED',
+      cause: { code: 'CLAUDE_PROCESS_STOP_TIMEOUT' },
+    });
+
+    if (manager === undefined) throw new Error('Missing Auto live-stop manager');
+    manager.allowStop = true;
+    await auto.shutdown();
+    expect(calls).toHaveLength(1);
+    expect(manager.running).toBe(false);
+    expect(resume.running).toBe(false);
+  });
+
+  it('treats Persistent session mismatch as terminal without current or future Resume execution', async () => {
+    const persistent = new PersistentStub();
+    const resume = new ResumeStub();
+    const auto = createAuto(persistent, resume);
+    await auto.start();
+    await auto.runTurn({ prompt: 'establish session A' });
+    persistent.turnError = codedError('CLAUDE_PERSISTENT_SESSION_ID_MISMATCH');
+    persistent.stopOnTurnError = true;
+
+    await expect(auto.runTurn({ prompt: 'identity mismatch X' })).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_TURN_FAILED',
+      transport: 'persistent-stream',
+      retrySafety: 'ambiguous',
+      cause: { code: 'CLAUDE_PERSISTENT_SESSION_ID_MISMATCH' },
+    });
+    expect(persistent.prompts).toEqual(['establish session A', 'identity mismatch X']);
+    expect(resume.requests).toEqual([]);
+    expect(auto.selectedTransport).toBe('persistent-stream');
+    expect(auto.lastFallback).toBeUndefined();
+    await expect(auto.runTurn({ prompt: 'future Y' })).rejects.toMatchObject({ code: 'CLAUDE_AUTO_NOT_STARTED' });
+    expect(resume.requests).toEqual([]);
+    await auto.shutdown();
+  });
+
   it('guards concurrent turns and releases the guard after success and failure', async () => {
     const persistent = new PersistentStub();
     const resume = new ResumeStub();
@@ -498,4 +575,15 @@ async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<v
 function readOption(args: readonly string[], name: string): string | undefined {
   const index = args.indexOf(name);
   return index < 0 ? undefined : args[index + 1];
+}
+
+class AutoNonStoppingProcessManager extends ClaudeProcessManager {
+  public allowStop = false;
+
+  public override async stop(): Promise<void> {
+    if (!this.allowStop) {
+      throw new ClaudeProcessError('CLAUDE_PROCESS_STOP_TIMEOUT', 'simulated Auto live stop timeout');
+    }
+    await super.stop();
+  }
 }

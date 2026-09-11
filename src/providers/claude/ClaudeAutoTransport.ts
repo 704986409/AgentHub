@@ -61,6 +61,7 @@ export type ClaudeAutoErrorCode =
   | 'CLAUDE_AUTO_TURN_ALREADY_ACTIVE'
   | 'CLAUDE_AUTO_NO_USABLE_TRANSPORT'
   | 'CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED'
+  | 'CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED'
   | 'CLAUDE_AUTO_TURN_FAILED'
   | 'CLAUDE_AUTO_SHUTDOWN_FAILED';
 
@@ -249,6 +250,16 @@ export class ClaudeAutoTransport {
         'not-applicable',
       );
     }
+    if (this.#state === 'FAILED' && this.#selectedTransport === 'resume-per-turn' &&
+      this.#resume?.running === true) {
+      throw new ClaudeAutoError(
+        'CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED',
+        'Claude Auto transport still owns a live resume-per-turn child',
+        'resume-per-turn',
+        this.#sessionId,
+        'not-applicable',
+      );
+    }
     if (this.#state !== 'READY' || this.#selectedTransport === undefined) {
       throw new ClaudeAutoError('CLAUDE_AUTO_NOT_STARTED', 'Claude Auto transport is not ready');
     }
@@ -292,8 +303,23 @@ export class ClaudeAutoTransport {
           this.capturePersistentSession();
           this.#persistent = undefined;
         }
-        await this.#resume?.shutdown();
-        this.#resume = undefined;
+        if (this.#resume !== undefined) {
+          try {
+            await this.#resume.shutdown();
+          } catch (cause) {
+            this.#state = this.#resume.running ? 'FAILED' : 'STOPPED';
+            if (!this.#resume.running) this.#resume = undefined;
+            throw new ClaudeAutoError(
+              'CLAUDE_AUTO_SHUTDOWN_FAILED',
+              'Claude Auto resume-per-turn shutdown failed',
+              'resume-per-turn',
+              this.#sessionId,
+              'not-applicable',
+              { cause },
+            );
+          }
+          this.#resume = undefined;
+        }
         this.#state = 'STOPPED';
       } catch (cause) {
         if (cause instanceof ClaudeAutoError) throw cause;
@@ -414,6 +440,17 @@ export class ClaudeAutoTransport {
           { cause },
         );
       }
+      if (isTerminalPersistentIdentityFailure(cause)) {
+        this.#state = 'FAILED';
+        throw new ClaudeAutoError(
+          'CLAUDE_AUTO_TURN_FAILED',
+          'Claude persistent turn failed with an untrusted session identity',
+          'persistent-stream',
+          this.#sessionId,
+          'ambiguous',
+          { cause },
+        );
+      }
       if (this.#requestedMode === 'auto' && this.#sessionId !== undefined && this.resumeIsSupported()) {
         this.switchToResume('PERSISTENT_FAILED_AFTER_DISPATCH', cause);
         this.#state = 'READY';
@@ -446,6 +483,17 @@ export class ClaudeAutoTransport {
       return normalizeResumeResult(result, this.#lastFallback);
     } catch (cause) {
       if (cause instanceof ClaudeAutoError) throw cause;
+      if (resume.running) {
+        this.#state = 'FAILED';
+        throw new ClaudeAutoError(
+          'CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED',
+          'Claude resume-per-turn turn failed while a child remains owned',
+          'resume-per-turn',
+          this.#sessionId,
+          'ambiguous',
+          { cause },
+        );
+      }
       throw new ClaudeAutoError(
         'CLAUDE_AUTO_TURN_FAILED',
         'Claude resume-per-turn turn failed',
@@ -622,6 +670,10 @@ function noUsableTransport(cause?: unknown): ClaudeAutoError {
 function readErrorCode(error: unknown): string | undefined {
   if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
   return typeof error.code === 'string' ? error.code : undefined;
+}
+
+function isTerminalPersistentIdentityFailure(error: unknown): boolean {
+  return readErrorCode(error) === 'CLAUDE_PERSISTENT_SESSION_ID_MISMATCH';
 }
 
 function validateMode(mode: string): asserts mode is ClaudeTransportMode {

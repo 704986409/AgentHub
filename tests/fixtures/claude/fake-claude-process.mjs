@@ -80,6 +80,8 @@ if (mode.startsWith('persistent-')) {
 } else if (mode === 'result-hang') {
   emitTurn('session-A', 'session-A', 'present');
   setInterval(() => undefined, 1_000);
+} else if (mode === 'natural-exit-hang') {
+  setTimeout(() => process.exit(0), 250);
 } else {
   process.stderr.write(`Unknown fixture mode: ${mode}\n`);
   process.exitCode = 64;

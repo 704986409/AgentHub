@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   ClaudeProcessManager,
+  ClaudeProcessError,
   ClaudeResumePerTurnTransport,
   ClaudeTurnError,
   buildClaudeTurnArgs,
@@ -16,6 +17,7 @@ const fixturePath = fileURLToPath(new URL('./fixtures/claude/fake-claude-process
 class FixtureHarness {
   readonly calls: ClaudeProcessManagerOptions[] = [];
   readonly managers: ClaudeProcessManager[] = [];
+  readonly liveStopManagers: NonStoppingProcessManager[] = [];
 
   public constructor(private readonly scenarios: string[]) {}
 
@@ -23,22 +25,41 @@ class FixtureHarness {
     const scenario = this.scenarios[this.calls.length];
     if (scenario === undefined) throw new Error('No fixture scenario configured');
     this.calls.push(options);
+    const liveStopFailure = scenario.endsWith('-live-stop-failure');
+    const fixtureScenario = liveStopFailure ? scenario.replace(/-live-stop-failure$/u, '') : scenario;
     const managerOptions: ClaudeProcessManagerOptions = {
       command: process.execPath,
-      args: [fixturePath, scenario, ...(options.args ?? [])],
+      args: [fixturePath, fixtureScenario, ...(options.args ?? [])],
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
       ...(options.env === undefined ? {} : { env: options.env }),
       stopTimeoutMs: 75,
     };
-    const manager = scenario === 'stop-failure'
+    const manager = liveStopFailure
+      ? new NonStoppingProcessManager(managerOptions)
+      : scenario === 'stop-failure'
       ? new StopFailureClaudeProcessManager(managerOptions)
       : new ClaudeProcessManager(managerOptions);
+    if (manager instanceof NonStoppingProcessManager) this.liveStopManagers.push(manager);
     this.managers.push(manager);
     return manager;
   };
 
   public allStopped(): boolean {
     return this.managers.every((manager) => !manager.running && manager.pid === undefined);
+  }
+}
+
+class NonStoppingProcessManager extends ClaudeProcessManager {
+  public allowStop = false;
+
+  public override async stop(): Promise<void> {
+    if (!this.allowStop) {
+      throw new ClaudeProcessError(
+        'CLAUDE_PROCESS_STOP_TIMEOUT',
+        'simulated live process stop timeout',
+      );
+    }
+    await super.stop();
   }
 }
 
@@ -191,6 +212,75 @@ describe('Claude resume-per-turn transport', () => {
     expect(harness.allStopped()).toBe(true);
   });
 
+  it('preserves timeout and retains a live child until shutdown retries the same manager', async () => {
+    const harness = new FixtureHarness(['hang-live-stop-failure']);
+    const transport = createTransport(harness);
+
+    await expect(transport.runTurn({ prompt: 'timeout', timeoutMs: 30 })).rejects.toMatchObject({
+      code: 'CLAUDE_TURN_TIMEOUT',
+    });
+    expect(transport.active).toBe(false);
+    expect(transport.running).toBe(true);
+    await expect(transport.runTurn({ prompt: 'blocked' })).rejects.toMatchObject({
+      code: 'CLAUDE_TURN_PROCESS_OWNERSHIP_UNRESOLVED',
+    });
+    expect(harness.calls).toHaveLength(1);
+
+    const manager = harness.liveStopManagers[0];
+    if (manager === undefined) throw new Error('Missing live-stop manager');
+    await expect(transport.shutdown()).rejects.toMatchObject({ code: 'CLAUDE_PROCESS_STOP_TIMEOUT' });
+    manager.allowStop = true;
+    await transport.shutdown();
+    expect(harness.calls).toHaveLength(1);
+    expect(transport.running).toBe(false);
+    expect(harness.allStopped()).toBe(true);
+    expect(manager.listenerCount('stdout')).toBe(0);
+    expect(manager.listenerCount('stderr')).toBe(0);
+    expect(manager.listenerCount('exit')).toBe(0);
+  });
+
+  it('preserves parser failure while retaining a live child and ignores later output', async () => {
+    const harness = new FixtureHarness(['parser-error-hang-live-stop-failure']);
+    const transport = createTransport(harness);
+
+    const error = await captureFailure(transport.runTurn({ prompt: 'bad stream', timeoutMs: 2_000 }));
+    expect(error).toMatchObject({ code: 'CLAUDE_STREAM_PROTOCOL_ERROR' });
+    if (!(error instanceof Error)) throw new Error('Expected parser error');
+    expect(error.cause).toMatchObject({ code: 'CLAUDE_JSONL_INVALID_JSON' });
+    expect(transport.running).toBe(true);
+    expect(transport.active).toBe(false);
+    await expect(transport.runTurn({ prompt: 'blocked' })).rejects.toMatchObject({
+      code: 'CLAUDE_TURN_PROCESS_OWNERSHIP_UNRESOLVED',
+    });
+    expect(harness.calls).toHaveLength(1);
+
+    const manager = harness.liveStopManagers[0];
+    if (manager === undefined) throw new Error('Missing live-stop manager');
+    manager.allowStop = true;
+    await transport.shutdown();
+    expect(harness.allStopped()).toBe(true);
+  });
+
+  it('releases retained ownership on natural exit and permits a new turn', async () => {
+    const harness = new FixtureHarness(['natural-exit-hang-live-stop-failure', 'turn-success']);
+    const transport = createTransport(harness);
+
+    await expect(transport.runTurn({ prompt: 'natural exit', timeoutMs: 30 })).rejects.toMatchObject({
+      code: 'CLAUDE_TURN_TIMEOUT',
+    });
+    expect(transport.running).toBe(true);
+    await waitFor(() => !transport.running);
+    const oldManager = harness.managers[0];
+    if (oldManager === undefined) throw new Error('Missing first manager');
+    expect(oldManager.listenerCount('stdout')).toBe(0);
+    expect(oldManager.listenerCount('stderr')).toBe(0);
+    expect(oldManager.listenerCount('exit')).toBe(0);
+
+    await expect(transport.runTurn({ prompt: 'after natural exit' })).resolves.toMatchObject({ resultText: 'first-ok' });
+    expect(harness.calls).toHaveLength(2);
+    expect(harness.allStopped()).toBe(true);
+  });
+
   it('fails fast for a concurrent turn without creating a second process', async () => {
     const harness = new FixtureHarness(['hang']);
     const transport = createTransport(harness);
@@ -284,5 +374,13 @@ async function captureFailure(promise: Promise<unknown>): Promise<unknown> {
     return undefined;
   } catch (error) {
     return error;
+  }
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for fixture state');
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }

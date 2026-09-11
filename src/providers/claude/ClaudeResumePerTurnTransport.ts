@@ -35,6 +35,7 @@ export type ClaudeTurnErrorCode =
   | 'CLAUDE_DUPLICATE_RESULT'
   | 'CLAUDE_SESSION_ID_MISSING'
   | 'CLAUDE_SESSION_ID_MISMATCH'
+  | 'CLAUDE_TURN_PROCESS_OWNERSHIP_UNRESOLVED'
   | 'CLAUDE_TURN_PROCESS_FAILED'
   | 'CLAUDE_TURN_FAILED';
 
@@ -70,6 +71,17 @@ interface TurnCollection {
   duplicateResult: boolean;
 }
 
+interface ClaudeResumeOwnedProcess {
+  manager: ClaudeProcessManager;
+  parser: ClaudeJsonlParser;
+  terminal: boolean;
+  finalized: boolean;
+  onStdout: (chunk: Buffer) => void;
+  onStderr: (chunk: Buffer) => void;
+  onError: (error: Error) => void;
+  onExit: (exit: ClaudeProcessExit) => void;
+}
+
 export class ClaudeResumePerTurnTransport {
   readonly #command: string;
   readonly #env: NodeJS.ProcessEnv | undefined;
@@ -81,7 +93,7 @@ export class ClaudeResumePerTurnTransport {
   readonly #onStderr: ((chunk: Buffer) => void) | undefined;
   readonly #processFactory: (options: ClaudeProcessManagerOptions) => ClaudeProcessManager;
   #active = false;
-  #activeProcess: ClaudeProcessManager | undefined;
+  #ownedProcess: ClaudeResumeOwnedProcess | undefined;
 
   public constructor(options: ClaudeResumePerTurnTransportOptions = {}) {
     this.#command = options.command ?? 'claude';
@@ -100,12 +112,24 @@ export class ClaudeResumePerTurnTransport {
     return this.#active;
   }
 
+  public get running(): boolean {
+    return this.#ownedProcess?.manager.running === true;
+  }
+
   public async runTurn(request: ClaudeTurnRequest): Promise<ClaudeTurnResult> {
     validateRequest(request);
     if (this.#active) {
       throw new ClaudeTurnError('CLAUDE_TURN_ALREADY_ACTIVE', 'A Claude transport turn is already active');
     }
-    this.#active = true;
+    if (this.#ownedProcess !== undefined) {
+      if (this.#ownedProcess.manager.running) {
+        throw new ClaudeTurnError(
+          'CLAUDE_TURN_PROCESS_OWNERSHIP_UNRESOLVED',
+          'A previous Claude turn still owns a live process',
+        );
+      }
+      this.finalizeOwnedProcess(this.#ownedProcess);
+    }
     const startedAt = Date.now();
     const timeoutMs = request.timeoutMs ?? this.#defaultTimeoutMs;
     validateTimeout(timeoutMs);
@@ -120,11 +144,16 @@ export class ClaudeResumePerTurnTransport {
       ...(cwd === undefined ? {} : { cwd }),
       ...(this.#env === undefined ? {} : { env: this.#env }),
     });
-    this.#activeProcess = processManager;
+    this.#active = true;
     const collection: TurnCollection = { sessionIds: [], messageTypes: [], result: undefined, duplicateResult: false };
     let parseError: ClaudeJsonlParseError | undefined;
     let processError: Error | undefined;
     let terminalFailure = false;
+    let rejectParserFailure: ((error: ClaudeTurnError) => void) | undefined;
+    const parserFailure = new Promise<never>((_resolve, reject) => {
+      rejectParserFailure = reject;
+    });
+    parserFailure.catch(() => undefined);
     const failOnce = (error: unknown): void => {
       if (terminalFailure) return;
       terminalFailure = true;
@@ -137,6 +166,13 @@ export class ClaudeResumePerTurnTransport {
           0,
           { cause: error },
         );
+      rejectParserFailure?.(new ClaudeTurnError(
+        'CLAUDE_STREAM_PROTOCOL_ERROR',
+        'Claude stream-json protocol parsing failed',
+        undefined,
+        undefined,
+        { cause: parseError },
+      ));
       void processManager.stop().catch(() => undefined);
     };
     const parser = new ClaudeJsonlParser({
@@ -146,21 +182,42 @@ export class ClaudeResumePerTurnTransport {
       },
       onError: failOnce,
     });
-    processManager.on('stdout', (chunk: Buffer) => {
-      if (terminalFailure) return;
+    const onStdout = (chunk: Buffer): void => {
+      if (ownedProcess.terminal || terminalFailure) return;
       try {
         parser.push(chunk);
       } catch (error) {
         failOnce(error);
       }
-    });
-    processManager.on('stderr', (chunk: Buffer) => notifyObserver(this.#onStderr, chunk));
-    processManager.on('error', (error: Error) => {
+    };
+    const onStderr = (chunk: Buffer): void => {
+      if (!ownedProcess.terminal) notifyObserver(this.#onStderr, chunk);
+    };
+    const onError = (error: Error): void => {
+      if (ownedProcess.terminal) return;
       processError = error;
-    });
+    };
+    const onExit = (): void => this.finalizeOwnedProcess(ownedProcess);
+    const ownedProcess: ClaudeResumeOwnedProcess = {
+      manager: processManager,
+      parser,
+      terminal: false,
+      finalized: false,
+      onStdout,
+      onStderr,
+      onError,
+      onExit,
+    };
+    this.#ownedProcess = ownedProcess;
+    processManager.on('stdout', onStdout);
+    processManager.on('stderr', onStderr);
+    processManager.on('error', onError);
+    processManager.on('exit', onExit);
 
+    let result: ClaudeTurnResult | undefined;
+    let primaryError: ClaudeTurnError | undefined;
     try {
-      const { exit, processId } = await runProcessTurn(processManager, parser, timeoutMs);
+      const { exit, processId } = await runProcessTurn(processManager, parser, timeoutMs, parserFailure);
       if (parseError !== undefined) {
         throw new ClaudeTurnError(
           'CLAUDE_STREAM_PROTOCOL_ERROR',
@@ -187,39 +244,81 @@ export class ClaudeResumePerTurnTransport {
           exit.signal,
         );
       }
-      const result = validateCollection(collection, request.sessionId);
-      return {
-        sessionId: result.sessionId,
-        resultText: typeof result.message.result === 'string' ? result.message.result : '',
+      const validated = validateCollection(collection, request.sessionId);
+      result = {
+        sessionId: validated.sessionId,
+        resultText: typeof validated.message.result === 'string' ? validated.message.result : '',
         exitCode: exit.code,
         messageTypes: [...collection.messageTypes],
         resumed,
         ...(processId === undefined ? {} : { processId }),
         durationMs: Date.now() - startedAt,
-        ...(typeof result.message.subtype === 'string' ? { resultSubtype: result.message.subtype } : {}),
+        ...(typeof validated.message.subtype === 'string' ? { resultSubtype: validated.message.subtype } : {}),
         isError: false,
       };
     } catch (error) {
-      if (error instanceof ClaudeTurnError) throw error;
-      throw new ClaudeTurnError('CLAUDE_TURN_PROCESS_FAILED', 'Claude turn process failed', undefined, undefined, {
-        cause: error,
-      });
-    } finally {
-      try {
-        await processManager.stop();
-      } finally {
-        try {
-          parser.end();
-        } finally {
-          this.#activeProcess = undefined;
-          this.#active = false;
-        }
-      }
+      primaryError = error instanceof ClaudeTurnError
+        ? error
+        : new ClaudeTurnError('CLAUDE_TURN_PROCESS_FAILED', 'Claude turn process failed', undefined, undefined, {
+          cause: error,
+        });
     }
+
+    ownedProcess.terminal = true;
+    let cleanupError: unknown;
+    try {
+      await processManager.stop();
+    } catch (error) {
+      cleanupError = error;
+    } finally {
+      if (!processManager.running) this.finalizeOwnedProcess(ownedProcess);
+      this.#active = false;
+    }
+
+    if (primaryError !== undefined) throw primaryError;
+    if (processManager.running) {
+      throw new ClaudeTurnError(
+        'CLAUDE_TURN_PROCESS_OWNERSHIP_UNRESOLVED',
+        'Claude turn completed but its process could not be released',
+        undefined,
+        undefined,
+        cleanupError === undefined ? undefined : { cause: cleanupError },
+      );
+    }
+    if (cleanupError !== undefined) {
+      throw new ClaudeTurnError(
+        'CLAUDE_TURN_PROCESS_FAILED',
+        cleanupError instanceof Error ? cleanupError.message : 'Claude process cleanup failed',
+        undefined,
+        undefined,
+        { cause: cleanupError },
+      );
+    }
+    if (result === undefined) throw new ClaudeTurnError('CLAUDE_TURN_FAILED', 'Claude turn produced no result');
+    return result;
   }
 
   public async shutdown(): Promise<void> {
-    await this.#activeProcess?.stop();
+    const ownedProcess = this.#ownedProcess;
+    if (ownedProcess === undefined) return;
+    ownedProcess.terminal = true;
+    try {
+      await ownedProcess.manager.stop();
+    } finally {
+      if (!ownedProcess.manager.running) this.finalizeOwnedProcess(ownedProcess);
+    }
+  }
+
+  private finalizeOwnedProcess(ownedProcess: ClaudeResumeOwnedProcess): void {
+    if (ownedProcess.finalized) return;
+    ownedProcess.finalized = true;
+    ownedProcess.terminal = true;
+    ownedProcess.manager.off('stdout', ownedProcess.onStdout);
+    ownedProcess.manager.off('stderr', ownedProcess.onStderr);
+    ownedProcess.manager.off('error', ownedProcess.onError);
+    ownedProcess.manager.off('exit', ownedProcess.onExit);
+    ownedProcess.parser.end();
+    if (this.#ownedProcess === ownedProcess) this.#ownedProcess = undefined;
   }
 }
 
@@ -239,6 +338,7 @@ async function runProcessTurn(
   processManager: ClaudeProcessManager,
   parser: ClaudeJsonlParser,
   timeoutMs: number,
+  parserFailure: Promise<never>,
 ): Promise<{ exit: ClaudeProcessExit; processId?: number }> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
@@ -248,9 +348,9 @@ async function runProcessTurn(
     }, timeoutMs);
   });
   try {
-    await Promise.race([processManager.start(), timeout]);
+    await Promise.race([processManager.start(), timeout, parserFailure]);
     const processId = processManager.pid;
-    const exit = await Promise.race([processManager.waitForExit(), timeout]);
+    const exit = await Promise.race([processManager.waitForExit(), timeout, parserFailure]);
     parser.end();
     return { exit, ...(processId === undefined ? {} : { processId }) };
   } finally {
