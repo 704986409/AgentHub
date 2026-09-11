@@ -153,6 +153,32 @@ describe('Claude worker session', () => {
     expect(fake.startCalls).toBe(2);
   });
 
+  it.each([
+    'CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED',
+    'CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED',
+  ] as const)('requires cleanup after lower start reports %s', async (code) => {
+    const ownershipError = new ClaudeAutoError(code, 'ownership unresolved');
+    const { session, fake, events } = createFakeSession();
+    fake.startError = ownershipError;
+
+    await expect(session.start()).rejects.toBe(ownershipError);
+    expect(session.started).toBe(false);
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runTurn({ prompt: 'turn' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runRevision({ prompt: 'revision' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    expect(fake.startCalls).toBe(1);
+    expect(fake.runCalls).toBe(0);
+    expect(fake.prompts).toEqual([]);
+    expect(events).toEqual([]);
+
+    fake.startError = undefined;
+    await session.shutdown();
+    await session.start();
+    expect(session.started).toBe(true);
+    expect(fake.shutdownCalls).toBe(1);
+    expect(fake.startCalls).toBe(2);
+  });
+
   it('atomically cleans up and permits retry when raw mapping fails after lower start', async () => {
     const mapperError = new Error('start raw mapper failed');
     const eventBus = new EventBus();
@@ -181,14 +207,18 @@ describe('Claude worker session', () => {
     expect(fake.shutdownCalls).toBe(2);
   });
 
-  it('retains ownership for same-Auto shutdown retry when atomic start cleanup fails', async () => {
+  it('blocks use until same-Auto cleanup succeeds after atomic start cleanup fails', async () => {
     const mapperError = new Error('start raw mapper failed');
     const cleanupError = new ClaudeAutoError('CLAUDE_AUTO_SHUTDOWN_FAILED', 'start cleanup failed');
     const eventBus = new EventBus();
+    let failMapping = true;
     eventBus.subscribe((event) => {
-      if (event.eventType === providerObservedType) throw mapperError;
+      if (event.eventType === providerObservedType && failMapping) {
+        failMapping = false;
+        throw mapperError;
+      }
     });
-    const { session, fake } = createFakeSession({ eventBus });
+    const { session, fake, events } = createFakeSession({ eventBus });
     fake.start = () => {
       fake.startCalls += 1;
       fake.options.onRawMessage?.(rawInit());
@@ -197,15 +227,35 @@ describe('Claude worker session', () => {
     fake.shutdownError = cleanupError;
 
     await expect(session.start()).rejects.toBe(cleanupError);
-    expect(session.started).toBe(true);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
     expect(fake.startCalls).toBe(1);
     expect(fake.shutdownCalls).toBe(1);
-    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_ALREADY_STARTED' });
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runTurn({ prompt: 'turn' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runRevision({ prompt: 'revision' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    expect(fake.runCalls).toBe(0);
+    expect(fake.prompts).toEqual([]);
+    expect(events.filter((event) => event.eventType === executionStartedType)).toEqual([]);
+
+    await expect(session.shutdown()).rejects.toBe(cleanupError);
+    expect(session.started).toBe(false);
+    expect(fake.shutdownCalls).toBe(2);
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runTurn({ prompt: 'still dirty' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runRevision({ prompt: 'still dirty' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    expect(fake.startCalls).toBe(1);
+    expect(fake.runCalls).toBe(0);
 
     fake.shutdownError = undefined;
     await session.shutdown();
-    expect(fake.shutdownCalls).toBe(2);
+    expect(fake.shutdownCalls).toBe(3);
     expect(session.started).toBe(false);
+    await session.start();
+    await expect(session.runTurn({ prompt: 'after cleanup' })).resolves.toMatchObject({ protocolValid: true });
+    expect(fake.startCalls).toBe(2);
+    expect(fake.runCalls).toBe(1);
+    expect(events.filter((event) => event.eventType === executionStartedType)).toHaveLength(1);
   });
 
   it('preserves lower start failure and clears raw mapping state before retry', async () => {

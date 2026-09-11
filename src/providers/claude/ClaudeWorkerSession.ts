@@ -58,6 +58,7 @@ export type ClaudeWorkerSessionErrorCode =
   | 'CLAUDE_WORKER_SESSION_ALREADY_STARTED'
   | 'CLAUDE_WORKER_SESSION_TURN_ALREADY_ACTIVE'
   | 'CLAUDE_WORKER_SESSION_LIFECYCLE_BUSY'
+  | 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED'
   | 'CLAUDE_WORKER_SESSION_INVALID_REQUEST';
 
 export class ClaudeWorkerSessionError extends Error {
@@ -75,6 +76,7 @@ export class ClaudeWorkerSession {
   readonly #mapper: ClaudeEventMapper;
   readonly #resultParser: AgentHubWorkerResultParser;
   #started = false;
+  #cleanupRequired = false;
   #active = false;
   #startPromise: Promise<void> | undefined;
   #shutdownPromise: Promise<void> | undefined;
@@ -123,6 +125,9 @@ export class ClaudeWorkerSession {
         'CLAUDE_WORKER_SESSION_LIFECYCLE_BUSY',
         'Claude worker session shutdown is in progress',
       ));
+    }
+    if (this.#cleanupRequired) {
+      return Promise.reject(cleanupRequiredError());
     }
     if (this.#started || this.#startPromise !== undefined) {
       return Promise.reject(new ClaudeWorkerSessionError(
@@ -174,6 +179,9 @@ export class ClaudeWorkerSession {
         'CLAUDE_WORKER_SESSION_LIFECYCLE_BUSY',
         'Claude worker session shutdown is in progress',
       ));
+    }
+    if (this.#cleanupRequired) {
+      return Promise.reject(cleanupRequiredError());
     }
     if (!this.#started) {
       return Promise.reject(new ClaudeWorkerSessionError(
@@ -250,22 +258,25 @@ export class ClaudeWorkerSession {
       await this.#auto.start();
     } catch (error) {
       this.#takeRawMappingError();
+      this.#cleanupRequired = requiresCleanupAfterStartFailure(error);
       throw error;
     }
 
     const rawMappingError = this.#takeRawMappingError();
     if (rawMappingError === undefined) {
       this.#started = true;
+      this.#cleanupRequired = false;
       return;
     }
 
     try {
       await this.#auto.shutdown();
     } catch (cleanupError) {
-      this.#started = true;
+      this.#cleanupRequired = true;
       throw cleanupError;
     }
     this.#takeRawMappingError();
+    this.#cleanupRequired = false;
     throw rawMappingError;
   }
 
@@ -282,6 +293,7 @@ export class ClaudeWorkerSession {
     await activeTurnSettled;
     this.#takeRawMappingError();
     this.#started = false;
+    this.#cleanupRequired = false;
   }
 
   #takeRawMappingError(): Error | undefined {
@@ -294,6 +306,20 @@ export class ClaudeWorkerSession {
     const error = this.#takeRawMappingError();
     if (error !== undefined) throw error;
   }
+}
+
+function cleanupRequiredError(): ClaudeWorkerSessionError {
+  return new ClaudeWorkerSessionError(
+    'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED',
+    'Claude worker session requires successful shutdown before it can be used',
+  );
+}
+
+function requiresCleanupAfterStartFailure(error: unknown): boolean {
+  return error instanceof ClaudeAutoError && (
+    error.code === 'CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED'
+    || error.code === 'CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED'
+  );
 }
 
 function validateRequest(request: ClaudeWorkerTurnRequest): void {
