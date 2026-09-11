@@ -550,20 +550,120 @@ describe('Claude worker session', () => {
     );
     const { session, fake, events } = createFakeSession();
     fake.sessionId = 'session-A';
-    fake.turns.push({ error });
+    fake.turns.push(
+      { error },
+      { result: autoResult(workerText('COMPLETED')) },
+    );
     await session.start();
     let caught: unknown;
     try { await session.runTurn({ prompt: 'PRIVATE_PROMPT' }); } catch (value) { caught = value; }
     expect(caught).toBe(error);
     expect(fake.runCalls).toBe(1);
     expect(session.active).toBe(false);
+    expect(session.started).toBe(true);
     expect(events.map((event) => event.eventType).filter(isExecutionTerminal)).toEqual([
       AgentRuntimeEventType.AGENT_EXECUTION_FAILED,
     ]);
     expect(JSON.stringify(events)).not.toContain('PRIVATE_PROMPT');
+    await expect(session.runRevision({ prompt: 'safe retry' })).resolves.toMatchObject({ protocolValid: true });
+    expect(fake.runCalls).toBe(2);
     await session.shutdown();
     expect(session.started).toBe(false);
     expect(session.active).toBe(false);
+  });
+
+  it.each([
+    ['CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED', 'persistent-stream'],
+    ['CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED', 'resume-per-turn'],
+  ] as const)('quarantines turn-time %s until same-Auto cleanup succeeds', async (code, transport) => {
+    const ownershipError = new ClaudeAutoError(code, 'owned', transport, 'session-A', 'ambiguous');
+    const cleanupError = new ClaudeAutoError('CLAUDE_AUTO_SHUTDOWN_FAILED', 'cleanup failed');
+    const { session, fake, events } = createFakeSession();
+    fake.selectedTransport = transport;
+    fake.sessionId = 'session-A';
+    fake.turns.push(
+      { error: ownershipError },
+      { result: autoResult(workerText('COMPLETED'), { transport }) },
+    );
+    await session.start();
+
+    await expect(session.runTurn({ prompt: 'owned turn' })).rejects.toBe(ownershipError);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+    expect(fake.runCalls).toBe(1);
+    expect(events.map((event) => event.eventType).filter((type) => type === executionStartedType)).toHaveLength(1);
+    expect(events.map((event) => event.eventType).filter(isExecutionTerminal)).toEqual([
+      AgentRuntimeEventType.AGENT_EXECUTION_FAILED,
+    ]);
+    const eventCount = events.length;
+
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runTurn({ prompt: 'blocked turn' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runRevision({ prompt: 'blocked revision' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    expect(fake.startCalls).toBe(1);
+    expect(fake.runCalls).toBe(1);
+    expect(fake.prompts).toHaveLength(1);
+    expect(events).toHaveLength(eventCount);
+
+    fake.shutdownError = cleanupError;
+    await expect(session.shutdown()).rejects.toBe(cleanupError);
+    await expect(session.shutdown()).rejects.toBe(cleanupError);
+    expect(session.started).toBe(false);
+    expect(fake.shutdownCalls).toBe(2);
+    await expect(session.runTurn({ prompt: 'still blocked' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+
+    fake.shutdownError = undefined;
+    await session.shutdown();
+    await session.start();
+    await expect(session.runRevision({ prompt: 'after cleanup' })).resolves.toMatchObject({ protocolValid: true });
+    expect(fake.shutdownCalls).toBe(3);
+    expect(fake.startCalls).toBe(2);
+    expect(fake.runCalls).toBe(2);
+    expect(session.started).toBe(true);
+  });
+
+  it('sets turn ownership dirty state before failure-event mapping can throw', async () => {
+    const ownershipError = new ClaudeAutoError(
+      'CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED', 'owned', 'persistent-stream', 'session-A', 'ambiguous',
+    );
+    const mapperError = new Error('failure mapper failed');
+    const eventBus = new EventBus();
+    eventBus.subscribe((event) => {
+      if (event.eventType === executionFailedType) throw mapperError;
+    });
+    const { session, fake } = createFakeSession({ eventBus });
+    fake.turns.push({ error: ownershipError });
+    await session.start();
+
+    await expect(session.runTurn({ prompt: 'owned turn' })).rejects.toBe(mapperError);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runTurn({ prompt: 'blocked' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runRevision({ prompt: 'blocked' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    expect(fake.runCalls).toBe(1);
+    await session.shutdown();
+  });
+
+  it('keeps ownership dirty when raw mapping and an ownership-unresolved turn fail together', async () => {
+    const rawMapperError = new Error('raw mapper failed');
+    const ownershipError = new ClaudeAutoError(
+      'CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED', 'owned', 'resume-per-turn', 'session-A', 'ambiguous',
+    );
+    const eventBus = new EventBus();
+    eventBus.subscribe((event) => {
+      if (event.eventType === providerObservedType) throw rawMapperError;
+    });
+    const { session, fake } = createFakeSession({ eventBus });
+    fake.turns.push({ raw: [rawInit()], error: ownershipError });
+    await session.start();
+
+    await expect(session.runTurn({ prompt: 'owned turn' })).rejects.toBe(ownershipError);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+    await expect(session.runRevision({ prompt: 'blocked' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    expect(fake.runCalls).toBe(1);
+    await session.shutdown();
   });
 
   it('reflects Auto session identity after transport failure without synthesizing one', async () => {
@@ -1118,6 +1218,7 @@ const executionTerminalTypes = new Set<string>([
   AgentRuntimeEventType.AGENT_EXECUTION_FAILED,
 ]);
 const executionStartedType: string = AgentRuntimeEventType.AGENT_EXECUTION_STARTED;
+const executionFailedType: string = AgentRuntimeEventType.AGENT_EXECUTION_FAILED;
 const providerObservedType: string = AgentRuntimeEventType.PROVIDER_EVENT_OBSERVED;
 const inputRequiredType: string = AgentRuntimeEventType.AGENT_INPUT_REQUIRED;
 
