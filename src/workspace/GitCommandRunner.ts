@@ -45,6 +45,7 @@ export interface GitCommandRunnerOptions {
   readonly defaultTimeoutMs?: number;
   readonly maxOutputBytes?: number;
   readonly execFile?: GitExecFile;
+  readonly env?: NodeJS.ProcessEnv;
 }
 
 export class GitCommandRunner implements GitCommandRunnerLike {
@@ -52,25 +53,40 @@ export class GitCommandRunner implements GitCommandRunnerLike {
   readonly #defaultTimeoutMs: number;
   readonly #maxOutputBytes: number;
   readonly #execFile: GitExecFile;
+  readonly #env: NodeJS.ProcessEnv;
 
   public constructor(options: GitCommandRunnerOptions = {}) {
-    this.#gitExecutable = nonBlank(options.gitExecutable ?? 'git', 'gitExecutable');
-    this.#defaultTimeoutMs = positiveInteger(options.defaultTimeoutMs ?? 30_000, 'defaultTimeoutMs');
-    this.#maxOutputBytes = positiveInteger(options.maxOutputBytes ?? 1024 * 1024, 'maxOutputBytes');
-    this.#execFile = options.execFile ?? execFile;
+    const gitExecutable = options.gitExecutable;
+    const defaultTimeoutMs = options.defaultTimeoutMs;
+    const maxOutputBytes = options.maxOutputBytes;
+    const execFileValue = options.execFile;
+    const env = options.env;
+    this.#gitExecutable = nonBlank(gitExecutable ?? 'git', 'gitExecutable');
+    this.#defaultTimeoutMs = positiveInteger(defaultTimeoutMs ?? 30_000, 'defaultTimeoutMs');
+    this.#maxOutputBytes = positiveInteger(maxOutputBytes ?? 1024 * 1024, 'maxOutputBytes');
+    this.#execFile = execFileValue ?? execFile;
+    this.#env = sanitizeGitEnvironment(env ?? process.env);
   }
 
   public run(args: readonly string[], options: GitCommandOptions): Promise<GitCommandResult> {
-    if (!Array.isArray(args) || !args.every((arg) => typeof arg === 'string')) {
+    if (!Array.isArray(args)) {
       return Promise.reject(new TypeError('Git arguments must be strings'));
     }
+    const argsValues: unknown[] = Array.from(args as readonly unknown[]);
+    if (!argsValues.every((arg) => typeof arg === 'string')) {
+      return Promise.reject(new TypeError('Git arguments must be strings'));
+    }
+    const argsSnapshot = argsValues;
     let cwd: string;
     let timeout: number;
     let accepted: readonly number[];
     try {
-      cwd = nonBlank(options.cwd, 'cwd');
-      timeout = positiveInteger(options.timeoutMs ?? this.#defaultTimeoutMs, 'timeoutMs');
-      accepted = options.acceptedExitCodes ?? [0];
+      const cwdValue = options.cwd;
+      const timeoutValue = options.timeoutMs;
+      const acceptedValue = options.acceptedExitCodes;
+      cwd = nonBlank(cwdValue, 'cwd');
+      timeout = positiveInteger(timeoutValue ?? this.#defaultTimeoutMs, 'timeoutMs');
+      accepted = [...(acceptedValue ?? [0])];
       if (!Array.isArray(accepted) || accepted.length === 0 ||
         !accepted.every((code) => Number.isSafeInteger(code) && code >= 0)) {
         throw new TypeError('acceptedExitCodes must contain non-negative integers');
@@ -78,15 +94,16 @@ export class GitCommandRunner implements GitCommandRunnerLike {
     } catch (error) {
       return Promise.reject(error instanceof Error ? error : new Error('Git invocation options are invalid'));
     }
-    const operation = args[0] ?? 'git';
+    const operation = argsSnapshot[0] ?? 'git';
     return new Promise((resolve, reject) => {
-      this.#execFile(this.#gitExecutable, [...args], {
+      this.#execFile(this.#gitExecutable, argsSnapshot, {
         cwd,
         timeout,
         maxBuffer: this.#maxOutputBytes,
         encoding: 'utf8',
         windowsHide: true,
         shell: false,
+        env: { ...this.#env },
       }, (error, stdoutValue, stderrValue) => {
         const stdout = String(stdoutValue);
         const stderr = String(stderrValue);
@@ -103,6 +120,19 @@ export class GitCommandRunner implements GitCommandRunnerLike {
       });
     });
   }
+}
+
+const gitRoutingEnvironment = new Set([
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_QUARANTINE_PATH',
+]);
+
+function sanitizeGitEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (!gitRoutingEnvironment.has(key.toUpperCase()) && value !== undefined) result[key] = value;
+  }
+  return Object.freeze(result);
 }
 
 function classifyCommandError(

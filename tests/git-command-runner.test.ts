@@ -53,6 +53,62 @@ describe('GitCommandRunner', () => {
     const runner = new GitCommandRunner({ execFile: failingExec(0) });
     await expect(runner.run(['status'], { cwd: '', acceptedExitCodes: [] })).rejects.toBeInstanceOf(TypeError);
   });
+
+  it('snapshots accessor-backed arguments and options exactly once', async () => {
+    let argumentReads = 0;
+    let cwdReads = 0;
+    let timeoutReads = 0;
+    let acceptedReads = 0;
+    let invokedArgs: readonly string[] = [];
+    const args: string[] = [];
+    Object.defineProperty(args, '0', {
+      configurable: true, enumerable: true,
+      get: () => { argumentReads += 1; return argumentReads === 1 ? 'status' : 'unsafe'; },
+    });
+    Object.defineProperty(args, 'length', { value: 1 });
+    const options = Object.defineProperties({}, {
+      cwd: { get: () => { cwdReads += 1; return '.'; } },
+      timeoutMs: { get: () => { timeoutReads += 1; return 123; } },
+      acceptedExitCodes: { get: () => { acceptedReads += 1; return [0]; } },
+    }) as { cwd: string; timeoutMs: number; acceptedExitCodes: number[] };
+    const runner = new GitCommandRunner({ execFile: (_file, passed, _options, callback) => {
+      invokedArgs = passed;
+      callback(null, '', '');
+    } });
+    await runner.run(args, options);
+    expect(invokedArgs).toEqual(['status']);
+    expect({ argumentReads, cwdReads, timeoutReads, acceptedReads }).toEqual({
+      argumentReads: 1, cwdReads: 1, timeoutReads: 1, acceptedReads: 1,
+    });
+  });
+
+  it('owns accepted exit codes after dispatch in both directions', async () => {
+    let callback: Parameters<GitExecFile>[3] | undefined;
+    const runner = new GitCommandRunner({ execFile: (_file, _args, _options, value) => { callback = value; } });
+    const rejectedCodes = [0];
+    const rejected = runner.run(['status'], { cwd: '.', acceptedExitCodes: rejectedCodes });
+    rejectedCodes.push(1);
+    callback?.(Object.assign(new Error('failed'), { code: 1 }), '', '');
+    await expect(rejected).rejects.toMatchObject({ code: 'GIT_COMMAND_FAILED' });
+
+    const acceptedCodes = [0, 1];
+    const accepted = runner.run(['status'], { cwd: '.', acceptedExitCodes: acceptedCodes });
+    acceptedCodes.pop();
+    callback?.(Object.assign(new Error('failed'), { code: 1 }), '', '');
+    await expect(accepted).resolves.toMatchObject({ exitCode: 1 });
+  });
+
+  it('strips repository-routing environment while preserving normal execution variables', async () => {
+    let invokedOptions: ExecFileOptions | undefined;
+    const runner = new GitCommandRunner({
+      env: { PATH: 'git-path', HOME: 'home', USERPROFILE: 'profile', GIT_DIR: 'wrong', GIT_WORK_TREE: 'wrong' },
+      execFile: (_file, _args, options, callback) => { invokedOptions = options; callback(null, '', ''); },
+    });
+    await runner.run(['status'], { cwd: '.' });
+    expect(invokedOptions?.env).toMatchObject({ PATH: 'git-path', HOME: 'home', USERPROFILE: 'profile' });
+    expect(invokedOptions?.env).not.toHaveProperty('GIT_DIR');
+    expect(invokedOptions?.env).not.toHaveProperty('GIT_WORK_TREE');
+  });
 });
 
 function failingExec(exitCode: number): GitExecFile {

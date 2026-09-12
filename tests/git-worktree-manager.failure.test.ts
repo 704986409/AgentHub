@@ -151,6 +151,23 @@ describe('GitWorktreeManager failure reconciliation', () => {
     expect((await actual.run(['worktree', 'list', '--porcelain'], { cwd: repo })).stdout)
       .toContain('branch refs/heads/agenthub/TASK-A');
   });
+
+  it('preserves a created worktree when base-marker creation fails and recovers on retry', async () => {
+    const repo = await createRepository('agenthub marker failure ');
+    const injected = new InterceptRunner(actual);
+    injected.markerFailure = true;
+    const manager = await GitWorktreeManager.open({ repositoryRoot: repo, runner: injected });
+    await expect(manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_BASE_CONFLICT' });
+    expect((await actual.run(['worktree', 'list', '--porcelain'], { cwd: repo })).stdout)
+      .toContain('branch refs/heads/agenthub/TASK-A');
+    await expect(actual.run(['show-ref', '--verify', '--quiet', 'refs/agenthub/bases/TASK-A'], {
+      cwd: repo, acceptedExitCodes: [0, 1],
+    })).resolves.toMatchObject({ exitCode: 1 });
+    injected.markerFailure = false;
+    await expect(manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' }))
+      .resolves.toMatchObject({ created: false });
+  });
 });
 
 class InterceptRunner implements GitCommandRunnerLike {
@@ -161,6 +178,7 @@ class InterceptRunner implements GitCommandRunnerLike {
   public removeAfterSuccessFailure = false;
   public removeFailure = false;
   public excludeFailure = false;
+  public markerFailure = false;
   private hideNextList = false;
 
   public constructor(private readonly delegate: GitCommandRunnerLike) {}
@@ -168,6 +186,9 @@ class InterceptRunner implements GitCommandRunnerLike {
   public async run(args: readonly string[], options: GitCommandOptions): Promise<GitCommandResult> {
     if (this.excludeFailure && args.join(' ') === 'rev-parse --git-path info/exclude') {
       throw new GitCommandError('GIT_COMMAND_FAILED', 'rev-parse', 1);
+    }
+    if (this.markerFailure && args[0] === 'update-ref' && args[1]?.startsWith('refs/agenthub/bases/')) {
+      throw new GitCommandError('GIT_COMMAND_FAILED', 'update-ref', 1);
     }
     if (args[0] === 'worktree' && args[1] === 'add') {
       this.addCalls += 1;

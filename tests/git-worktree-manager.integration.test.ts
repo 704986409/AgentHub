@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -73,6 +73,7 @@ describe('GitWorktreeManager real Git integration', () => {
       repositoryRoot: second.repositoryRoot,
       worktreePath: second.worktreePath,
       branchName: second.branchName,
+      baseCommit: second.baseCommit,
       headCommit: second.headCommit,
     });
     expect((await git(repo, ['show-ref', '--verify', 'refs/heads/agenthub/TASK-A'])).exitCode).toBe(0);
@@ -200,6 +201,186 @@ describe('GitWorktreeManager real Git integration', () => {
     });
     expect((await git(repo, ['worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)).toHaveLength(1);
   });
+
+  it('blocks managed-root and Git-info junction escapes without touching external data', async () => {
+    const repo = await createRepository('agenthub containment ');
+    const external = await temporaryDirectory('agenthub external ');
+    const sentinel = path.join(external, 'sentinel.txt');
+    await writeFile(sentinel, 'preserve me', 'utf8');
+    const manager = await GitWorktreeManager.open({ repositoryRoot: repo });
+
+    await writeFile(path.join(repo, '.agenthub'), 'conflict');
+    await expect(manager.createWorkspace({ taskId: 'PARENT-FILE', baseRef: 'HEAD' }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_PATH_CONFLICT' });
+    await rm(path.join(repo, '.agenthub'));
+    await symlink(external, path.join(repo, '.agenthub'), process.platform === 'win32' ? 'junction' : 'dir');
+    await expect(manager.createWorkspace({ taskId: 'PARENT-LINK', baseRef: 'HEAD' }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_PATH_CONFLICT' });
+    await expect(readFile(sentinel, 'utf8')).resolves.toBe('preserve me');
+    await expect(readFile(path.join(external, 'worktrees', 'PARENT-LINK'))).rejects.toBeDefined();
+    await rm(path.join(repo, '.agenthub'), { force: true });
+
+    await mkdir(path.join(repo, '.agenthub'));
+    await writeFile(path.join(repo, '.agenthub', 'worktrees'), 'conflict');
+    await expect(manager.createWorkspace({ taskId: 'WORKTREES-FILE', baseRef: 'HEAD' }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_PATH_CONFLICT' });
+    await rm(path.join(repo, '.agenthub', 'worktrees'));
+    await symlink(external, path.join(repo, '.agenthub', 'worktrees'), process.platform === 'win32' ? 'junction' : 'dir');
+    await expect(manager.createWorkspace({ taskId: 'WORKTREES-LINK', baseRef: 'HEAD' }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_PATH_CONFLICT' });
+    await rm(path.join(repo, '.agenthub', 'worktrees'), { force: true });
+
+    const info = path.join(repo, '.git', 'info');
+    const infoBackup = path.join(repo, '.git', 'info-backup');
+    await rename(info, infoBackup);
+    await symlink(external, info, process.platform === 'win32' ? 'junction' : 'dir');
+    await expect(manager.createWorkspace({ taskId: 'INFO-LINK', baseRef: 'HEAD' }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_CONTRACT_VIOLATION', operation: 'exclude' });
+    await expect(readFile(sentinel, 'utf8')).resolves.toBe('preserve me');
+    await rm(info, { force: true });
+    await rename(infoBackup, info);
+    expect((await git(repo, ['show-ref', '--verify', '--quiet', 'refs/heads/agenthub/INFO-LINK'], [0, 1])).exitCode).toBe(1);
+  });
+
+  it('rejects a replaced managed root before inspect or remove', async () => {
+    const repo = await createRepository('agenthub replacement ');
+    const external = await temporaryDirectory('agenthub replacement external ');
+    const sentinel = path.join(external, 'sentinel.txt');
+    await writeFile(sentinel, 'preserve me', 'utf8');
+    const manager = await GitWorktreeManager.open({ repositoryRoot: repo });
+    await manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' });
+    const managed = path.join(repo, '.agenthub');
+    const backup = path.join(repo, '.agenthub-safe');
+    await rename(managed, backup);
+    await symlink(external, managed, process.platform === 'win32' ? 'junction' : 'dir');
+    await expect(manager.inspectWorkspace('TASK-A')).rejects.toMatchObject({ code: 'GIT_WORKTREE_PATH_CONFLICT' });
+    await expect(manager.removeWorkspace('TASK-A')).rejects.toMatchObject({ code: 'GIT_WORKTREE_PATH_CONFLICT' });
+    await expect(readFile(sentinel, 'utf8')).resolves.toBe('preserve me');
+    await rm(managed, { force: true });
+    await rename(backup, managed);
+  });
+
+  it('persists original base identity across main movement, task commits, restart, and removal', async () => {
+    const repo = await createRepository('agenthub durable base ');
+    let manager = await GitWorktreeManager.open({ repositoryRoot: repo });
+    const workspace = await manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'main' });
+    const original = workspace.baseCommit;
+    expect((await git(repo, ['rev-parse', 'refs/agenthub/bases/TASK-A'])).stdout.trim()).toBe(original);
+    await writeFile(path.join(workspace.worktreePath, 'task.txt'), 'task\n');
+    await git(workspace.worktreePath, ['add', 'task.txt']);
+    await git(workspace.worktreePath, ['commit', '-m', 'task commit']);
+    const taskCommit = (await git(workspace.worktreePath, ['rev-parse', 'HEAD'])).stdout.trim();
+    await writeFile(path.join(repo, 'main.txt'), 'main\n');
+    await git(repo, ['add', 'main.txt']);
+    await git(repo, ['commit', '-m', 'advance main']);
+    manager = await GitWorktreeManager.open({ repositoryRoot: repo });
+    const adopted = await manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'main' });
+    expect(adopted).toMatchObject({ created: false, baseCommit: original, headCommit: taskCommit });
+    await expect(manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'refs/heads/no-longer-present' }))
+      .resolves.toMatchObject({ created: false, baseCommit: original, headCommit: taskCommit });
+    expect(await manager.inspectWorkspace('TASK-A')).toMatchObject({ baseCommit: original, headCommit: taskCommit });
+    await manager.removeWorkspace('TASK-A');
+    expect((await git(repo, ['rev-parse', 'refs/agenthub/bases/TASK-A'])).stdout.trim()).toBe(original);
+    expect((await git(repo, ['rev-parse', 'refs/heads/agenthub/TASK-A'])).stdout.trim()).toBe(taskCommit);
+  });
+
+  it('coordinates same-repository managers and keeps repositories independent', async () => {
+    const repoA = await createRepository('agenthub shared manager A ');
+    const repoB = await createRepository('agenthub shared manager B ');
+    const counting = new CountingRunner(runner);
+    const [managerA1, managerA2, managerB] = await Promise.all([
+      GitWorktreeManager.open({ repositoryRoot: repoA, runner: counting }),
+      GitWorktreeManager.open({ repositoryRoot: repoA, runner: counting }),
+      GitWorktreeManager.open({ repositoryRoot: repoB, runner: counting }),
+    ]);
+    const first = managerA1.createWorkspace({ taskId: 'TASK-X', baseRef: 'HEAD' });
+    const duplicate = managerA2.createWorkspace({ taskId: 'TASK-X', baseRef: 'HEAD' });
+    expect(duplicate).toBe(first);
+    await expect(managerA2.createWorkspace({ taskId: 'TASK-X', baseRef: 'main' }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_OPERATION_BUSY' });
+    await expect(managerA2.removeWorkspace('TASK-X')).rejects.toMatchObject({ code: 'GIT_WORKTREE_OPERATION_BUSY' });
+    const otherRepo = managerB.createWorkspace({ taskId: 'TASK-X', baseRef: 'HEAD' });
+    await Promise.all([first, otherRepo]);
+    expect([...counting.addCallsByRoot.values()]).toEqual([1, 1]);
+    expect([...counting.excludeCallsByRoot.values()]).toEqual([1, 1]);
+    counting.blockRemove = true;
+    const removal = managerA1.removeWorkspace('TASK-X');
+    await counting.removeStarted;
+    await expect(managerA2.createWorkspace({ taskId: 'TASK-X', baseRef: 'HEAD' }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_OPERATION_BUSY' });
+    counting.releaseRemove();
+    await removal;
+  });
+
+  it('ignores inherited Git repository-routing environment', async () => {
+    const repoA = await createRepository('agenthub routed A ');
+    const repoB = await createRepository('agenthub routed B ');
+    const isolated = new GitCommandRunner({
+      env: { ...process.env, GIT_DIR: path.join(repoB, '.git'), GIT_WORK_TREE: repoB },
+    });
+    const manager = await GitWorktreeManager.open({ repositoryRoot: repoA, runner: isolated });
+    const workspace = await manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' });
+    expect(workspace.repositoryRoot).toBe(await realpath(repoA));
+    expect((await git(repoB, ['show-ref', '--verify', '--quiet', 'refs/heads/agenthub/TASK-A'], [0, 1])).exitCode)
+      .toBe(1);
+  });
+
+  it('recovers only an exact clean missing base marker and rejects ambiguous migration', async () => {
+    const repo = await createRepository('agenthub marker recovery ');
+    let manager = await GitWorktreeManager.open({ repositoryRoot: repo });
+    const workspace = await manager.createWorkspace({ taskId: 'SAFE', baseRef: 'HEAD' });
+    await git(repo, ['update-ref', '-d', 'refs/agenthub/bases/SAFE']);
+    manager = await GitWorktreeManager.open({ repositoryRoot: repo });
+    await expect(manager.createWorkspace({ taskId: 'SAFE', baseRef: 'HEAD' }))
+      .resolves.toMatchObject({ created: false, baseCommit: workspace.baseCommit });
+
+    const ambiguous = await manager.createWorkspace({ taskId: 'AMBIGUOUS', baseRef: 'HEAD' });
+    await writeFile(path.join(ambiguous.worktreePath, 'change.txt'), 'change\n');
+    await git(ambiguous.worktreePath, ['add', 'change.txt']);
+    await git(ambiguous.worktreePath, ['commit', '-m', 'advance task']);
+    await git(repo, ['update-ref', '-d', 'refs/agenthub/bases/AMBIGUOUS']);
+    manager = await GitWorktreeManager.open({ repositoryRoot: repo });
+    await expect(manager.createWorkspace({ taskId: 'AMBIGUOUS', baseRef: 'HEAD' }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_BASE_CONFLICT' });
+
+    await git(repo, ['update-ref', 'refs/agenthub/bases/COLLISION', 'HEAD']);
+    await expect(manager.createWorkspace({ taskId: 'COLLISION', baseRef: 'HEAD' }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_BASE_CONFLICT' });
+  });
+
+  it('rejects tampered linked-worktree metadata and branch identity', async () => {
+    const repo = await createRepository('agenthub metadata identity ');
+    const manager = await GitWorktreeManager.open({ repositoryRoot: repo });
+    const workspace = await manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' });
+    const dotGit = path.join(workspace.worktreePath, '.git');
+    const backup = path.join(workspace.worktreePath, '.git-safe');
+    await rename(dotGit, backup);
+    await writeFile(dotGit, 'gitdir: C:/definitely/not/the/right/repository\n');
+    await expect(manager.inspectWorkspace('TASK-A')).rejects.toMatchObject({ code: 'GIT_WORKTREE_CONTRACT_VIOLATION' });
+    await rm(dotGit);
+    await mkdir(dotGit);
+    await expect(manager.inspectWorkspace('TASK-A')).rejects.toMatchObject({ code: 'GIT_WORKTREE_PATH_CONFLICT' });
+    await rm(dotGit, { recursive: true });
+    await rename(backup, dotGit);
+
+    await git(repo, ['update-ref', '-d', 'refs/heads/agenthub/TASK-A']);
+    await expect(manager.inspectWorkspace('TASK-A')).rejects.toMatchObject({ code: 'GIT_WORKTREE_CONTRACT_VIOLATION' });
+  });
+
+  it('snapshots manager open options exactly once', async () => {
+    const repo = await createRepository('agenthub open snapshot ');
+    let rootReads = 0;
+    let runnerReads = 0;
+    let executableReads = 0;
+    const options = Object.defineProperties({}, {
+      repositoryRoot: { get: () => { rootReads += 1; return rootReads === 1 ? repo : 'wrong'; } },
+      runner: { get: () => { runnerReads += 1; return runner; } },
+      gitExecutable: { get: () => { executableReads += 1; return 'unused'; } },
+    }) as { repositoryRoot: string; runner: GitCommandRunner; gitExecutable: string };
+    const manager = await GitWorktreeManager.open(options);
+    expect(manager.repositoryRoot).toBe(await realCanonical(repo));
+    expect({ rootReads, runnerReads, executableReads }).toEqual({ rootReads: 1, runnerReads: 1, executableReads: 1 });
+  });
 });
 
 async function createRepository(prefix: string): Promise<string> {
@@ -219,6 +400,36 @@ async function temporaryDirectory(prefix: string): Promise<string> {
   return root;
 }
 
-function git(cwd: string, args: readonly string[]) {
-  return runner.run(args, { cwd });
+function git(cwd: string, args: readonly string[], acceptedExitCodes?: readonly number[]) {
+  return runner.run(args, { cwd, ...(acceptedExitCodes === undefined ? {} : { acceptedExitCodes }) });
+}
+
+class CountingRunner {
+  public readonly addCallsByRoot = new Map<string, number>();
+  public readonly excludeCallsByRoot = new Map<string, number>();
+  public blockRemove = false;
+  public readonly removeStarted: Promise<void>;
+  private signalRemove!: () => void;
+  private continueRemove: (() => void) | undefined;
+  public constructor(private readonly delegate: GitCommandRunner) {
+    this.removeStarted = new Promise((resolve) => { this.signalRemove = resolve; });
+  }
+  public async run(args: readonly string[], options: { cwd: string; acceptedExitCodes?: readonly number[] }) {
+    if (args[0] === 'worktree' && args[1] === 'add') increment(this.addCallsByRoot, options.cwd);
+    if (args.join(' ') === 'rev-parse --git-path info/exclude') increment(this.excludeCallsByRoot, options.cwd);
+    if (this.blockRemove && args[0] === 'worktree' && args[1] === 'remove') {
+      this.signalRemove();
+      await new Promise<void>((resolve) => { this.continueRemove = resolve; });
+    }
+    return this.delegate.run(args, options);
+  }
+  public releaseRemove(): void { this.continueRemove?.(); }
+}
+
+function increment(values: Map<string, number>, key: string): void {
+  values.set(key, (values.get(key) ?? 0) + 1);
+}
+
+async function realCanonical(value: string): Promise<string> {
+  return realpath(value);
 }
