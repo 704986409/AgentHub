@@ -421,6 +421,32 @@ describe('Claude Auto transport', () => {
     await expect(auto.runTurn({ prompt: 'future Y' })).rejects.toMatchObject({ code: 'CLAUDE_AUTO_NOT_STARTED' });
     expect(resume.requests).toEqual([]);
     await auto.shutdown();
+    expect(auto.requiresCleanup).toBe(false);
+  });
+
+  it('keeps a conflicting Persistent result terminal and preserves the confirmed identity', async () => {
+    const persistent = new PersistentStub();
+    const resume = new ResumeStub();
+    const auto = createAuto(persistent, resume, { mode: 'persistent-stream' });
+    await auto.start();
+    await auto.runTurn({ prompt: 'establish session A' });
+    persistent.sessionIdForResult = 'session-B';
+
+    await expect(auto.runTurn({ prompt: 'conflicting result' })).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED',
+      transport: 'persistent-stream',
+      sessionId: 'session-A',
+    });
+    expect(auto.requiresCleanup).toBe(true);
+    expect(auto.sessionId).toBe('session-A');
+    expect(resume.requests).toHaveLength(0);
+    await expect(auto.runTurn({ prompt: 'future blocked' })).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED',
+    });
+    expect(persistent.prompts).toHaveLength(2);
+    expect(resume.requests).toHaveLength(0);
+    await auto.shutdown();
+    expect(auto.requiresCleanup).toBe(false);
   });
 
   it('guards concurrent turns and releases the guard after success and failure', async () => {
@@ -461,8 +487,27 @@ describe('Claude Auto transport', () => {
     await expect(auto.runTurn({ prompt: 'conflict' })).rejects.toMatchObject({
       code: 'CLAUDE_AUTO_TURN_FAILED', transport: 'resume-per-turn', sessionId: 'session-A',
     });
+    expect(auto.requiresCleanup).toBe(true);
     expect(persistent.startCalls).toBe(0);
     expect(auto.active).toBe(false);
+    expect(auto.sessionId).toBe('session-A');
+    expect(auto.selectedTransport).toBe('resume-per-turn');
+    expect(resume.requests).toHaveLength(1);
+    await expect(auto.runTurn({ prompt: 'must stay blocked' })).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_NOT_STARTED',
+    });
+    expect(resume.requests).toHaveLength(1);
+    expect(persistent.startCalls).toBe(0);
+
+    await auto.shutdown();
+    expect(auto.requiresCleanup).toBe(false);
+    resume.resultSessionId = 'session-A';
+    await auto.start();
+    await expect(auto.runTurn({ prompt: 'clean retry' })).resolves.toMatchObject({
+      transport: 'resume-per-turn', sessionId: 'session-A',
+    });
+    expect(resume.requests).toHaveLength(2);
+    expect(persistent.startCalls).toBe(0);
     await auto.shutdown();
   });
 

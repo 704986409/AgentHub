@@ -429,7 +429,7 @@ export class ClaudeAutoTransport {
 
     try {
       const result = await persistent.runTurn({ prompt: request.prompt, timeoutMs });
-      this.acceptSession(result.sessionId, 'persistent-stream', true);
+      this.acceptSession(result.sessionId, 'persistent-stream');
       return normalizePersistentResult(result);
     } catch (cause) {
       this.capturePersistentSession();
@@ -483,7 +483,7 @@ export class ClaudeAutoTransport {
         ...(this.#sessionId === undefined ? {} : { sessionId: this.#sessionId }),
         timeoutMs,
       });
-      this.acceptSession(result.sessionId, 'resume-per-turn', false);
+      this.acceptSession(result.sessionId, 'resume-per-turn');
       return normalizeResumeResult(result, this.#lastFallback);
     } catch (cause) {
       if (cause instanceof ClaudeAutoError) throw cause;
@@ -512,10 +512,9 @@ export class ClaudeAutoTransport {
   private acceptSession(
     sessionId: string,
     transport: ClaudeSelectedTransport,
-    persistentMayRemainLive: boolean,
   ): void {
     if (this.#sessionId !== undefined && this.#sessionId !== sessionId) {
-      if (persistentMayRemainLive) this.#state = 'FAILED';
+      this.#state = 'FAILED';
       throw new ClaudeAutoError(
         'CLAUDE_AUTO_TURN_FAILED',
         'Claude transport returned a conflicting session identity',

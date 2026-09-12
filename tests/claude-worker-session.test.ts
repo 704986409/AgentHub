@@ -691,6 +691,82 @@ describe('Claude worker session', () => {
     await session.shutdown();
   });
 
+  it('quarantines an actual Auto Resume identity conflict before parser or a second execution', async () => {
+    const persistent = new LifecyclePersistentStub();
+    const resume = new LifecycleResumeStub();
+    resume.resultSessionId = 'session-B';
+    const parser = new AgentHubWorkerResultParser();
+    let parseCalls = 0;
+    const originalParse = parser.parse.bind(parser);
+    parser.parse = (text) => { parseCalls += 1; return originalParse(text); };
+    const { session, events } = createLifecycleSession(persistent, resume, {
+      resultParser: parser,
+      transportOptions: { mode: 'resume-per-turn', initialSessionId: 'session-A' },
+    });
+    await session.start();
+
+    await expect(session.runTurn({ prompt: 'identity conflict' })).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_TURN_FAILED', transport: 'resume-per-turn', sessionId: 'session-A',
+    });
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+    expect(session.sessionId).toBe('session-A');
+    expect(session.selectedTransport).toBe('resume-per-turn');
+    expect(parseCalls).toBe(0);
+    expect(resume.requests).toHaveLength(1);
+    expect(persistent.prompts).toHaveLength(0);
+    expect(events.filter((event) => event.eventType === executionStartedType)).toHaveLength(1);
+    expect(events.map((event) => event.eventType).filter(isExecutionTerminal)).toEqual([
+      AgentRuntimeEventType.AGENT_EXECUTION_FAILED,
+    ]);
+
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runTurn({ prompt: 'blocked turn' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runRevision({ prompt: 'blocked revision' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    expect(resume.requests).toHaveLength(1);
+    expect(events.filter((event) => event.eventType === executionStartedType)).toHaveLength(1);
+
+    await session.shutdown();
+    resume.resultSessionId = 'session-A';
+    await session.start();
+    await expect(session.runTurn({ prompt: 'clean retry' })).resolves.toMatchObject({
+      protocolValid: true, transport: 'resume-per-turn', sessionId: 'session-A',
+    });
+    expect(parseCalls).toBe(1);
+    expect(resume.requests).toHaveLength(2);
+    await session.shutdown();
+  });
+
+  it('commits actual Resume identity-conflict dirty state before failure mapping throws', async () => {
+    const persistent = new LifecyclePersistentStub();
+    const resume = new LifecycleResumeStub();
+    resume.resultSessionId = 'session-B';
+    const mapperError = new Error('identity failure mapper failed');
+    const eventBus = new EventBus();
+    eventBus.subscribe((event) => {
+      if (event.eventType === executionFailedType) throw mapperError;
+    });
+    const parser = new AgentHubWorkerResultParser();
+    let parseCalls = 0;
+    parser.parse = () => { parseCalls += 1; throw new Error('parser must not run'); };
+    const { session } = createLifecycleSession(persistent, resume, {
+      eventBus,
+      resultParser: parser,
+      transportOptions: { mode: 'resume-per-turn', initialSessionId: 'session-A' },
+    });
+    await session.start();
+
+    await expect(session.runTurn({ prompt: 'identity conflict' })).rejects.toBe(mapperError);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+    expect(parseCalls).toBe(0);
+    await expect(session.runRevision({ prompt: 'blocked' })).rejects.toMatchObject({
+      code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED',
+    });
+    expect(resume.requests).toHaveLength(1);
+    await session.shutdown();
+  });
+
   it.each([
     ['CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED', 'persistent-stream'],
     ['CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED', 'resume-per-turn'],
@@ -1499,12 +1575,13 @@ class LifecycleResumeStub {
   public running = false;
   public active = false;
   public readonly requests: { prompt: string; sessionId?: string }[] = [];
+  public resultSessionId: string | undefined;
 
   public runTurn(request: { prompt: string; sessionId?: string }): Promise<ClaudeAutoTurnResult> {
     this.requests.push({ ...request });
     return Promise.resolve(autoResult(workerText('COMPLETED'), {
       transport: 'resume-per-turn',
-      sessionId: request.sessionId ?? 'session-A',
+      sessionId: this.resultSessionId ?? request.sessionId ?? 'session-A',
     }));
   }
 
@@ -1517,15 +1594,22 @@ class LifecycleResumeStub {
 function createLifecycleSession(
   persistent: LifecyclePersistentStub,
   resume: LifecycleResumeStub,
+  options: {
+    eventBus?: EventBus;
+    resultParser?: AgentHubWorkerResultParser;
+    transportOptions?: Partial<ClaudeAutoTransportOptions>;
+  } = {},
 ): { session: ClaudeWorkerSession; events: DomainEvent[] } {
-  const eventBus = new EventBus();
+  const eventBus = options.eventBus ?? new EventBus();
   const events: DomainEvent[] = [];
   eventBus.subscribe((event) => events.push(event));
   const session = new ClaudeWorkerSession({
     eventBus,
     context: { provider: 'claude' },
+    ...(options.resultParser === undefined ? {} : { resultParser: options.resultParser }),
     transportOptions: {
       capabilityReport: report('supported'),
+      ...options.transportOptions,
       persistentFactory: () => persistent as unknown as ClaudePersistentStreamTransport,
       resumeFactory: () => resume as unknown as ClaudeResumePerTurnTransport,
     },
