@@ -290,7 +290,13 @@ export class ClaudeWorkerSession {
       () => undefined,
       () => undefined,
     );
-    await this.#auto.shutdown();
+    try {
+      await this.#auto.shutdown();
+    } catch (error) {
+      this.#started = false;
+      this.#cleanupRequired = true;
+      throw error;
+    }
     await activeTurnSettled;
     this.#takeRawMappingError();
     this.#started = false;

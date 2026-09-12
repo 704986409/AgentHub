@@ -885,7 +885,7 @@ describe('Claude worker session', () => {
     expect(mapped.session.active).toBe(false);
   });
 
-  it('delegates idle shutdown idempotently and preserves retry on lower failure', async () => {
+  it('quarantines an idle Session after lower shutdown failure until an explicit retry succeeds', async () => {
     const { session, fake, events } = createFakeSession();
     await session.shutdown();
     expect(fake.shutdownCalls).toBe(1);
@@ -894,11 +894,46 @@ describe('Claude worker session', () => {
     const error = new ClaudeAutoError('CLAUDE_AUTO_SHUTDOWN_FAILED', 'shutdown failed');
     fake.shutdownError = error;
     await expect(session.shutdown()).rejects.toBe(error);
-    expect(session.started).toBe(true);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+    expect(fake.requiresCleanup).toBe(false);
+    const startCalls = fake.startCalls;
+    const runCalls = fake.runCalls;
+    const eventCount = events.length;
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runTurn({ prompt: 'blocked turn' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runRevision({ prompt: 'blocked revision' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    expect(fake.startCalls).toBe(startCalls);
+    expect(fake.runCalls).toBe(runCalls);
+    expect(events).toHaveLength(eventCount);
+    expect(events.filter((event) => event.eventType === executionStartedType)).toEqual([]);
+
     fake.shutdownError = undefined;
     await session.shutdown();
     expect(fake.shutdownCalls).toBe(3);
     expect(session.started).toBe(false);
+    await session.start();
+    expect(session.started).toBe(true);
+    expect(fake.startCalls).toBe(startCalls + 1);
+  });
+
+  it('quarantines a failed shutdown when the lower Auto also reports cleanup ownership', async () => {
+    const { session, fake } = createFakeSession();
+    await session.start();
+    const error = new ClaudeAutoError('CLAUDE_AUTO_SHUTDOWN_FAILED', 'live child remains');
+    fake.requiresCleanup = true;
+    fake.shutdownError = error;
+
+    await expect(session.shutdown()).rejects.toBe(error);
+    expect(session.started).toBe(false);
+    expect(fake.requiresCleanup).toBe(true);
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+
+    fake.shutdownError = undefined;
+    await session.shutdown();
+    expect(fake.requiresCleanup).toBe(false);
+    await session.start();
+    expect(session.started).toBe(true);
   });
 
   it('serializes shutdown behind a successful start without resurrecting session state', async () => {
@@ -976,10 +1011,10 @@ describe('Claude worker session', () => {
     await session.shutdown();
   });
 
-  it('shares a concurrent shutdown failure and permits one explicit retry on the same Auto', async () => {
+  it('shares a concurrent shutdown failure, quarantines locally, and retries the same Auto once', async () => {
     const shutdownBarrier = deferred();
     const shutdownError = new ClaudeAutoError('CLAUDE_AUTO_SHUTDOWN_FAILED', 'shutdown failed');
-    const { session, fake } = createFakeSession();
+    const { session, fake, events } = createFakeSession();
     fake.shutdown = async () => {
       fake.shutdownCalls += 1;
       await shutdownBarrier.promise;
@@ -995,13 +1030,23 @@ describe('Claude worker session', () => {
     shutdownBarrier.resolve();
     await expect(first).rejects.toBe(shutdownError);
     await expect(second).rejects.toBe(shutdownError);
-    expect(session.started).toBe(true);
+    expect(session.started).toBe(false);
+    expect(fake.requiresCleanup).toBe(false);
+    const eventCount = events.length;
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runTurn({ prompt: 'blocked turn' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runRevision({ prompt: 'blocked revision' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    expect(fake.startCalls).toBe(1);
+    expect(fake.runCalls).toBe(0);
+    expect(events).toHaveLength(eventCount);
 
     fake.shutdown = FakeAuto.prototype.shutdown.bind(fake);
     await session.shutdown();
     expect(fake.shutdownCalls).toBe(2);
     expect(session.started).toBe(false);
     expect(session.active).toBe(false);
+    await session.start();
+    expect(fake.startCalls).toBe(2);
   });
 
   it('blocks start, turn, and revision locally while shutdown is in progress', async () => {
@@ -1051,28 +1096,39 @@ describe('Claude worker session', () => {
     expect(events).toHaveLength(eventCountAtShutdown);
   });
 
-  it('preserves active ownership when lower shutdown fails and quiesces on retry', async () => {
+  it('quarantines immediately when active-turn shutdown fails and keeps dirty state after turn settles', async () => {
     const turnBarrier = deferred();
     const shutdownError = new ClaudeAutoError('CLAUDE_AUTO_SHUTDOWN_FAILED', 'shutdown failed');
-    const { session, fake } = createFakeSession();
+    const { session, fake, events } = createFakeSession();
     fake.turns.push({ wait: turnBarrier.promise, error: new Error('stopped on retry') });
     await session.start();
     const turn = session.runTurn({ prompt: 'active' });
     fake.shutdownError = shutdownError;
 
     await expect(session.shutdown()).rejects.toBe(shutdownError);
-    expect(session.started).toBe(true);
+    expect(session.started).toBe(false);
     expect(session.active).toBe(true);
     expect(fake.shutdownCalls).toBe(1);
+    const eventCount = events.length;
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runTurn({ prompt: 'blocked turn' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runRevision({ prompt: 'blocked revision' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    expect(fake.startCalls).toBe(1);
+    expect(fake.runCalls).toBe(1);
+    expect(events).toHaveLength(eventCount);
 
-    fake.shutdownError = undefined;
-    const retry = session.shutdown();
     turnBarrier.resolve();
     await expect(turn).rejects.toThrow('stopped on retry');
-    await retry;
+    expect(session.active).toBe(false);
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+
+    fake.shutdownError = undefined;
+    await session.shutdown();
     expect(fake.shutdownCalls).toBe(2);
     expect(session.started).toBe(false);
     expect(session.active).toBe(false);
+    await session.start();
+    expect(session.started).toBe(true);
   });
 
   it('registers the active turn before synchronous execution-start observers can request shutdown', async () => {
