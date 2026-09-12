@@ -42,7 +42,7 @@ const workerResult: AgentHubWorkerResult = {
 class FakeSession implements AgentProviderSession {
   public readonly providerId = 'fake';
   public readonly capabilities = capabilities;
-  public started = false;
+  #started = false;
   public active = false;
   public readonly sessionId: string;
   public startCalls = 0;
@@ -58,9 +58,23 @@ class FakeSession implements AgentProviderSession {
   public onStart: (() => void) | undefined;
   public onRun: (() => void) | undefined;
   public onShutdown: (() => void) | undefined;
+  public onStoppedInspection: (() => void) | undefined;
 
   public constructor(public readonly agentId: string) {
     this.sessionId = `session-${agentId}`;
+  }
+
+  public get started(): boolean {
+    if (!this.#started && this.onStoppedInspection !== undefined) {
+      const callback = this.onStoppedInspection;
+      this.onStoppedInspection = undefined;
+      queueMicrotask(callback);
+    }
+    return this.#started;
+  }
+
+  public set started(value: boolean) {
+    this.#started = value;
   }
 
   public async start(): Promise<void> {
@@ -501,6 +515,74 @@ describe('AgentPool shutdownAll', () => {
     expect(pool.draining).toBe(false);
   });
 
+  it('joins an immediate IDLE start-failure reconciliation without a false drain failure', async () => {
+    const { pool, provider } = registeredHarness('agent-A', 'agent-B');
+    const constructionError = new Error('construction failed');
+    provider.createError = constructionError;
+
+    const start = pool.start('agent-A', binding('A'));
+    const drain = pool.shutdownAll();
+
+    await expect(start).rejects.toBe(constructionError);
+    await expect(drain).resolves.toBeUndefined();
+    expect(pool.draining).toBe(false);
+    expect(pool.getSnapshot('agent-A').state).toBe('IDLE');
+
+    provider.createError = undefined;
+    await pool.start('agent-B', binding('A'));
+    await pool.shutdown('agent-B', 'assignment-A');
+  });
+
+  it('blocks reuse and unregister while an IDLE start reconciliation is pending', async () => {
+    const { pool, provider } = registeredHarness('agent-A', 'agent-B');
+    provider.createError = new Error('construction failed');
+    const start = pool.start('agent-A', binding('A'));
+    void start.catch(() => undefined);
+    const sameAgent = pool.start('agent-A', binding('B'));
+    const otherAgent = pool.start('agent-B', binding('A'));
+    const pendingTurn = pool.runTurn('agent-A', 'assignment-A', request());
+    const pendingShutdown = pool.shutdown('agent-A', 'assignment-A');
+    void otherAgent.catch(() => undefined);
+    void pendingTurn.catch(() => undefined);
+    void pendingShutdown.catch(() => undefined);
+
+    expectPoolError(() => pool.unregister('agent-A'), 'AGENT_POOL_AGENT_BUSY');
+    await expect(sameAgent).rejects.toMatchObject({
+      code: 'AGENT_POOL_OPERATION_BUSY',
+    });
+    await expect(otherAgent).rejects.toMatchObject({
+      code: 'AGENT_POOL_ASSIGNMENT_ALREADY_OWNED',
+    });
+    await expect(pendingTurn).rejects.toMatchObject({ code: 'AGENT_POOL_OPERATION_BUSY' });
+    await expect(pendingShutdown).rejects.toMatchObject({ code: 'AGENT_POOL_OPERATION_BUSY' });
+
+    await expect(start).rejects.toThrow('construction failed');
+    provider.createError = undefined;
+    await pool.start('agent-B', binding('A'));
+    await pool.shutdown('agent-B', 'assignment-A');
+  });
+
+  it('drains an immediate FAILED start through the same Runtime and session', async () => {
+    const { pool, provider } = registeredHarness('agent-A', 'agent-B');
+    provider.nextSession = (options) => Object.assign(new FakeSession(contextAgentId(options)), {
+      startError: new Error('start failed'),
+    });
+
+    const start = pool.start('agent-A', binding('A'));
+    const drain = pool.shutdownAll();
+
+    await expect(start).rejects.toThrow('start failed');
+    await expect(drain).resolves.toBeUndefined();
+    const session = sessionFor(provider, 'agent-A');
+    expect(session.shutdownCalls).toBe(1);
+    expect(provider.createCalls).toBe(1);
+    expect(pool.getSnapshot('agent-A').state).toBe('IDLE');
+
+    provider.nextSession = undefined;
+    await pool.start('agent-B', binding('A'));
+    await pool.shutdown('agent-B', 'assignment-A');
+  });
+
   it('shares one drain and starts independent cleanups concurrently', async () => {
     const { pool, provider } = registeredHarness('agent-A', 'agent-B');
     await Promise.all([pool.start('agent-A', binding('A')), pool.start('agent-B', binding('B'))]);
@@ -556,6 +638,47 @@ describe('AgentPool shutdownAll', () => {
     expect(active.pool.getSnapshot('agent-A').state).toBe('IDLE');
   });
 
+  it('joins assignment shutdown reconciliation with one lower cleanup generation', async () => {
+    const { pool, provider } = registeredHarness('agent-A');
+    await pool.start('agent-A', binding('A'));
+    const session = sessionFor(provider, 'agent-A');
+    const gate = deferred();
+    session.shutdownBarrier = gate.promise;
+
+    const shutdown = pool.shutdown('agent-A', 'assignment-A');
+    const drain = pool.shutdownAll();
+    await Promise.resolve();
+    expect(session.shutdownCalls).toBe(1);
+
+    gate.resolve();
+    await Promise.all([shutdown, drain]);
+    expect(session.shutdownCalls).toBe(1);
+    expect(pool.getSnapshot('agent-A').state).toBe('IDLE');
+    expect(pool.draining).toBe(false);
+  });
+
+  it('shares shutdown after Runtime becomes IDLE but before Pool reconciliation', async () => {
+    const { pool, provider } = registeredHarness('agent-A');
+    await pool.start('agent-A', binding('A'));
+    const session = sessionFor(provider, 'agent-A');
+    const gate = deferred();
+    const observed = deferred();
+    let repeated: Promise<void> | undefined;
+    session.shutdownBarrier = gate.promise;
+    session.onStoppedInspection = () => {
+      repeated = pool.shutdown('agent-A', 'assignment-A');
+      observed.resolve();
+    };
+
+    const first = pool.shutdown('agent-A', 'assignment-A');
+    gate.resolve();
+    await observed.promise;
+    expect(repeated).toBe(first);
+    await Promise.all([first, repeated]);
+    expect(session.shutdownCalls).toBe(1);
+    expect(pool.getSnapshot('agent-A').state).toBe('IDLE');
+  });
+
   it('lets reentrant shutdownAll win during start without assignment resurrection', async () => {
     const { pool, provider } = registeredHarness('agent-A');
     let drain: Promise<void> | undefined;
@@ -594,6 +717,37 @@ describe('AgentPool shutdownAll', () => {
     expect(pool.getSnapshot('agent-A').state).toBe('IDLE');
     await pool.start('agent-C', binding('A'));
     await pool.shutdown('agent-C', 'assignment-A');
+  });
+
+  it('combines pending clean reconciliation with partial drain success and retry', async () => {
+    const { pool, provider } = registeredHarness('agent-A', 'agent-B', 'agent-C', 'agent-D');
+    await Promise.all([pool.start('agent-B', binding('B')), pool.start('agent-C', binding('C'))]);
+    const sessionB = sessionFor(provider, 'agent-B');
+    const sessionC = sessionFor(provider, 'agent-C');
+    sessionC.shutdownError = new Error('C cleanup failed');
+    provider.createError = new Error('A construction failed');
+
+    const startA = pool.start('agent-A', binding('A'));
+    const drain = pool.shutdownAll();
+    await expect(startA).rejects.toThrow('A construction failed');
+    await expect(drain).rejects.toMatchObject({
+      code: 'AGENT_POOL_SHUTDOWN_FAILED', failedAgentIds: ['agent-C'],
+    });
+
+    expect(sessionB.shutdownCalls).toBe(1);
+    expect(sessionC.shutdownCalls).toBe(1);
+    expect(pool.getSnapshot('agent-A').state).toBe('IDLE');
+    expect(pool.getSnapshot('agent-B').state).toBe('IDLE');
+    expect(pool.getSnapshot('agent-C').state).toBe('FAILED');
+    provider.createError = undefined;
+    await pool.start('agent-D', binding('A'));
+    await pool.shutdown('agent-D', 'assignment-A');
+
+    sessionC.shutdownError = undefined;
+    await pool.shutdownAll();
+    expect(sessionC.shutdownCalls).toBe(2);
+    await pool.start('agent-D', binding('C'));
+    await pool.shutdown('agent-D', 'assignment-C');
   });
 
   it('aggregates multiple failed agents and retries only non-IDLE runtimes', async () => {

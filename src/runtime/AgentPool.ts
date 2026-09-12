@@ -76,6 +76,13 @@ interface AgentPoolRegistrationSnapshot {
 interface PoolEntry {
   readonly registration: AgentPoolRegistrationSnapshot;
   readonly runtime: AgentRuntime;
+  pendingStart?: PendingLifecycle;
+  pendingShutdown?: PendingLifecycle;
+}
+
+interface PendingLifecycle {
+  readonly token: object;
+  readonly promise: Promise<void>;
 }
 
 export class AgentPool {
@@ -141,6 +148,9 @@ export class AgentPool {
     if (entry.runtime.state !== 'IDLE' || entry.runtime.busy || this.#hasAssignmentFor(agentId)) {
       throw new AgentPoolError('AGENT_POOL_AGENT_BUSY', `Agent ${agentId} is busy`);
     }
+    if (entry.pendingStart !== undefined || entry.pendingShutdown !== undefined) {
+      throw operationBusy();
+    }
     this.#entries.delete(agentId);
   }
 
@@ -177,13 +187,20 @@ export class AgentPool {
         this.#reconcileStartFailure(entry, snapshot.assignmentId);
         throw error;
       }
-      return starting.then(
-        () => this.#validateStartedEntry(entry, snapshot),
-        (error: unknown) => {
+      const token = {};
+      const current = (async () => {
+        try {
+          await starting;
+          this.#validateStartedEntry(entry, snapshot);
+        } catch (error) {
           this.#reconcileStartFailure(entry, snapshot.assignmentId);
           throw error;
-        },
-      );
+        } finally {
+          if (entry.pendingStart?.token === token) delete entry.pendingStart;
+        }
+      })();
+      entry.pendingStart = { token, promise: current };
+      return current;
     } catch (error) {
       return rejectPreserving(error);
     }
@@ -206,21 +223,10 @@ export class AgentPool {
   public shutdown(agentId: string, assignmentId: string): Promise<void> {
     try {
       this.#ensureNotDraining();
-      const entry = this.#requireOwnedEntry(agentId, assignmentId);
-      let stopping: Promise<void>;
-      try {
-        stopping = entry.runtime.shutdown();
-      } catch (error) {
-        this.#reconcileShutdownFailure(entry, assignmentId);
-        throw error;
-      }
-      return stopping.then(
-        () => this.#reconcileShutdownSuccess(entry, assignmentId),
-        (error: unknown) => {
-          this.#reconcileShutdownFailure(entry, assignmentId);
-          throw error;
-        },
-      );
+      const entry = this.#requireAssignmentOwner(agentId, assignmentId);
+      if (entry.pendingShutdown !== undefined) return entry.pendingShutdown.promise;
+      this.#validateRuntimeOwnership(entry, assignmentId);
+      return this.#beginShutdown(entry, assignmentId);
     } catch (error) {
       return rejectPreserving(error);
     }
@@ -242,19 +248,10 @@ export class AgentPool {
 
   async #performShutdownAll(): Promise<void> {
     const failures: string[] = [];
-    const cleanups: Promise<void>[] = [];
-    for (const entry of this.#entries.values()) {
-      if (entry.runtime.state === 'IDLE') {
-        if (entry.runtime.busy || entry.runtime.binding !== undefined ||
-          this.#hasAssignmentFor(entry.registration.agentId)) {
-          failures.push(entry.registration.agentId);
-        }
-        continue;
-      }
-      cleanups.push(this.#shutdownEntryForDrain(entry).catch(() => {
+    const cleanups = [...this.#entries.values()].map((entry) =>
+      this.#drainEntry(entry).catch(() => {
         failures.push(entry.registration.agentId);
       }));
-    }
     await Promise.all(cleanups);
     if (failures.length > 0) {
       throw new AgentPoolError(
@@ -265,15 +262,30 @@ export class AgentPool {
     }
   }
 
-  async #shutdownEntryForDrain(entry: PoolEntry): Promise<void> {
-    try {
-      await entry.runtime.shutdown();
-    } catch (error) {
-      if (isRuntimeClean(entry.runtime)) this.#releaseAssignmentsFor(entry.registration.agentId);
-      throw error;
+  async #drainEntry(entry: PoolEntry): Promise<void> {
+    if (entry.runtime.state === 'IDLE') {
+      const pending = pendingReconciliations(entry);
+      if (pending.length > 0) {
+        await Promise.all(pending.map(settle));
+        return this.#drainEntry(entry);
+      }
+      if (!isRuntimeClean(entry.runtime) || this.#hasAssignmentFor(entry.registration.agentId)) {
+        throw runtimeContractViolation(entry.registration.agentId);
+      }
+      return;
     }
-    if (!isRuntimeClean(entry.runtime)) throw runtimeContractViolation(entry.registration.agentId);
-    this.#releaseAssignmentsFor(entry.registration.agentId);
+
+    const pendingShutdown = entry.pendingShutdown;
+    if (pendingShutdown !== undefined) {
+      try {
+        await pendingShutdown.promise;
+      } catch (error) {
+        if (!isRuntimeClean(entry.runtime)) throw error;
+      }
+      return this.#drainEntry(entry);
+    }
+
+    await this.#beginShutdown(entry);
   }
 
   #ensureAgentCanStart(entry: PoolEntry): void {
@@ -282,6 +294,9 @@ export class AgentPool {
     if (entry.runtime.state !== 'IDLE' || entry.runtime.busy) {
       if (!hasAssignment) throw runtimeContractViolation(agentId);
       throw new AgentPoolError('AGENT_POOL_AGENT_BUSY', `Agent ${agentId} is busy`);
+    }
+    if (entry.pendingStart !== undefined || entry.pendingShutdown !== undefined) {
+      throw operationBusy();
     }
     if (entry.runtime.binding !== undefined || hasAssignment) throw runtimeContractViolation(agentId);
   }
@@ -303,28 +318,65 @@ export class AgentPool {
     }
   }
 
-  #reconcileShutdownSuccess(entry: PoolEntry, assignmentId: string): void {
-    if (!isRuntimeClean(entry.runtime)) throw runtimeContractViolation(entry.registration.agentId);
-    this.#deleteOwnerIfExact(assignmentId, entry.registration.agentId);
+  #beginShutdown(entry: PoolEntry, assignmentId?: string): Promise<void> {
+    if (entry.pendingShutdown !== undefined) return entry.pendingShutdown.promise;
+    let stopping: Promise<void>;
+    try {
+      stopping = entry.runtime.shutdown();
+    } catch (error) {
+      this.#reconcileShutdown(entry, assignmentId);
+      throw error;
+    }
+    const token = {};
+    const current = (async () => {
+      try {
+        await stopping;
+        if (!isRuntimeClean(entry.runtime)) throw runtimeContractViolation(entry.registration.agentId);
+        this.#reconcileShutdown(entry, assignmentId);
+      } catch (error) {
+        this.#reconcileShutdown(entry, assignmentId);
+        throw error;
+      } finally {
+        if (entry.pendingShutdown?.token === token) delete entry.pendingShutdown;
+      }
+    })();
+    entry.pendingShutdown = { token, promise: current };
+    return current;
   }
 
-  #reconcileShutdownFailure(entry: PoolEntry, assignmentId: string): void {
-    if (isRuntimeClean(entry.runtime)) {
+  #reconcileShutdown(entry: PoolEntry, assignmentId?: string): void {
+    if (!isRuntimeClean(entry.runtime)) return;
+    if (assignmentId === undefined) {
+      this.#releaseAssignmentsFor(entry.registration.agentId);
+    } else {
       this.#deleteOwnerIfExact(assignmentId, entry.registration.agentId);
     }
   }
 
   #requireOwnedEntry(agentId: string, assignmentId: string): PoolEntry {
+    const entry = this.#requireAssignmentOwner(agentId, assignmentId);
+    this.#validateRuntimeOwnership(entry, assignmentId);
+    return entry;
+  }
+
+  #requireAssignmentOwner(agentId: string, assignmentId: string): PoolEntry {
     const entry = this.#requireEntry(agentId);
     if (!isNonBlankString(assignmentId) || this.#assignmentOwners.get(assignmentId) !== agentId) {
       throw assignmentMismatch(agentId, assignmentId);
     }
+    return entry;
+  }
+
+  #validateRuntimeOwnership(entry: PoolEntry, assignmentId: string): void {
+    if (entry.runtime.state === 'IDLE' &&
+      (entry.pendingStart !== undefined || entry.pendingShutdown !== undefined)) {
+      throw operationBusy();
+    }
     const binding = entry.runtime.binding;
     if (binding === undefined || binding.assignmentId !== assignmentId ||
       entry.runtime.state === 'IDLE' || !entry.runtime.busy) {
-      throw runtimeContractViolation(agentId);
+      throw runtimeContractViolation(entry.registration.agentId);
     }
-    return entry;
   }
 
   #requireEntry(agentId: string): PoolEntry {
@@ -418,6 +470,17 @@ function snapshotEntry(entry: PoolEntry): Readonly<AgentPoolEntrySnapshot> {
 
 function isRuntimeClean(runtime: AgentRuntime): boolean {
   return runtime.state === 'IDLE' && !runtime.busy && runtime.binding === undefined;
+}
+
+function pendingReconciliations(entry: PoolEntry): Promise<void>[] {
+  const pending: Promise<void>[] = [];
+  if (entry.pendingStart !== undefined) pending.push(entry.pendingStart.promise);
+  if (entry.pendingShutdown !== undefined) pending.push(entry.pendingShutdown.promise);
+  return pending;
+}
+
+function settle(promise: Promise<void>): Promise<void> {
+  return promise.then(() => undefined, () => undefined);
 }
 
 function invalidRegistration(message: string): AgentPoolError {
