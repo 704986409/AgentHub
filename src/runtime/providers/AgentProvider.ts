@@ -3,7 +3,7 @@ import type { EventBus } from '../../events/event-bus.js';
 import type { AgentHubWorkerResult } from '../../protocol/AgentHubWorkerResult.js';
 import type { AgentHubWorkerResultFailure } from '../../protocol/AgentHubWorkerResultParser.js';
 import type { ManagerDirective } from '../../protocol/ManagerDirective.js';
-import type { ManagerDirectiveFailure } from '../../protocol/ManagerDirectiveParser.js';
+import type { ManagerDirectiveFailureKind } from '../../protocol/ManagerDirectiveParser.js';
 
 export type AgentProviderId = string;
 
@@ -50,11 +50,21 @@ export interface AgentManagerDirectiveTurnSuccess extends AgentProviderTurnMetad
   readonly failure?: never;
 }
 
+export type AgentManagerDirectiveFailureKind =
+  | ManagerDirectiveFailureKind
+  | 'initial_turn_failed'
+  | 'repair_turn_failed';
+
+export interface AgentManagerDirectiveFailure {
+  readonly kind: AgentManagerDirectiveFailureKind;
+  readonly message: string;
+}
+
 export interface AgentManagerDirectiveTurnFailure extends AgentProviderTurnMetadata {
   readonly protocol: 'manager-directive';
   readonly directiveStatus: 'invalid';
   readonly directive: null;
-  readonly failure: ManagerDirectiveFailure;
+  readonly failure: AgentManagerDirectiveFailure;
 }
 
 export type AgentManagerDirectiveTurnResult =

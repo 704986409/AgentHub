@@ -4,6 +4,9 @@ import {
   AgentProviderError,
   agentOutputProtocols,
   validateAgentProviderTurnRequest,
+  type AgentManagerDirectiveFailure,
+  type AgentManagerDirectiveFailureKind,
+  type AgentManagerDirectiveTurnFailure,
   type AgentManagerDirectiveTurnResult,
   type AgentProvider,
   type AgentProviderCapabilities,
@@ -12,7 +15,14 @@ import {
   type AgentProviderTurnResult,
   type AgentWorkerResultTurnFailure,
   type AgentWorkerResultTurnSuccess,
+  type ManagerDirectiveFailureKind,
+  type ManagerDirectiveTurnFailureKind,
 } from '../src/index.js';
+
+type Assert<T extends true> = T;
+type ArbitraryManagerFailureRejected = Assert<
+  'codex_special_failure' extends AgentManagerDirectiveFailureKind ? false : true
+>;
 
 const hybridCapabilities: AgentProviderCapabilities = {
   outputProtocols: ['manager-directive', 'worker-result'],
@@ -47,6 +57,74 @@ describe('agent provider contract', () => {
     expect(result).not.toHaveProperty('text');
     expect(result).not.toHaveProperty('threadId');
     expect(result).not.toHaveProperty('repairText');
+  });
+
+  it.each([
+    'missing_directive',
+    'multiple_directives',
+    'malformed_json',
+    'schema_invalid',
+    'semantic_invalid',
+  ] as const)('keeps parser failure kind %s directly representable', (kind) => {
+    const parserKind: ManagerDirectiveFailureKind = kind;
+    const neutralKind: AgentManagerDirectiveFailureKind = parserKind;
+    const failure: AgentManagerDirectiveFailure = { kind: neutralKind, message: 'Parser failure' };
+    expect(failure.kind).toBe(kind);
+  });
+
+  it.each([
+    ['initial_turn_failed', 'Initial Manager turn ended with status failed'],
+    ['repair_turn_failed', 'Repair turn ended with status timeout'],
+  ] as const)('supports neutral execution failure %s', (kind, message) => {
+    const failure: AgentManagerDirectiveFailure = { kind, message };
+    const result: AgentManagerDirectiveTurnFailure = {
+      providerId: 'hybrid-test',
+      protocol: 'manager-directive',
+      directiveStatus: 'invalid',
+      directive: null,
+      failure,
+    };
+    expect(result.failure).toEqual({ kind, message });
+  });
+
+  it('accepts every existing Codex manager failure kind without a cast or rename', () => {
+    const codexKinds: ManagerDirectiveTurnFailureKind[] = [
+      'missing_directive',
+      'multiple_directives',
+      'malformed_json',
+      'schema_invalid',
+      'semantic_invalid',
+      'initial_turn_failed',
+      'repair_turn_failed',
+    ];
+    const neutralKinds: AgentManagerDirectiveFailureKind[] = codexKinds;
+    expect(neutralKinds).toEqual(codexKinds);
+  });
+
+  it('keeps arbitrary manager failure kinds outside the closed neutral vocabulary', () => {
+    const rejected: ArbitraryManagerFailureRejected = true;
+    expect(rejected).toBe(true);
+  });
+
+  it.each(['valid', 'repaired'] as const)('keeps manager %s success results unchanged', (directiveStatus) => {
+    const result: AgentManagerDirectiveTurnResult = {
+      providerId: 'hybrid-test',
+      protocol: 'manager-directive',
+      directiveStatus,
+      directive: {
+        action: 'INFORM',
+        taskId: 'TASK-1',
+        title: 'Status',
+        instructions: '',
+        acceptanceCriteria: [],
+        issues: [],
+        requestedChecks: [],
+        summary: 'Done',
+      },
+    };
+    expect(result.directiveStatus).toBe(directiveStatus);
+    expect(result.directive.action).toBe('INFORM');
+    expect(result).not.toHaveProperty('failure');
   });
 
   it('models worker success and failure as a strict protocol-validity union', () => {
