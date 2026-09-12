@@ -7,7 +7,7 @@ import {
   type GitCommandRunnerLike,
 } from './GitCommandRunner.js';
 
-import { captureWorkspaceChanges, snapshotCaptureOptions, canonicalChangeState,
+import { captureWorkspaceChanges, snapshotCaptureOptions, canonicalChangeState, gitCapturePrefix,
   type CaptureWorkspaceChangesOptions, type GitWorkspaceChangeSnapshot } from './GitWorkspaceChangeCapture.js';
 
 const excludeRule = '/.agenthub/worktrees/';
@@ -229,7 +229,7 @@ export class GitWorktreeManager {
       return Promise.reject(operationBusy(taskId));
     }
     const token = {};
-    const operation = captureWorkspaceChanges(this.#runner, () => this.#inspect(taskId), snapshot);
+    const operation = captureWorkspaceChanges(this.#runner, () => this.#inspect(taskId, gitCapturePrefix), snapshot);
     const current = operation.finally(() => {
       if (this.#coordination.operations.get(key)?.token === token) this.#coordination.operations.delete(key);
     });
@@ -356,19 +356,19 @@ export class GitWorktreeManager {
     }
   }
 
-  async #inspect(taskId: string): Promise<TaskWorkspace | undefined> {
+  async #inspect(taskId: string, gitPrefix: readonly string[] = []): Promise<TaskWorkspace | undefined> {
     const branchName = branchFor(taskId);
     const worktreePath = this.#pathFor(taskId);
     await this.#validateManagedRoot(taskId, false);
-    const records = await this.#discover();
-    const exact = await this.#exactWorkspace(taskId, branchName, worktreePath, records);
+    const records = await this.#discover(gitPrefix);
+    const exact = await this.#exactWorkspace(taskId, branchName, worktreePath, records, gitPrefix);
     if (exact !== undefined) {
-      const baseCommit = await this.#requireBaseMarker(taskId);
-      await this.#assertBaseAncestry(taskId, baseCommit, exact.headCommit);
+      const baseCommit = await this.#requireBaseMarker(taskId, gitPrefix);
+      await this.#assertBaseAncestry(taskId, baseCommit, exact.headCommit, gitPrefix);
       return Object.freeze({ ...exact, baseCommit });
     }
     if (findByPath(records, worktreePath) !== undefined || await pathExists(worktreePath)) throw pathConflict(taskId);
-    if (await this.#branchExists(branchName, taskId) || findByBranch(records, branchName) !== undefined) {
+    if (await this.#branchExists(branchName, taskId, gitPrefix) || findByBranch(records, branchName) !== undefined) {
       throw new GitWorktreeError('GIT_WORKTREE_BRANCH_CONFLICT', 'Task branch exists without its managed worktree', 'inspect', taskId);
     }
     return undefined;
@@ -407,12 +407,13 @@ export class GitWorktreeManager {
     branchName: string,
     worktreePath: string,
     records: readonly GitWorktreeRecord[],
+    gitPrefix: readonly string[] = [],
   ): Promise<VerifiedWorkspace | undefined> {
     const record = findByPath(records, worktreePath);
     if (record === undefined || record.branch !== `refs/heads/${branchName}`) return undefined;
     if (record.prunable) throw staleMetadata(taskId);
     if (record.detached || record.bare || record.locked) throw pathConflict(taskId);
-    return this.#workspaceFromRecord(taskId, branchName, worktreePath, record);
+    return this.#workspaceFromRecord(taskId, branchName, worktreePath, record, gitPrefix);
   }
 
   async #workspaceFromRecord(
@@ -420,6 +421,7 @@ export class GitWorktreeManager {
     branchName: string,
     worktreePath: string,
     record: GitWorktreeRecord,
+    gitPrefix: readonly string[] = [],
   ): Promise<VerifiedWorkspace> {
     if (record.head === undefined || !shaPattern.test(record.head)) {
       throw new GitWorktreeError(
@@ -435,12 +437,12 @@ export class GitWorktreeManager {
     }
     try {
       const [topResult, gitDirResult, commonResult, branchResult, headResult, refResult] = await Promise.all([
-        this.#runnerCall(['rev-parse', '--show-toplevel'], 'verify-worktree', taskId, worktreePath),
-        this.#runnerCall(['rev-parse', '--absolute-git-dir'], 'verify-worktree', taskId, worktreePath),
-        this.#runnerCall(['rev-parse', '--path-format=absolute', '--git-common-dir'], 'verify-worktree', taskId, worktreePath),
-        this.#runnerCall(['symbolic-ref', '-q', 'HEAD'], 'verify-worktree', taskId, worktreePath),
-        this.#runnerCall(['rev-parse', '--verify', 'HEAD'], 'verify-worktree', taskId, worktreePath),
-        this.#runnerCall(['rev-parse', '--verify', `refs/heads/${branchName}`], 'verify-worktree', taskId, worktreePath),
+        this.#runnerCall(['rev-parse', '--show-toplevel'], 'verify-worktree', taskId, worktreePath, undefined, gitPrefix),
+        this.#runnerCall(['rev-parse', '--absolute-git-dir'], 'verify-worktree', taskId, worktreePath, undefined, gitPrefix),
+        this.#runnerCall(['rev-parse', '--path-format=absolute', '--git-common-dir'], 'verify-worktree', taskId, worktreePath, undefined, gitPrefix),
+        this.#runnerCall(['symbolic-ref', '-q', 'HEAD'], 'verify-worktree', taskId, worktreePath, undefined, gitPrefix),
+        this.#runnerCall(['rev-parse', '--verify', 'HEAD'], 'verify-worktree', taskId, worktreePath, undefined, gitPrefix),
+        this.#runnerCall(['rev-parse', '--verify', `refs/heads/${branchName}`], 'verify-worktree', taskId, worktreePath, undefined, gitPrefix),
       ]);
       const top = await realpath(path.resolve(worktreePath, topResult.stdout.trim()));
       const linkedGitDir = await realpath(path.resolve(worktreePath, gitDirResult.stdout.trim()));
@@ -462,8 +464,8 @@ export class GitWorktreeManager {
     });
   }
 
-  async #discover(): Promise<readonly GitWorktreeRecord[]> {
-    const result = await this.#runnerCall(['worktree', 'list', '--porcelain', '-z'], 'discover');
+  async #discover(gitPrefix: readonly string[] = []): Promise<readonly GitWorktreeRecord[]> {
+    const result = await this.#runnerCall(['worktree', 'list', '--porcelain', '-z'], 'discover', undefined, undefined, undefined, gitPrefix);
     return parseWorktreePorcelain(result.stdout);
   }
 
@@ -481,9 +483,9 @@ export class GitWorktreeManager {
     }
   }
 
-  async #branchExists(branchName: string, taskId?: string): Promise<boolean> {
+  async #branchExists(branchName: string, taskId?: string, gitPrefix: readonly string[] = []): Promise<boolean> {
     const result = await this.#runnerCall(
-      ['show-ref', '--verify', '--quiet', `refs/heads/${branchName}`], 'inspect-branch', taskId, undefined, [0, 1],
+      ['show-ref', '--verify', '--quiet', `refs/heads/${branchName}`], 'inspect-branch', taskId, undefined, [0, 1], gitPrefix,
     );
     return result.exitCode === 0;
   }
@@ -579,33 +581,35 @@ export class GitWorktreeManager {
     }
   }
 
-  async #readBaseMarker(taskId: string): Promise<string | undefined> {
+  async #readBaseMarker(taskId: string, gitPrefix: readonly string[] = []): Promise<string | undefined> {
     const marker = baseMarkerFor(taskId);
     const exists = await this.#runnerCall(
-      ['show-ref', '--verify', '--quiet', marker], 'inspect-base', taskId, undefined, [0, 1],
+      ['show-ref', '--verify', '--quiet', marker], 'inspect-base', taskId, undefined, [0, 1], gitPrefix,
     );
     if (exists.exitCode === 1) return undefined;
     const symbolic = await this.#runnerCall(
-      ['symbolic-ref', '-q', marker], 'inspect-base', taskId, undefined, [0, 1],
+      ['symbolic-ref', '-q', marker], 'inspect-base', taskId, undefined, [0, 1], gitPrefix,
     );
     if (symbolic.exitCode === 0) throw baseConflict(taskId);
     const resolved = await this.#runnerCall(
-      ['rev-parse', '--verify', '--end-of-options', `${marker}^{commit}`], 'inspect-base', taskId,
+      ['rev-parse', '--verify', '--end-of-options', `${marker}^{commit}`], 'inspect-base', taskId, undefined, undefined, gitPrefix,
     );
     const commit = resolved.stdout.trim();
     if (!shaPattern.test(commit)) throw baseConflict(taskId);
     return commit;
   }
 
-  async #requireBaseMarker(taskId: string): Promise<string> {
-    const marker = await this.#readBaseMarker(taskId);
+  async #requireBaseMarker(taskId: string, gitPrefix: readonly string[] = []): Promise<string> {
+    const marker = await this.#readBaseMarker(taskId, gitPrefix);
     if (marker === undefined) throw baseConflict(taskId);
     return marker;
   }
 
-  async #assertBaseAncestry(taskId: string, baseCommit: string, headCommit: string): Promise<void> {
+  async #assertBaseAncestry(
+    taskId: string, baseCommit: string, headCommit: string, gitPrefix: readonly string[] = [],
+  ): Promise<void> {
     const result = await this.#runnerCall(
-      ['merge-base', '--is-ancestor', baseCommit, headCommit], 'verify-base', taskId, undefined, [0, 1],
+      ['merge-base', '--is-ancestor', baseCommit, headCommit], 'verify-base', taskId, undefined, [0, 1], gitPrefix,
     );
     if (result.exitCode !== 0) throw baseConflict(taskId);
   }
@@ -662,8 +666,9 @@ export class GitWorktreeManager {
     taskId?: string,
     cwd = this.#repositoryRoot,
     acceptedExitCodes?: readonly number[],
+    gitPrefix: readonly string[] = [],
   ) {
-    return this.#runner.run(args, {
+    return this.#runner.run([...gitPrefix, ...args], {
       cwd,
       ...(acceptedExitCodes === undefined ? {} : { acceptedExitCodes }),
     }).catch((error: unknown) => {

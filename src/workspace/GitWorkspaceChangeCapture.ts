@@ -76,6 +76,9 @@ const mode = /^(?:000000|100644|100755|120000|160000)$/;
 const compare = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;
 const sorted = (values: Iterable<string>): string[] => [...new Set(values)].sort(compare);
 const sha = (value: string | Buffer): string => createHash('sha256').update(value).digest('hex');
+export const gitCapturePrefix: readonly string[] = Object.freeze([
+  '--no-optional-locks', '--no-lazy-fetch', '--no-replace-objects', '-c', 'core.fsmonitor=false',
+]);
 
 /** Explicit recursive key ordering; independent of object construction and locale. */
 export function canonicalChangeState(value: unknown): string {
@@ -217,8 +220,7 @@ export async function captureWorkspaceChanges(
     const run = async (args: readonly string[], patch = false): Promise<string | undefined> => {
       try {
         // Disable optional index refresh, fsmonitor helpers, lazy fetch, and replacement objects.
-        const result = await runner.run(['--no-optional-locks', '--no-lazy-fetch', '--no-replace-objects',
-          '-c', 'core.fsmonitor=false', ...args], { cwd: workspace.worktreePath });
+        const result = await runner.run([...gitCapturePrefix, ...args], { cwd: workspace.worktreePath });
         if (result.exitCode !== 0 || typeof result.stdout !== 'string') return fail('GIT_CHANGE_CONTRACT_VIOLATION');
         return result.stdout;
       } catch (error) {

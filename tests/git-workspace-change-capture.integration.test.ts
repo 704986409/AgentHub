@@ -205,6 +205,10 @@ describe('change capture real Git', { timeout: 30_000 }, () => {
     const before = await readFile(path.resolve(wt, indexPath));
     calls.length = 0;
     const result = await capture({ includePatchText: true });
+    for (const call of calls) {
+      expect(call.args).toContain('--no-lazy-fetch');
+      expect(call.args).toContain('--no-replace-objects');
+    }
     for (const call of calls.filter(c => c.args.includes('diff') || c.args.includes('--porcelain=v2'))) {
       expect(call.cwd).toBe(wt);
       expect(call.args).toContain('--no-optional-locks');
@@ -218,6 +222,7 @@ describe('change capture real Git', { timeout: 30_000 }, () => {
     if (patch.status !== 'captured') throw new Error('missing patch');
     expect(patch.sha256).toBe(hash(patch.text));
     expect(patch.byteLength).toBe(Buffer.byteLength(patch.text));
+    expect((await capture()).changeSetSha256).toBe(result.changeSetSha256);
   });
   it('captures real unresolved conflict stages', async () => {
     const { repo, wt, capture } = await setup();
