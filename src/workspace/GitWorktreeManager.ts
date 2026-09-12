@@ -7,6 +7,9 @@ import {
   type GitCommandRunnerLike,
 } from './GitCommandRunner.js';
 
+import { captureWorkspaceChanges, snapshotCaptureOptions, canonicalChangeState,
+  type CaptureWorkspaceChangesOptions, type GitWorkspaceChangeSnapshot } from './GitWorkspaceChangeCapture.js';
+
 const excludeRule = '/.agenthub/worktrees/';
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const taskIdPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
@@ -80,7 +83,8 @@ export interface GitWorktreeRecord {
 interface PendingOperation {
   readonly token: object;
   readonly taskId: string;
-  readonly kind: 'create' | 'remove';
+  readonly kind: 'create' | 'remove' | 'capture';
+  readonly captureKey?: string;
   readonly baseRef?: string;
   readonly promise: Promise<unknown>;
 }
@@ -203,6 +207,33 @@ export class GitWorktreeManager {
       if (this.#coordination.operations.get(key)?.token === token) this.#coordination.operations.delete(key);
     });
     this.#coordination.operations.set(key, { token, taskId, kind: 'create', baseRef, promise: current });
+    return current;
+  }
+
+  public captureWorkspaceChanges(
+    taskIdValue: string, options?: CaptureWorkspaceChangesOptions,
+  ): Promise<GitWorkspaceChangeSnapshot> {
+    let taskId: string;
+    let snapshot: Required<CaptureWorkspaceChangesOptions>;
+    try {
+      taskId = validateTaskId(taskIdValue);
+      snapshot = snapshotCaptureOptions(options);
+    } catch (error) { return Promise.reject(asError(error)); }
+    const key = operationKey(taskId);
+    const captureKey = canonicalChangeState(snapshot);
+    const pending = this.#coordination.operations.get(key);
+    if (pending !== undefined) {
+      if (pending.taskId === taskId && pending.kind === 'capture' && pending.captureKey === captureKey) {
+        return pending.promise as Promise<GitWorkspaceChangeSnapshot>;
+      }
+      return Promise.reject(operationBusy(taskId));
+    }
+    const token = {};
+    const operation = captureWorkspaceChanges(this.#runner, () => this.#inspect(taskId), snapshot);
+    const current = operation.finally(() => {
+      if (this.#coordination.operations.get(key)?.token === token) this.#coordination.operations.delete(key);
+    });
+    this.#coordination.operations.set(key, { token, taskId, kind: 'capture', captureKey, promise: current });
     return current;
   }
 
