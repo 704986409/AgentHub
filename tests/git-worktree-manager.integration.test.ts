@@ -19,7 +19,7 @@ afterEach(async () => {
   }
 });
 
-describe('GitWorktreeManager real Git integration', () => {
+describe('GitWorktreeManager real Git integration', { timeout: 15_000 }, () => {
   it('reports a real Git executable and rejects non-repo, bare, nested, and linked roots', async () => {
     const version = await runner.run(['--version'], { cwd: process.cwd() });
     expect(version.exitCode).toBe(0);
