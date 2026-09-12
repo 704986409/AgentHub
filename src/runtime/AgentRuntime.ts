@@ -1,6 +1,9 @@
 import type { EventBus } from '../events/event-bus.js';
 import {
+  agentOutputProtocols,
   validateAgentProviderTurnRequest,
+  type AgentOutputProtocol,
+  type AgentProviderCapabilities,
   type AgentProviderId,
   type AgentProviderSession,
   type AgentProviderTurnRequest,
@@ -31,6 +34,7 @@ export interface AgentRuntimeBinding {
 
 export type AgentRuntimeErrorCode =
   | 'AGENT_RUNTIME_INVALID_IDENTITY'
+  | 'AGENT_RUNTIME_INVALID_CONFIG'
   | 'AGENT_RUNTIME_INVALID_BINDING'
   | 'AGENT_RUNTIME_ALREADY_OWNED'
   | 'AGENT_RUNTIME_NOT_OWNED'
@@ -56,6 +60,7 @@ export class AgentRuntime {
   #state: AgentRuntimeState = 'IDLE';
   #binding: Readonly<AgentRuntimeBinding> | undefined;
   #session: AgentProviderSession | undefined;
+  #sessionCapabilities: Readonly<AgentProviderCapabilities> | undefined;
   #active = false;
   #startPromise: Promise<void> | undefined;
   #activeTurnPromise: Promise<AgentProviderTurnResult> | undefined;
@@ -63,6 +68,12 @@ export class AgentRuntime {
 
   public constructor(options: AgentRuntimeOptions) {
     validateIdentity(options);
+    if (options.providerConfig !== undefined && !isRecord(options.providerConfig)) {
+      throw new AgentRuntimeError(
+        'AGENT_RUNTIME_INVALID_CONFIG',
+        'Agent runtime provider config must be an object',
+      );
+    }
     this.agentId = options.agentId;
     this.projectId = options.projectId;
     this.providerId = options.providerId;
@@ -132,6 +143,28 @@ export class AgentRuntime {
       return rejectPreserving(error);
     }
     this.#session = session;
+
+    let lifecycle: ProviderSessionLifecycle;
+    let capabilities: Readonly<AgentProviderCapabilities>;
+    try {
+      lifecycle = inspectSessionLifecycle(session);
+      capabilities = inspectSessionCapabilities(session);
+    } catch (error) {
+      const state = this.#currentState();
+      if (state !== 'STARTING') return Promise.reject(lifecycleErrorForState(state));
+      this.#state = 'FAILED';
+      return rejectPreserving(error);
+    }
+    this.#sessionCapabilities = capabilities;
+    const state = this.#currentState();
+    if (state !== 'STARTING' || this.#session !== session) {
+      return Promise.reject(lifecycleErrorForState(state));
+    }
+    if (lifecycle.started || lifecycle.active) {
+      this.#state = 'FAILED';
+      return Promise.reject(providerContractViolation('Provider session was not fresh and quiescent'));
+    }
+
     const current = Promise.resolve().then(() => this.#performStart(session));
     this.#startPromise = current;
     void current.finally(() => {
@@ -152,27 +185,50 @@ export class AgentRuntime {
         'Agent runtime does not own an assignment',
       ));
     }
+    if (this.#active) {
+      return Promise.reject(new AgentRuntimeError(
+        'AGENT_RUNTIME_TURN_ALREADY_ACTIVE',
+        'An Agent runtime turn is already active',
+      ));
+    }
     let lifecycle: ProviderSessionLifecycle;
     try {
       lifecycle = inspectSessionLifecycle(session);
     } catch (error) {
+      const state = this.#currentState();
+      if (state !== 'OWNED' || this.#session !== session) {
+        return Promise.reject(lifecycleErrorForState(state));
+      }
       this.#state = 'FAILED';
+      return rejectPreserving(error);
+    }
+    try {
+      this.#ensureTurnStillOwned(session);
+    } catch (error) {
       return rejectPreserving(error);
     }
     if (!lifecycle.started) {
       this.#state = 'FAILED';
       return Promise.reject(providerContractViolation('Provider session is not started'));
     }
+    if (lifecycle.active) {
+      this.#state = 'FAILED';
+      return Promise.reject(providerContractViolation('Provider session is already active'));
+    }
+    const capabilities = this.#sessionCapabilities;
+    if (capabilities === undefined) {
+      this.#state = 'FAILED';
+      return Promise.reject(providerContractViolation('Provider session capabilities are unavailable'));
+    }
     try {
-      validateAgentProviderTurnRequest(request, session.capabilities);
+      validateAgentProviderTurnRequest(request, capabilities);
     } catch (error) {
       return rejectPreserving(error);
     }
-    if (this.#active) {
-      return Promise.reject(new AgentRuntimeError(
-        'AGENT_RUNTIME_TURN_ALREADY_ACTIVE',
-        'An Agent runtime turn is already active',
-      ));
+    try {
+      this.#ensureTurnStillOwned(session);
+    } catch (error) {
+      return rejectPreserving(error);
     }
 
     this.#active = true;
@@ -199,8 +255,9 @@ export class AgentRuntime {
   async #performStart(session: AgentProviderSession): Promise<void> {
     try {
       await session.start();
-      if (!inspectSessionLifecycle(session).started) {
-        throw providerContractViolation('Provider session did not start');
+      const lifecycle = inspectSessionLifecycle(session);
+      if (!lifecycle.started || lifecycle.active) {
+        throw providerContractViolation('Provider session did not start in a quiescent state');
       }
       if (this.#state === 'STARTING') this.#state = 'OWNED';
     } catch (error) {
@@ -262,6 +319,7 @@ export class AgentRuntime {
     if (starting !== undefined) await starting.catch(() => undefined);
     const session = this.#session;
     if (session === undefined) {
+      this.#sessionCapabilities = undefined;
       this.#binding = undefined;
       this.#state = 'IDLE';
       return;
@@ -287,6 +345,7 @@ export class AgentRuntime {
       throw providerContractViolation('Provider session did not become quiescent after shutdown');
     }
     this.#session = undefined;
+    this.#sessionCapabilities = undefined;
     this.#binding = undefined;
     this.#active = false;
     this.#state = 'IDLE';
@@ -294,6 +353,29 @@ export class AgentRuntime {
 
   #markFailedUnlessStopping(): void {
     if (this.#state === 'OWNED') this.#state = 'FAILED';
+  }
+
+  #currentState(): AgentRuntimeState {
+    return this.#state;
+  }
+
+  #ensureTurnStillOwned(session: AgentProviderSession): void {
+    if (this.#state === 'FAILED') throw cleanupRequired();
+    if (this.#state === 'STARTING' || this.#state === 'STOPPING') {
+      throw lifecycleBusy(this.#state);
+    }
+    if (this.#state !== 'OWNED' || this.#session !== session) {
+      throw new AgentRuntimeError(
+        'AGENT_RUNTIME_NOT_OWNED',
+        'Agent runtime does not own this provider session',
+      );
+    }
+    if (this.#active) {
+      throw new AgentRuntimeError(
+        'AGENT_RUNTIME_TURN_ALREADY_ACTIVE',
+        'An Agent runtime turn is already active',
+      );
+    }
   }
 }
 
@@ -319,6 +401,34 @@ function inspectSessionLifecycle(session: AgentProviderSession): ProviderSession
     throw providerContractViolation('Provider session lifecycle is invalid');
   }
   return { started, active, sessionId };
+}
+
+function snapshotRuntimeCapabilities(value: unknown): Readonly<AgentProviderCapabilities> {
+  if (!isRecord(value) || typeof value.sessionContinuation !== 'boolean' ||
+    !Array.isArray(value.outputProtocols) || value.outputProtocols.length === 0) {
+    throw providerContractViolation('Provider session capabilities are invalid');
+  }
+  const protocols: AgentOutputProtocol[] = [];
+  for (const protocol of value.outputProtocols) {
+    if (typeof protocol !== 'string' ||
+      !agentOutputProtocols.includes(protocol as AgentOutputProtocol) ||
+      protocols.includes(protocol as AgentOutputProtocol)) {
+      throw providerContractViolation('Provider session capabilities are invalid');
+    }
+    protocols.push(protocol as AgentOutputProtocol);
+  }
+  return Object.freeze({
+    outputProtocols: Object.freeze(protocols),
+    sessionContinuation: value.sessionContinuation,
+  });
+}
+
+function inspectSessionCapabilities(session: AgentProviderSession): Readonly<AgentProviderCapabilities> {
+  try {
+    return snapshotRuntimeCapabilities(session.capabilities);
+  } catch {
+    throw providerContractViolation('Provider session capabilities could not be inspected');
+  }
 }
 
 function validateIdentity(identity: AgentRuntimeIdentity): void {
@@ -375,6 +485,10 @@ function cleanupRequired(): AgentRuntimeError {
     'AGENT_RUNTIME_CLEANUP_REQUIRED',
     'Agent runtime requires successful shutdown before reuse',
   );
+}
+
+function lifecycleErrorForState(state: AgentRuntimeState): AgentRuntimeError {
+  return state === 'FAILED' ? cleanupRequired() : lifecycleBusy(state);
 }
 
 function providerContractViolation(message: string): AgentRuntimeError {

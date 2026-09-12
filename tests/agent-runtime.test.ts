@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AgentProviderFactory,
   AgentRuntime,
+  AgentRuntimeError,
   ClaudeAgentProvider,
   CodexAgentProvider,
   CodexProviderStatus,
@@ -38,9 +39,18 @@ const workerResult: AgentHubWorkerResult = {
 };
 
 class FakeSession implements AgentProviderSession {
-  public started = false;
-  public active = false;
-  public sessionId: string | undefined = 'session-1';
+  #started = false;
+  #active = false;
+  #sessionId: string | undefined = 'session-1';
+  #capabilities: AgentProviderCapabilities;
+  public startedReads = 0;
+  public activeReads = 0;
+  public sessionIdReads = 0;
+  public capabilityReads = 0;
+  public onStartedRead: (() => void) | undefined;
+  public onActiveRead: (() => void) | undefined;
+  public onSessionIdRead: (() => void) | undefined;
+  public onCapabilitiesRead: (() => void) | undefined;
   public startCalls = 0;
   public runCalls = 0;
   public shutdownCalls = 0;
@@ -51,6 +61,7 @@ class FakeSession implements AgentProviderSession {
   public runError: Error | undefined;
   public shutdownError: Error | undefined;
   public falseStart = false;
+  public activeAfterStart = false;
   public keepActiveAfterRun = false;
   public stopAfterRun = false;
   public keepStartedAfterShutdown = false;
@@ -62,8 +73,21 @@ class FakeSession implements AgentProviderSession {
 
   public constructor(
     public readonly providerId = 'fake',
-    public readonly capabilities: AgentProviderCapabilities = providerCapabilities,
-  ) {}
+    capabilities: AgentProviderCapabilities = providerCapabilities,
+  ) { this.#capabilities = capabilities; }
+
+  public get started(): boolean { this.startedReads += 1; this.onStartedRead?.(); return this.#started; }
+  public set started(value: boolean) { this.#started = value; }
+  public get active(): boolean { this.activeReads += 1; this.onActiveRead?.(); return this.#active; }
+  public set active(value: boolean) { this.#active = value; }
+  public get sessionId(): string | undefined { this.sessionIdReads += 1; this.onSessionIdRead?.(); return this.#sessionId; }
+  public set sessionId(value: string | undefined) { this.#sessionId = value; }
+  public get capabilities(): AgentProviderCapabilities {
+    this.capabilityReads += 1;
+    this.onCapabilitiesRead?.();
+    return this.#capabilities;
+  }
+  public set capabilities(value: AgentProviderCapabilities) { this.#capabilities = value; }
 
   public async start(): Promise<void> {
     this.startCalls += 1;
@@ -71,6 +95,7 @@ class FakeSession implements AgentProviderSession {
     if (this.startBarrier !== undefined) await this.startBarrier;
     if (this.startError !== undefined) throw this.startError;
     if (!this.falseStart) this.started = true;
+    if (this.activeAfterStart) this.active = true;
   }
 
   public async runTurn(): Promise<AgentProviderTurnResult> {
@@ -143,6 +168,155 @@ describe('AgentRuntime', () => {
       .toThrow(/identity/);
   });
 
+  it.each([null, [], 'string', () => undefined])(
+    'rejects invalid providerConfig before it can be normalized: %j',
+    (providerConfig) => {
+      const factory = new AgentProviderFactory();
+      factory.register(new FakeProvider());
+      let thrown: unknown;
+      try {
+        new AgentRuntime({
+          agentId: 'agent', providerId: 'fake', providerFactory: factory,
+          eventBus: new EventBus(), providerConfig: providerConfig as never,
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(AgentRuntimeError);
+      expect(thrown).toMatchObject({ code: 'AGENT_RUNTIME_INVALID_CONFIG' });
+    },
+  );
+
+  it.each([
+    ['started', { started: true }],
+    ['active', { active: true }],
+    ['started and active', { started: true, active: true }],
+  ])('quarantines a fresh session that is already %s', async (_label, lifecycle) => {
+    const { runtime, provider } = harness();
+    provider.nextSession = () => Object.assign(new FakeSession(), lifecycle);
+    await expect(runtime.start(bindingA())).rejects.toMatchObject({
+      code: 'AGENT_RUNTIME_PROVIDER_CONTRACT_VIOLATION',
+    });
+    const session = requireSession(provider);
+    expect(session.startCalls).toBe(0);
+    expect(runtime).toMatchObject({ state: 'FAILED', busy: true, binding: bindingA() });
+    await expect(runtime.start(bindingA())).rejects.toMatchObject({ code: 'AGENT_RUNTIME_CLEANUP_REQUIRED' });
+    await expect(runtime.runTurn(managerRequest())).rejects.toMatchObject({ code: 'AGENT_RUNTIME_CLEANUP_REQUIRED' });
+    await runtime.shutdown();
+    expect(session.shutdownCalls).toBe(1);
+    expect(runtime.state).toBe('IDLE');
+  });
+
+  it('accepts an undefined or configured nonblank fresh sessionId and rejects a blank one', async () => {
+    for (const sessionId of [undefined, 'configured-session']) {
+      const { runtime, provider } = harness();
+      provider.nextSession = () => Object.assign(new FakeSession(), { sessionId });
+      await runtime.start(bindingA());
+      expect(requireSession(provider).startCalls).toBe(1);
+      await runtime.shutdown();
+    }
+
+    const blank = harness();
+    blank.provider.nextSession = () => Object.assign(new FakeSession(), { sessionId: ' ' });
+    await expect(blank.runtime.start(bindingA())).rejects.toMatchObject({
+      code: 'AGENT_RUNTIME_PROVIDER_CONTRACT_VIOLATION',
+    });
+    const session = requireSession(blank.provider);
+    expect(session.startCalls).toBe(0);
+    session.sessionId = undefined;
+    await blank.runtime.shutdown();
+  });
+
+  it('quarantines a non-string sessionId observed after Factory construction', async () => {
+    const { runtime, provider } = harness();
+    provider.nextSession = () => {
+      const session = new FakeSession();
+      session.onSessionIdRead = () => {
+        if (session.sessionIdReads === 3) {
+          session.onSessionIdRead = undefined;
+          (session as unknown as { sessionId: unknown }).sessionId = 42;
+        }
+      };
+      return session;
+    };
+    await expect(runtime.start(bindingA())).rejects.toMatchObject({
+      code: 'AGENT_RUNTIME_PROVIDER_CONTRACT_VIOLATION',
+    });
+    const session = requireSession(provider);
+    expect(session.startCalls).toBe(0);
+    session.sessionId = undefined;
+    await runtime.shutdown();
+  });
+
+  it('retains a Factory-returned session when Runtime lifecycle inspection throws', async () => {
+    const { runtime, provider } = harness();
+    provider.nextSession = () => {
+      const session = new FakeSession();
+      session.onStartedRead = () => {
+        if (session.startedReads === 2) {
+          session.onStartedRead = undefined;
+          throw new Error('lifecycle getter failed');
+        }
+      };
+      return session;
+    };
+    await expect(runtime.start(bindingA())).rejects.toMatchObject({
+      code: 'AGENT_RUNTIME_PROVIDER_CONTRACT_VIOLATION',
+    });
+    const session = requireSession(provider);
+    expect(session.startCalls).toBe(0);
+    expect(runtime).toMatchObject({ state: 'FAILED', busy: true, binding: bindingA() });
+    await runtime.shutdown();
+    expect(session.shutdownCalls).toBe(1);
+  });
+
+  it('retains a Factory-returned session when Runtime capability inspection throws', async () => {
+    const { runtime, provider } = harness();
+    provider.nextSession = () => {
+      const session = new FakeSession();
+      session.onCapabilitiesRead = () => {
+        if (session.capabilityReads === 2) {
+          session.onCapabilitiesRead = undefined;
+          throw new Error('capability getter failed');
+        }
+      };
+      return session;
+    };
+    await expect(runtime.start(bindingA())).rejects.toMatchObject({
+      code: 'AGENT_RUNTIME_PROVIDER_CONTRACT_VIOLATION',
+    });
+    const session = requireSession(provider);
+    expect(session.startCalls).toBe(0);
+    expect(runtime).toMatchObject({ state: 'FAILED', busy: true, binding: bindingA() });
+    await runtime.shutdown();
+  });
+
+  it.each([
+    null,
+    { outputProtocols: [], sessionContinuation: true },
+    { outputProtocols: ['manager-directive', 'manager-directive'], sessionContinuation: true },
+    { outputProtocols: ['future-protocol'], sessionContinuation: true },
+    { outputProtocols: ['manager-directive'], sessionContinuation: 'yes' },
+  ])('quarantines malformed Runtime capability snapshots: %j', async (invalidCapabilities) => {
+    const { runtime, provider } = harness();
+    provider.nextSession = () => {
+      const session = new FakeSession();
+      session.onCapabilitiesRead = () => {
+        if (session.capabilityReads === 2) {
+          session.capabilities = invalidCapabilities as AgentProviderCapabilities;
+        }
+      };
+      return session;
+    };
+    await expect(runtime.start(bindingA())).rejects.toMatchObject({
+      code: 'AGENT_RUNTIME_PROVIDER_CONTRACT_VIOLATION',
+    });
+    const session = requireSession(provider);
+    expect(session.startCalls).toBe(0);
+    expect(runtime.state).toBe('FAILED');
+    await runtime.shutdown();
+  });
+
   it.each(['taskId', 'assignmentId', 'specVersion', 'profileHash'] as const)(
     'rejects blank binding field %s before Factory construction', async (key) => {
       const { runtime, provider } = harness();
@@ -208,6 +382,60 @@ describe('AgentRuntime', () => {
     }
   });
 
+  it('quarantines a session whose successful start leaves lower execution active', async () => {
+    const { runtime, provider } = harness();
+    provider.nextSession = () => Object.assign(new FakeSession(), { activeAfterStart: true });
+    await expect(runtime.start(bindingA())).rejects.toMatchObject({
+      code: 'AGENT_RUNTIME_PROVIDER_CONTRACT_VIOLATION',
+    });
+    const session = requireSession(provider);
+    expect(session.startCalls).toBe(1);
+    expect(runtime).toMatchObject({ state: 'FAILED', busy: true, binding: bindingA() });
+    await runtime.shutdown();
+  });
+
+  it('quarantines a lifecycle inspection failure after lower start resolves', async () => {
+    const { runtime, provider } = harness();
+    provider.nextSession = () => {
+      const session = new FakeSession();
+      session.onStart = () => {
+        session.onActiveRead = () => {
+          session.onActiveRead = undefined;
+          throw new Error('post-start lifecycle getter failed');
+        };
+      };
+      return session;
+    };
+    await expect(runtime.start(bindingA())).rejects.toMatchObject({
+      code: 'AGENT_RUNTIME_PROVIDER_CONTRACT_VIOLATION',
+    });
+    const session = requireSession(provider);
+    expect(session.startCalls).toBe(1);
+    expect(runtime).toMatchObject({ state: 'FAILED', busy: true, binding: bindingA() });
+    await runtime.shutdown();
+  });
+
+  it('lets reentrant shutdown win before lower start dispatch during acquisition', async () => {
+    const { runtime, provider } = harness();
+    let shutdown: Promise<void> | undefined;
+    provider.nextSession = () => {
+      const session = new FakeSession();
+      session.onCapabilitiesRead = () => {
+        if (session.capabilityReads === 2) {
+          session.onCapabilitiesRead = undefined;
+          shutdown = runtime.shutdown();
+        }
+      };
+      return session;
+    };
+    await expect(runtime.start(bindingA())).rejects.toMatchObject({ code: 'AGENT_RUNTIME_LIFECYCLE_BUSY' });
+    const session = requireSession(provider);
+    expect(session.startCalls).toBe(0);
+    await shutdown;
+    expect(session.shutdownCalls).toBe(1);
+    expect(runtime).toMatchObject({ state: 'IDLE', busy: false, binding: undefined });
+  });
+
   it('serializes start/shutdown without resurrecting OWNED', async () => {
     const { runtime, provider } = harness();
     const gate = deferred();
@@ -262,6 +490,73 @@ describe('AgentRuntime', () => {
     gate.resolve();
     await first;
     expect(session.runCalls).toBe(1);
+    await runtime.shutdown();
+  });
+
+  it('quarantines a lower session that is already active before Runtime turn dispatch', async () => {
+    const { runtime, provider } = harness();
+    await runtime.start(bindingA());
+    const session = requireSession(provider);
+    session.active = true;
+    await expect(runtime.runTurn(managerRequest())).rejects.toMatchObject({
+      code: 'AGENT_RUNTIME_PROVIDER_CONTRACT_VIOLATION',
+    });
+    expect(session.runCalls).toBe(0);
+    expect(runtime).toMatchObject({ state: 'FAILED', busy: true, active: false });
+    await runtime.shutdown();
+  });
+
+  it('does not dispatch a turn when a lifecycle getter reenters shutdown during preflight', async () => {
+    const { runtime, provider } = harness();
+    await runtime.start(bindingA());
+    const session = requireSession(provider);
+    let shutdown: Promise<void> | undefined;
+    session.onStartedRead = () => {
+      session.onStartedRead = undefined;
+      shutdown = runtime.shutdown();
+    };
+    await expect(runtime.runTurn(managerRequest())).rejects.toMatchObject({ code: 'AGENT_RUNTIME_LIFECYCLE_BUSY' });
+    expect(session.runCalls).toBe(0);
+    await shutdown;
+    expect(session.shutdownCalls).toBe(1);
+    expect(runtime.state).toBe('IDLE');
+  });
+
+  it('uses one immutable capability snapshot for the full ownership generation', async () => {
+    const mutableCapabilities: AgentProviderCapabilities = {
+      outputProtocols: ['manager-directive'], sessionContinuation: true,
+    };
+    const { runtime, provider } = harness();
+    provider.nextSession = () => new FakeSession('fake', mutableCapabilities);
+    await runtime.start(bindingA());
+    const session = requireSession(provider);
+    session.capabilities = { outputProtocols: ['worker-result'], sessionContinuation: false };
+    await expect(runtime.runTurn(managerRequest())).resolves.toMatchObject({ directiveStatus: 'valid' });
+    await expect(runtime.runTurn(workerRequest())).rejects.toMatchObject({ code: 'AGENT_PROVIDER_UNSUPPORTED_PROTOCOL' });
+    expect(session.runCalls).toBe(1);
+    expect(session.capabilityReads).toBe(2);
+    await runtime.shutdown();
+  });
+
+  it('takes a fresh capability snapshot for the next assignment', async () => {
+    const { runtime, provider } = harness();
+    const capabilitySources: AgentProviderCapabilities[] = [];
+    provider.nextSession = () => {
+      const capabilities: AgentProviderCapabilities = {
+        outputProtocols: ['manager-directive'], sessionContinuation: true,
+      };
+      capabilitySources.push(capabilities);
+      return new FakeSession('fake', capabilities);
+    };
+    await runtime.start(bindingA());
+    await runtime.runTurn(managerRequest());
+    await runtime.shutdown();
+    (capabilitySources[0] as { outputProtocols: AgentProviderCapabilities['outputProtocols'] }).outputProtocols = ['worker-result'];
+    await runtime.start(bindingB());
+    await expect(runtime.runTurn(managerRequest())).resolves.toMatchObject({ directiveStatus: 'valid' });
+    await expect(runtime.runTurn(workerRequest())).rejects.toMatchObject({ code: 'AGENT_PROVIDER_UNSUPPORTED_PROTOCOL' });
+    expect(requireSession(provider, 1).runCalls).toBe(1);
+    expect(capabilitySources).toHaveLength(2);
     await runtime.shutdown();
   });
 
