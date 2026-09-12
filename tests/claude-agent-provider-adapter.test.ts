@@ -8,7 +8,9 @@ import {
   type AgentHubWorkerResult,
   type ClaudeAutoTransport,
   type ClaudeAutoTransportOptions,
+  type ClaudeCapabilityReport,
   type ClaudeWorkerSessionLike,
+  type ClaudeWorkerSessionOptions,
   type ClaudeWorkerTurnResult,
 } from '../src/index.js';
 
@@ -166,6 +168,34 @@ describe('Claude AgentProvider adapter', () => {
     expect(fakeAuto.runCalls).toBe(1);
     await session.shutdown();
   });
+
+  it('snapshots nested config and forces direct context attribution without mutating callers', () => {
+    let captured: ClaudeWorkerSessionOptions | undefined;
+    const provider = new ClaudeAgentProvider({ createWorkerSession: (options) => { captured = options; return new FakeWorker(); } });
+    const env = { TOKEN: 'A' };
+    const report = capabilityReport();
+    const config: { mode: string; env: Record<string, string>; capabilityReport: ClaudeCapabilityReport } = {
+      mode: 'auto', env, capabilityReport: report,
+    };
+    const callerContext = { ...context(), provider: 'spoofed-provider' };
+    provider.createSession({ eventBus: new EventBus(), context: callerContext, config });
+
+    env.TOKEN = 'B';
+    report.capabilities.resume = !report.capabilities.resume;
+    report.missingRequiredCapabilities.push('resume');
+    report.checks.push({ capability: 'resume', supported: false, evidence: 'unsupported' });
+    report.diagnostics.push('mutated');
+    config.mode = 'resume-per-turn';
+
+    expect(captured?.context.provider).toBe('claude');
+    expect(callerContext.provider).toBe('spoofed-provider');
+    expect(captured?.transportOptions?.mode).toBe('auto');
+    expect(captured?.transportOptions?.env).toEqual({ TOKEN: 'A' });
+    expect(captured?.transportOptions?.capabilityReport?.capabilities.resume).toBe(true);
+    expect(captured?.transportOptions?.capabilityReport?.missingRequiredCapabilities).toEqual([]);
+    expect(captured?.transportOptions?.capabilityReport?.checks).toHaveLength(0);
+    expect(captured?.transportOptions?.capabilityReport?.diagnostics).toEqual([]);
+  });
 });
 
 class FakeAuto {
@@ -205,4 +235,24 @@ function baseOptions(config?: Readonly<Record<string, unknown>>) {
 
 function request() {
   return { eventBus: new EventBus(), context: { projectId: 'P', agentId: 'A', taskId: 'T', assignmentId: 'AS' } };
+}
+
+function capabilityReport(): ClaudeCapabilityReport {
+  const booleans = Object.fromEntries([
+    'printMode', 'inputText', 'inputStreamJson', 'outputText', 'outputJson', 'outputStreamJson',
+    'resume', 'sessionId', 'continueSession', 'forkSession', 'modelSelection', 'effortSelection',
+    'systemPrompt', 'systemPromptFile', 'appendSystemPrompt', 'appendSystemPromptFile', 'mcpConfig',
+    'strictMcpConfig', 'toolsRestriction', 'allowedTools', 'disallowedTools', 'permissionMode',
+    'workingDirectorySupport',
+  ].map((name) => [name, true]));
+  return {
+    ok: true,
+    capabilities: {
+      ...booleans,
+      executablePath: 'claude', executableResolved: true, executableExists: true,
+      installed: true, platform: process.platform, authStatusAvailable: true,
+    } as ClaudeCapabilityReport['capabilities'],
+    missingRequiredCapabilities: [], unknownCapabilities: [], unsupportedCapabilities: [],
+    checks: [], diagnostics: [],
+  };
 }

@@ -51,7 +51,7 @@ export class ClaudeAgentProvider implements AgentProvider {
     const transportOptions = validateClaudeConfig(options.config);
     const worker = this.#createWorkerSession({
       eventBus: options.eventBus,
-      context: options.context,
+      context: Object.freeze({ ...options.context, provider: CLAUDE_AGENT_PROVIDER_ID }),
       ...(transportOptions === undefined ? {} : { transportOptions }),
     });
     return new ClaudeAgentProviderSession(worker);
@@ -138,7 +138,28 @@ function validateClaudeConfig(
   if (config.capabilityReport !== undefined && !isClaudeCapabilityReport(config.capabilityReport)) {
     invalidConfig('capabilityReport');
   }
-  return { ...config };
+  return snapshotClaudeConfig(config);
+}
+
+function snapshotClaudeConfig(
+  config: Readonly<Record<string, unknown>>,
+): Omit<ClaudeAutoTransportOptions, 'onRawMessage'> {
+  const report = config.capabilityReport as ClaudeCapabilityReport | undefined;
+  return {
+    ...config,
+    ...(config.env === undefined ? {} : { env: { ...(config.env as NodeJS.ProcessEnv) } }),
+    ...(report === undefined ? {} : {
+      capabilityReport: {
+        ...report,
+        capabilities: { ...report.capabilities },
+        missingRequiredCapabilities: [...report.missingRequiredCapabilities],
+        unknownCapabilities: [...report.unknownCapabilities],
+        unsupportedCapabilities: [...report.unsupportedCapabilities],
+        checks: report.checks.map((check) => ({ ...check })),
+        diagnostics: [...report.diagnostics],
+      },
+    }),
+  };
 }
 
 function rejectUnknownKeys(config: Readonly<Record<string, unknown>>, allowed: ReadonlySet<string>, provider: string): void {

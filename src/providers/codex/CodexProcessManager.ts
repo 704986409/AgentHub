@@ -97,36 +97,49 @@ export class CodexProcessManager extends EventEmitter {
     const child = this.#process;
     if (child === null) return;
     if (child.stdin.writable) child.stdin.end();
-    await new Promise<void>((resolve) => {
-      let finished = false;
-      const done = () => {
-        if (finished) return;
-        finished = true;
-        clearTimeout(timer);
-        resolve();
-      };
-      const timer = setTimeout(() => {
-        this.forceStop();
-        const forceStopTimer = setTimeout(done, 500);
-        child.once('exit', () => {
-          clearTimeout(forceStopTimer);
-          done();
-        });
-      }, timeoutMs);
-      child.once('exit', done);
-      if (child.exitCode !== null) done();
-    });
+    if (await waitForChildExit(child, timeoutMs)) return;
+    this.forceStopChild(child);
+    if (await waitForChildExit(child, 2_000)) return;
+    throw new Error('Codex app-server did not exit after forced stop');
   }
 
   public forceStop(): void {
     const child = this.#process;
-    if (child === null || child.killed) return;
+    if (child === null) return;
+    this.forceStopChild(child);
+  }
+
+  private forceStopChild(child: ChildProcessWithoutNullStreams): void {
+    if (child.exitCode !== null || child.signalCode !== null) return;
     if (process.platform === 'win32' && child.pid !== undefined) {
-      spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true });
+      const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+        shell: false,
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      killer.on('error', () => undefined);
     } else {
       child.kill();
     }
   }
+}
+
+function waitForChildExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (exited: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off('exit', onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once('exit', onExit);
+    if (child.exitCode !== null || child.signalCode !== null) finish(true);
+  });
 }
 
 export function resolveCodexExecutable(command = 'codex', env: NodeJS.ProcessEnv = process.env): string {

@@ -2,11 +2,35 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { CodexAppServerClient, CodexManagerUseCase, CodexProvider, CodexProviderStatus } from '../src/index.js';
+import { CodexAppServerClient, CodexManagerUseCase, CodexProcessManager, CodexProvider, CodexProviderStatus } from '../src/index.js';
 
 const managerFixture = fileURLToPath(new URL('./fixtures/codex/fake-manager-app-server.mjs', import.meta.url));
 
 describe('Codex app-server process integration', () => {
+  it('confirms forced child exit before stop resolves and can restart without a late exit', async () => {
+    const manager = new CodexProcessManager({
+      command: process.execPath,
+      args: ['-e', "process.stdin.resume(); setInterval(() => {}, 1000)"],
+    });
+    let exits = 0;
+    manager.on('exit', () => { exits += 1; });
+    await manager.start();
+    const firstPid = manager.pid;
+    await manager.stop(20);
+    expect(manager.running).toBe(false);
+    expect(manager.process).toBeNull();
+    expect(exits).toBe(1);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(exits).toBe(1);
+
+    await manager.start();
+    expect(manager.pid).not.toBe(firstPid);
+    await manager.stop(20);
+    expect(manager.running).toBe(false);
+    expect(manager.process).toBeNull();
+    expect(exits).toBe(2);
+    await manager.stop(20);
+  });
   it('keeps a long-running stdio child and separates stdout from stderr', async () => {
     const client = new CodexAppServerClient({
       command: process.execPath,

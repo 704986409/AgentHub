@@ -39,7 +39,9 @@ export type CodexAgentProviderErrorCode =
   | 'CODEX_AGENT_PROVIDER_TURN_ALREADY_ACTIVE'
   | 'CODEX_AGENT_PROVIDER_LIFECYCLE_BUSY'
   | 'CODEX_AGENT_PROVIDER_CLEANUP_REQUIRED'
-  | 'CODEX_AGENT_PROVIDER_SESSION_MISMATCH';
+  | 'CODEX_AGENT_PROVIDER_SESSION_MISMATCH'
+  | 'CODEX_AGENT_PROVIDER_RESULT_INVALID'
+  | 'CODEX_AGENT_PROVIDER_LOWER_STATE_INVALID';
 
 export class CodexAgentProviderError extends Error {
   public constructor(public readonly code: CodexAgentProviderErrorCode, message: string) {
@@ -52,7 +54,7 @@ export interface CodexManagerUseCaseLike extends CodexEventSource {
   initialize(): Promise<unknown>;
   shutdown(): Promise<void>;
   runDirectiveTurn(request: { prompt: string; timeoutMs?: number }): Promise<ManagerDirectiveTurnResult>;
-  getManagerSession(): { sessionId: string } | undefined;
+  getManagerSession(): { threadId: string; sessionId: string } | undefined;
   getStatus(): CodexProviderStatus;
 }
 
@@ -117,7 +119,10 @@ class CodexAgentProviderSession implements AgentProviderSession {
       eventBus,
       source: this.#mappingSource,
       context,
-      resolveSessionId: () => this.useCase.getManagerSession()?.sessionId,
+      resolveSessionId: (threadId) => {
+        const current = this.useCase.getManagerSession();
+        return current?.threadId === threadId ? current.sessionId : undefined;
+      },
     });
     this.#mapper.attach();
     useCase.onProcessExit(() => {
@@ -198,6 +203,7 @@ class CodexAgentProviderSession implements AgentProviderSession {
     try {
       await this.useCase.initialize();
       this.#throwMappingFailure();
+      this.#assertLowerStatus(CodexProviderStatus.READY, 'start');
       this.#started = true;
     } catch (error) {
       this.#started = false;
@@ -214,8 +220,13 @@ class CodexAgentProviderSession implements AgentProviderSession {
         prompt: request.prompt,
         ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
       });
-      this.#throwMappingFailure();
-      return mapCodexResult(result, Date.now() - startedAt);
+      if (!this.#stopping) this.#throwMappingFailure();
+      try {
+        return mapCodexResult(result, this.useCase.getManagerSession(), Date.now() - startedAt);
+      } catch (error) {
+        if (isTerminalResultError(error)) this.#markCleanupRequired();
+        throw error;
+      }
     } finally {
       this.#active = false;
     }
@@ -229,16 +240,20 @@ class CodexAgentProviderSession implements AgentProviderSession {
     try {
       await this.useCase.shutdown();
     } catch (error) {
-      this.#started = false;
-      this.#cleanupRequired = true;
-      await activeSettled;
+      this.#markCleanupRequired();
       throw error;
     }
     await activeSettled;
+    try {
+      this.#throwMappingFailure();
+      this.#assertLowerStatus(CodexProviderStatus.STOPPED, 'shutdown');
+    } catch (error) {
+      this.#markCleanupRequired();
+      throw error;
+    }
     this.#started = false;
     this.#active = false;
     this.#cleanupRequired = false;
-    this.#throwMappingFailure();
   }
 
   #throwMappingFailure(): void {
@@ -248,48 +263,103 @@ class CodexAgentProviderSession implements AgentProviderSession {
 
   #quarantineAfterRuntimeFailure(): void {
     if (this.#stopping || this.useCase.getStatus() === CodexProviderStatus.STOPPING) return;
+    this.#markCleanupRequired();
+  }
+
+  #markCleanupRequired(): void {
     this.#started = false;
     this.#cleanupRequired = true;
   }
+
+  #assertLowerStatus(expected: CodexProviderStatus, operation: string): void {
+    if (this.useCase.getStatus() === expected) return;
+    throw new CodexAgentProviderError(
+      'CODEX_AGENT_PROVIDER_LOWER_STATE_INVALID',
+      `Codex lower lifecycle state is invalid after ${operation}`,
+    );
+  }
 }
 
-function mapCodexResult(result: ManagerDirectiveTurnResult, durationMs: number): AgentProviderTurnResult {
-  const sessionId = selectCodexSessionId(result);
+function mapCodexResult(
+  result: ManagerDirectiveTurnResult,
+  currentSession: { threadId: string; sessionId: string } | undefined,
+  durationMs: number,
+): AgentProviderTurnResult {
+  validateCodexResultShape(result);
+  const sessionId = selectCodexSessionId(result, currentSession);
   const metadata = {
     providerId: CODEX_AGENT_PROVIDER_ID,
     sessionId,
     durationMs,
   };
   if (result.directiveStatus === 'valid' || result.directiveStatus === 'repaired') {
-    if (result.directive === null) throw new Error('Codex directive result is internally inconsistent');
+    const directive = result.directive;
+    if (directive === null) throw invalidResult();
     return {
       ...metadata,
       protocol: 'manager-directive',
       directiveStatus: result.directiveStatus,
-      directive: result.directive,
+      directive,
     };
   }
-  if (result.failure === undefined) throw new Error('Codex invalid directive result is missing failure details');
+  const failure = result.failure;
+  if (failure === undefined) throw invalidResult();
   return {
     ...metadata,
     protocol: 'manager-directive',
     directiveStatus: 'invalid',
     directive: null,
-    failure: { ...result.failure },
+    failure: { ...failure },
   };
 }
 
-function selectCodexSessionId(result: ManagerDirectiveTurnResult): string {
+function validateCodexResultShape(result: ManagerDirectiveTurnResult): void {
+  const successful = result.directiveStatus === 'valid' || result.directiveStatus === 'repaired';
+  const successShapeInvalid = successful && (result.directive === null || result.failure !== undefined ||
+    (result.directiveStatus === 'valid' && result.repairTurn !== undefined) ||
+    (result.directiveStatus === 'repaired' && result.repairTurn === undefined));
+  const failureShapeInvalid = result.directiveStatus === 'invalid' &&
+    (result.directive !== null || result.failure === undefined);
+  if (!successful && result.directiveStatus !== 'invalid' || successShapeInvalid || failureShapeInvalid) {
+    throw invalidResult();
+  }
+}
+
+function invalidResult(): CodexAgentProviderError {
+  return new CodexAgentProviderError(
+    'CODEX_AGENT_PROVIDER_RESULT_INVALID',
+    'Codex directive result violates the adapter contract',
+  );
+}
+
+function selectCodexSessionId(
+  result: ManagerDirectiveTurnResult,
+  currentSession: { threadId: string; sessionId: string } | undefined,
+): string {
   const initial = result.initialTurn.sessionId;
   const repair = result.repairTurn?.sessionId;
   if (result.repairTurn !== undefined &&
     (repair !== initial || result.repairTurn.threadId !== result.initialTurn.threadId)) {
-    throw new CodexAgentProviderError(
-      'CODEX_AGENT_PROVIDER_SESSION_MISMATCH',
-      'Codex directive turns reported inconsistent session identity',
-    );
+    throw sessionMismatch();
+  }
+  if (currentSession !== undefined &&
+    (result.initialTurn.threadId !== currentSession.threadId || initial !== currentSession.sessionId)) {
+    throw sessionMismatch();
   }
   return repair ?? initial;
+}
+
+function sessionMismatch(): CodexAgentProviderError {
+  return new CodexAgentProviderError(
+    'CODEX_AGENT_PROVIDER_SESSION_MISMATCH',
+    'Codex directive turns reported inconsistent session identity',
+  );
+}
+
+function isTerminalResultError(error: unknown): boolean {
+  return error instanceof CodexAgentProviderError &&
+    (error.code === 'CODEX_AGENT_PROVIDER_SESSION_MISMATCH' ||
+      error.code === 'CODEX_AGENT_PROVIDER_RESULT_INVALID');
 }
 
 class IsolatedCodexEventSource implements CodexEventSource {
@@ -360,7 +430,11 @@ function validateCodexConfig(config: Readonly<Record<string, unknown>> | undefin
   validateOptionalTimeout(turn.threadRequestTimeoutMs, 'turnOptions.threadRequestTimeoutMs');
   validateOptionalTimeout(turn.turnTimeoutMs, 'turnOptions.turnTimeoutMs');
   return {
-    providerOptions: { ...provider },
+    providerOptions: {
+      ...provider,
+      ...(provider.args === undefined ? {} : { args: [...provider.args] as string[] }),
+      ...(provider.env === undefined ? {} : { env: { ...provider.env } }),
+    },
     turnOptions: { ...turn },
   };
 }
