@@ -115,6 +115,82 @@ describe('agent provider factory', () => {
     }]);
   });
 
+  it('snapshots provider ID, capabilities, and this-bound construction exactly once', () => {
+    const factory = new AgentProviderFactory();
+    const reads = { id: 0, capabilities: 0, createSession: 0 };
+    let originalCalls = 0;
+    let replacementCalls = 0;
+    const dynamic = {
+      marker: 'registration-this',
+      get id() { reads.id += 1; return reads.id === 1 ? 'provider-a' : 'invalid/id'; },
+      get capabilities() { reads.capabilities += 1; return capabilities(['worker-result']); },
+      get createSession() {
+        reads.createSession += 1;
+        return function(this: { marker: string }): AgentProviderSession {
+          expect(this.marker).toBe('registration-this');
+          originalCalls += 1;
+          return new FakeSession('provider-a', capabilities(['worker-result']));
+        };
+      },
+    } as unknown as AgentProvider;
+    factory.register(dynamic);
+    Object.defineProperty(dynamic, 'createSession', {
+      value: () => { replacementCalls += 1; return new FakeSession('provider-a', capabilities(['worker-result'])); },
+    });
+    const session = factory.createSession('provider-a', request());
+    expect(session.providerId).toBe('provider-a');
+    expect(reads).toEqual({ id: 1, capabilities: 1, createSession: 1 });
+    expect(originalCalls).toBe(1);
+    expect(replacementCalls).toBe(0);
+    expect(factory.has('provider-a')).toBe(true);
+    expect(factory.has('invalid/id')).toBe(false);
+    expect(factory.list()[0]?.id).toBe('provider-a');
+  });
+
+  it('rejects the first invalid provider ID without trusting a later valid getter value', () => {
+    const factory = new AgentProviderFactory();
+    let reads = 0;
+    const dynamic = {
+      get id() { reads += 1; return reads === 1 ? 'invalid/id' : 'provider-a'; },
+      capabilities: capabilities(['worker-result']),
+      createSession: () => new FakeSession('provider-a', capabilities(['worker-result'])),
+    } as AgentProvider;
+    expectProviderError(() => factory.register(dynamic), 'AGENT_PROVIDER_INVALID_ID');
+    expect(reads).toBe(1);
+    expect(factory.list()).toEqual([]);
+  });
+
+  it('uses the first snapshotted ID for duplicate detection and never registers a later ID', () => {
+    const factory = new AgentProviderFactory();
+    factory.register(provider('provider-x'));
+    let reads = 0;
+    const dynamic = {
+      get id() { reads += 1; return reads === 1 ? 'provider-x' : 'provider-y'; },
+      capabilities: capabilities(['worker-result']),
+      createSession: () => new FakeSession('provider-y', capabilities(['worker-result'])),
+    } as AgentProvider;
+    expectProviderError(() => factory.register(dynamic), 'AGENT_PROVIDER_DUPLICATE');
+    expect(reads).toBe(1);
+    expect(factory.has('provider-y')).toBe(false);
+    expect(factory.list().map(({ id }) => id)).toEqual(['provider-x']);
+  });
+
+  it('reads capability fields once and detaches the registered protocol array', () => {
+    const factory = new AgentProviderFactory();
+    const protocols: AgentOutputProtocol[] = ['worker-result'];
+    const reads = { outputProtocols: 0, sessionContinuation: 0 };
+    const dynamicCapabilities = {
+      get outputProtocols() { reads.outputProtocols += 1; return protocols; },
+      get sessionContinuation() { reads.sessionContinuation += 1; return true; },
+    };
+    factory.register(new FakeProvider('provider-x', dynamicCapabilities));
+    protocols.push('manager-directive');
+    expect(reads).toEqual({ outputProtocols: 1, sessionContinuation: 1 });
+    expect(factory.list()[0]?.capabilities).toEqual({
+      outputProtocols: ['worker-result'], sessionContinuation: true,
+    });
+  });
+
   it('rejects empty, duplicate, unknown, and malformed capabilities', () => {
     const invalid = [
       capabilities([]),
@@ -194,6 +270,69 @@ describe('agent provider factory', () => {
     expect(fake.lastOptions?.config).not.toBe(config);
     expect(Object.isFrozen(fake.lastOptions?.config)).toBe(true);
     expect(config).toEqual({ token: 'PRIVATE_CONFIG_SENTINEL', mode: 'test' });
+  });
+
+  it('reads createSession request fields once and passes only their first snapshots', () => {
+    const factory = new AgentProviderFactory();
+    const fake = provider('provider-x');
+    factory.register(fake);
+    const eventBus = new EventBus();
+    const otherEventBus = new EventBus();
+    const reads = { eventBus: 0, context: 0, config: 0, projectId: 0 };
+    const firstContext = {
+      provider: 'spoofed',
+      get projectId() { reads.projectId += 1; return reads.projectId === 1 ? 'project-A' : 'project-B'; },
+    };
+    const dynamicRequest = {
+      get eventBus() { reads.eventBus += 1; return reads.eventBus === 1 ? eventBus : otherEventBus; },
+      get context() { reads.context += 1; return reads.context === 1 ? firstContext : { projectId: 'project-B' }; },
+      get config() { reads.config += 1; return reads.config === 1 ? { mode: 'A' } : { mode: 'B' }; },
+    };
+    factory.createSession('provider-x', dynamicRequest);
+    expect(reads).toEqual({ eventBus: 1, context: 1, config: 1, projectId: 1 });
+    expect(fake.lastOptions?.eventBus).toBe(eventBus);
+    expect(fake.lastOptions?.context).toEqual({ provider: 'provider-x', projectId: 'project-A' });
+    expect(fake.lastOptions?.config).toEqual({ mode: 'A' });
+  });
+
+  it('reads every returned Session validation field exactly once', () => {
+    const factory = new AgentProviderFactory();
+    const reads = {
+      providerId: 0, capabilities: 0, started: 0, active: 0,
+      sessionId: 0, start: 0, runTurn: 0, shutdown: 0,
+      outputProtocols: 0, sessionContinuation: 0,
+    };
+    const session = {
+      get providerId() { reads.providerId += 1; return 'provider-x'; },
+      get capabilities() {
+        reads.capabilities += 1;
+        return {
+          get outputProtocols() { reads.outputProtocols += 1; return ['worker-result'] as const; },
+          get sessionContinuation() { reads.sessionContinuation += 1; return true; },
+        };
+      },
+      get started() { reads.started += 1; return false; },
+      get active() { reads.active += 1; return false; },
+      get sessionId() { reads.sessionId += 1; return undefined; },
+      get start() { reads.start += 1; return () => Promise.resolve(); },
+      get runTurn() {
+        reads.runTurn += 1;
+        return () => Promise.resolve({
+          providerId: 'provider-x', protocol: 'worker-result', protocolValid: false,
+          failure: { kind: 'missing_result', message: 'fake' },
+        } satisfies AgentProviderTurnResult);
+      },
+      get shutdown() { reads.shutdown += 1; return () => Promise.resolve(); },
+    } as AgentProviderSession;
+    factory.register({
+      id: 'provider-x', capabilities: capabilities(['worker-result']), createSession: () => session,
+    });
+    expect(factory.createSession('provider-x', request())).toBe(session);
+    expect(reads).toEqual({
+      providerId: 1, capabilities: 1, started: 1, active: 1,
+      sessionId: 1, start: 1, runTurn: 1, shutdown: 1,
+      outputProtocols: 1, sessionContinuation: 1,
+    });
   });
 
   it('creates distinct sessions without starting, running, shutting down, publishing, or caching', () => {

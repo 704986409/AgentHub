@@ -1,5 +1,6 @@
 import type { EventBus } from '../events/event-bus.js';
 import {
+  AgentProviderError,
   agentOutputProtocols,
   validateAgentProviderTurnRequest,
   type AgentOutputProtocol,
@@ -147,6 +148,24 @@ export class AgentRuntime {
     }
     this.#binding = snapshot;
 
+    let capabilities: Readonly<AgentProviderCapabilities>;
+    try {
+      const descriptor = this.#providerFactory.list().find(({ id }) => id === this.providerId);
+      if (descriptor === undefined) {
+        throw new AgentProviderError(
+          'AGENT_PROVIDER_NOT_FOUND',
+          `Agent provider ${this.providerId} is not registered`,
+        );
+      }
+      capabilities = snapshotRuntimeCapabilities(descriptor.capabilities);
+    } catch (error) {
+      const state = this.#currentState();
+      if (state !== 'STARTING') return Promise.reject(lifecycleErrorForState(state));
+      this.#binding = undefined;
+      this.#state = 'IDLE';
+      return rejectPreserving(error);
+    }
+
     let session: AgentProviderSession;
     try {
       session = this.#providerFactory.createSession(this.providerId, {
@@ -167,20 +186,18 @@ export class AgentRuntime {
       return rejectPreserving(error);
     }
     this.#session = session;
+    this.#sessionCapabilities = capabilities;
 
     let lifecycle: ProviderSessionLifecycle;
-    let capabilities: Readonly<AgentProviderCapabilities>;
     try {
       lifecycle = inspectSessionLifecycle(session);
       this.#sessionId = lifecycle.sessionId;
-      capabilities = inspectSessionCapabilities(session);
     } catch (error) {
       const state = this.#currentState();
       if (state !== 'STARTING') return Promise.reject(lifecycleErrorForState(state));
       this.#state = 'FAILED';
       return rejectPreserving(error);
     }
-    this.#sessionCapabilities = capabilities;
     const state = this.#currentState();
     if (state !== 'STARTING' || this.#session !== session) {
       return Promise.reject(lifecycleErrorForState(state));
@@ -480,14 +497,6 @@ function snapshotRuntimeCapabilities(value: unknown): Readonly<AgentProviderCapa
     outputProtocols: Object.freeze(protocols),
     sessionContinuation,
   });
-}
-
-function inspectSessionCapabilities(session: AgentProviderSession): Readonly<AgentProviderCapabilities> {
-  try {
-    return snapshotRuntimeCapabilities(session.capabilities);
-  } catch {
-    throw providerContractViolation('Provider session capabilities could not be inspected');
-  }
 }
 
 function validateIdentity(identity: AgentRuntimeIdentity): void {

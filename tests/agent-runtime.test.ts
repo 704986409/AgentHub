@@ -271,7 +271,7 @@ describe('AgentRuntime', () => {
     provider.nextSession = () => {
       const session = new FakeSession();
       session.onSessionIdRead = () => {
-        if (session.sessionIdReads === 3) {
+        if (session.sessionIdReads === 2) {
           session.onSessionIdRead = undefined;
           (session as unknown as { sessionId: unknown }).sessionId = 42;
         }
@@ -331,24 +331,23 @@ describe('AgentRuntime', () => {
     expect(session.shutdownCalls).toBe(1);
   });
 
-  it('retains a Factory-returned session when Runtime capability inspection throws', async () => {
+  it('does not perform a second Session capability read after Factory validation', async () => {
     const { runtime, provider } = harness();
     provider.nextSession = () => {
       const session = new FakeSession();
       session.onCapabilitiesRead = () => {
-        if (session.capabilityReads === 2) {
-          session.onCapabilitiesRead = undefined;
+        if (session.capabilityReads > 1) {
           throw new Error('capability getter failed');
         }
       };
       return session;
     };
-    await expect(runtime.start(bindingA())).rejects.toMatchObject({
-      code: 'AGENT_RUNTIME_PROVIDER_CONTRACT_VIOLATION',
-    });
+    await runtime.start(bindingA());
     const session = requireSession(provider);
-    expect(session.startCalls).toBe(0);
-    expect(runtime).toMatchObject({ state: 'FAILED', busy: true, binding: bindingA() });
+    expect(session.capabilityReads).toBe(1);
+    expect(session.startCalls).toBe(1);
+    expect(runtime.state).toBe('OWNED');
+    session.onCapabilitiesRead = undefined;
     await runtime.shutdown();
   });
 
@@ -413,30 +412,55 @@ describe('AgentRuntime', () => {
     await runtime.shutdown();
   });
 
+  it('keeps the Factory descriptor authoritative over a later valid Session capability generation', async () => {
+    const { runtime, provider } = harness();
+    provider.nextSession = () => {
+      const session = new FakeSession();
+      session.onCapabilitiesRead = () => {
+        if (session.capabilityReads > 1) {
+          session.capabilities = { outputProtocols: ['worker-result'], sessionContinuation: false };
+        }
+      };
+      return session;
+    };
+    await runtime.start(bindingA());
+    const session = requireSession(provider);
+    await expect(runtime.runTurn(managerRequest())).resolves.toMatchObject({ directiveStatus: 'valid' });
+    await expect(runtime.runTurn(workerRequest())).rejects.toMatchObject({ code: 'AGENT_PROVIDER_UNSUPPORTED_PROTOCOL' });
+    expect(session.capabilityReads).toBe(1);
+    expect(session.runCalls).toBe(1);
+    await runtime.shutdown();
+  });
+
+  it('accepts both protocols from a registered hybrid provider descriptor', async () => {
+    const { runtime, provider } = harness({
+      sessionCapabilities: {
+        outputProtocols: ['manager-directive', 'worker-result'], sessionContinuation: true,
+      },
+    });
+    await runtime.start(bindingA());
+    const session = requireSession(provider);
+    await expect(runtime.runTurn(managerRequest())).resolves.toMatchObject({ directiveStatus: 'valid' });
+    session.result = workerFailure();
+    await expect(runtime.runTurn(workerRequest())).resolves.toMatchObject({ protocolValid: false });
+    expect(session.runCalls).toBe(2);
+    await runtime.shutdown();
+  });
+
   it.each([
     null,
     { outputProtocols: [], sessionContinuation: true },
     { outputProtocols: ['manager-directive', 'manager-directive'], sessionContinuation: true },
     { outputProtocols: ['future-protocol'], sessionContinuation: true },
     { outputProtocols: ['manager-directive'], sessionContinuation: 'yes' },
-  ])('quarantines malformed Runtime capability snapshots: %j', async (invalidCapabilities) => {
+  ])('returns cleanly to IDLE when Factory rejects malformed Session capabilities: %j', async (invalidCapabilities) => {
     const { runtime, provider } = harness();
-    provider.nextSession = () => {
-      const session = new FakeSession();
-      session.onCapabilitiesRead = () => {
-        if (session.capabilityReads === 2) {
-          session.capabilities = invalidCapabilities as AgentProviderCapabilities;
-        }
-      };
-      return session;
-    };
+    provider.nextSession = () => new FakeSession('fake', invalidCapabilities as AgentProviderCapabilities);
     await expect(runtime.start(bindingA())).rejects.toMatchObject({
-      code: 'AGENT_RUNTIME_PROVIDER_CONTRACT_VIOLATION',
+      code: 'AGENT_PROVIDER_CONTRACT_VIOLATION',
     });
-    const session = requireSession(provider);
-    expect(session.startCalls).toBe(0);
-    expect(runtime.state).toBe('FAILED');
-    await runtime.shutdown();
+    expect(requireSession(provider).startCalls).toBe(0);
+    expect(runtime).toMatchObject({ state: 'IDLE', busy: false, binding: undefined });
   });
 
   it.each(['taskId', 'assignmentId', 'specVersion', 'profileHash'] as const)(
@@ -608,7 +632,7 @@ describe('AgentRuntime', () => {
     provider.nextSession = () => {
       const session = new FakeSession();
       session.onCapabilitiesRead = () => {
-        if (session.capabilityReads === 2) {
+        if (session.capabilityReads === 1) {
           session.onCapabilitiesRead = undefined;
           shutdown = runtime.shutdown();
         }
@@ -818,7 +842,7 @@ describe('AgentRuntime', () => {
     await expect(runtime.runTurn(managerRequest())).resolves.toMatchObject({ directiveStatus: 'valid' });
     await expect(runtime.runTurn(workerRequest())).rejects.toMatchObject({ code: 'AGENT_PROVIDER_UNSUPPORTED_PROTOCOL' });
     expect(session.runCalls).toBe(1);
-    expect(session.capabilityReads).toBe(2);
+    expect(session.capabilityReads).toBe(1);
     await runtime.shutdown();
   });
 
@@ -826,16 +850,10 @@ describe('AgentRuntime', () => {
     const { runtime, provider } = harness();
     const reads = { outputProtocols: 0, sessionContinuation: 0 };
     provider.nextSession = () => {
-      const session = new FakeSession();
-      session.onCapabilitiesRead = () => {
-        if (session.capabilityReads === 2) {
-          session.capabilities = {
-            get outputProtocols() { reads.outputProtocols += 1; return ['manager-directive'] as const; },
-            get sessionContinuation() { reads.sessionContinuation += 1; return true; },
-          };
-        }
-      };
-      return session;
+      return new FakeSession('fake', {
+        get outputProtocols() { reads.outputProtocols += 1; return ['manager-directive'] as const; },
+        get sessionContinuation() { reads.sessionContinuation += 1; return true; },
+      });
     };
     await runtime.start(bindingA());
     expect(reads).toEqual({ outputProtocols: 1, sessionContinuation: 1 });

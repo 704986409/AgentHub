@@ -7,11 +7,14 @@ import {
   type AgentProviderDescriptor,
   type AgentProviderId,
   type AgentProviderSession,
+  type AgentProviderSessionCreateOptions,
   type CreateAgentProviderSessionRequest,
 } from './AgentProvider.js';
 
 interface RegisteredProvider {
-  readonly provider: AgentProvider;
+  readonly createSession: (
+    options: AgentProviderSessionCreateOptions,
+  ) => AgentProviderSession;
   readonly descriptor: AgentProviderDescriptor;
 }
 
@@ -25,19 +28,27 @@ export class AgentProviderFactory {
   readonly #providers = new Map<AgentProviderId, RegisteredProvider>();
 
   public register(provider: AgentProvider): void {
-    if (!isRecord(provider) || typeof provider.createSession !== 'function') {
+    if (!isRecord(provider)) {
       throw contractViolation('Agent provider must implement createSession');
     }
-    validateProviderId(provider.id);
-    if (this.#providers.has(provider.id)) {
+    const id = provider.id;
+    const rawCapabilities = provider.capabilities;
+    const createSession: unknown = Reflect.get(provider, 'createSession');
+    validateProviderId(id);
+    const capabilities = snapshotCapabilities(rawCapabilities);
+    if (typeof createSession !== 'function') {
+      throw contractViolation('Agent provider must implement createSession');
+    }
+    if (this.#providers.has(id)) {
       throw new AgentProviderError(
         'AGENT_PROVIDER_DUPLICATE',
-        `Agent provider ${provider.id} is already registered`,
+        `Agent provider ${id} is already registered`,
       );
     }
-    const capabilities = snapshotCapabilities(provider.capabilities);
-    const descriptor = Object.freeze({ id: provider.id, capabilities });
-    this.#providers.set(provider.id, { provider, descriptor });
+    const descriptor = Object.freeze({ id, capabilities });
+    const createRegisteredSession = (options: AgentProviderSessionCreateOptions): AgentProviderSession =>
+      Reflect.apply(createSession, provider, [options]) as AgentProviderSession;
+    this.#providers.set(id, { createSession: createRegisteredSession, descriptor });
   }
 
   public has(providerId: AgentProviderId): boolean {
@@ -60,13 +71,17 @@ export class AgentProviderFactory {
         `Agent provider ${providerId} is not registered`,
       );
     }
-    if (!isRecord(request) || !isRecord(request.context)) {
+    if (!isRecord(request)) {
       throw contractViolation('Agent provider session request is invalid');
     }
-    const context = Object.freeze({ ...request.context, provider: registered.descriptor.id });
-    const config = request.config === undefined ? undefined : snapshotConfig(request.config);
-    const session = registered.provider.createSession({
-      eventBus: request.eventBus,
+    const eventBus = request.eventBus;
+    const rawContext = request.context;
+    const rawConfig = request.config;
+    if (!isRecord(rawContext)) throw contractViolation('Agent provider session request is invalid');
+    const context = Object.freeze({ ...rawContext, provider: registered.descriptor.id });
+    const config = rawConfig === undefined ? undefined : snapshotConfig(rawConfig);
+    const session = registered.createSession({
+      eventBus,
       context,
       ...(config === undefined ? {} : { config }),
     });
@@ -85,13 +100,16 @@ function validateProviderId(providerId: unknown): asserts providerId is AgentPro
 }
 
 function snapshotCapabilities(value: unknown): AgentProviderCapabilities {
-  if (!isRecord(value) || typeof value.sessionContinuation !== 'boolean' ||
-    !Array.isArray(value.outputProtocols) || value.outputProtocols.length === 0) {
+  if (!isRecord(value)) {
     throw invalidCapabilities();
   }
+  const sessionContinuation = value.sessionContinuation;
+  const outputProtocols = value.outputProtocols;
+  if (typeof sessionContinuation !== 'boolean' ||
+    !Array.isArray(outputProtocols) || outputProtocols.length === 0) throw invalidCapabilities();
   const protocols: AgentOutputProtocol[] = [];
   const seen = new Set<AgentOutputProtocol>();
-  for (const protocol of value.outputProtocols) {
+  for (const protocol of outputProtocols) {
     if (typeof protocol !== 'string' || !agentOutputProtocols.includes(protocol as AgentOutputProtocol)) {
       throw invalidCapabilities();
     }
@@ -102,21 +120,28 @@ function snapshotCapabilities(value: unknown): AgentProviderCapabilities {
   }
   return Object.freeze({
     outputProtocols: Object.freeze(protocols),
-    sessionContinuation: value.sessionContinuation,
+    sessionContinuation,
   });
 }
 
 function validateSession(value: unknown, descriptor: AgentProviderDescriptor): asserts value is AgentProviderSession {
-  if (!isRecord(value) || value.providerId !== descriptor.id ||
-    typeof value.start !== 'function' || typeof value.runTurn !== 'function' ||
-    typeof value.shutdown !== 'function' || typeof value.started !== 'boolean' ||
-    typeof value.active !== 'boolean' ||
-    (value.sessionId !== undefined && typeof value.sessionId !== 'string')) {
+  if (!isRecord(value)) throw contractViolation('Agent provider returned an invalid session contract');
+  const providerId = value.providerId;
+  const start = value.start;
+  const runTurn = value.runTurn;
+  const shutdown = value.shutdown;
+  const started = value.started;
+  const active = value.active;
+  const sessionId = value.sessionId;
+  const rawCapabilities = value.capabilities;
+  if (providerId !== descriptor.id || typeof start !== 'function' || typeof runTurn !== 'function' ||
+    typeof shutdown !== 'function' || typeof started !== 'boolean' || typeof active !== 'boolean' ||
+    (sessionId !== undefined && typeof sessionId !== 'string')) {
     throw contractViolation('Agent provider returned an invalid session contract');
   }
   let capabilities: AgentProviderCapabilities;
   try {
-    capabilities = snapshotCapabilities(value.capabilities);
+    capabilities = snapshotCapabilities(rawCapabilities);
   } catch {
     throw contractViolation('Agent provider session capabilities are invalid');
   }
