@@ -124,7 +124,7 @@ export class GitCommandRunner implements GitCommandRunnerLike {
 
 const gitRoutingEnvironment = new Set([
   'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
-  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_QUARANTINE_PATH',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_QUARANTINE_PATH', 'GIT_DIFF_OPTS',
 ]);
 
 function sanitizeGitEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

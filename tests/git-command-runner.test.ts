@@ -101,13 +101,14 @@ describe('GitCommandRunner', () => {
   it('strips repository-routing environment while preserving normal execution variables', async () => {
     let invokedOptions: ExecFileOptions | undefined;
     const runner = new GitCommandRunner({
-      env: { PATH: 'git-path', HOME: 'home', USERPROFILE: 'profile', GIT_DIR: 'wrong', GIT_WORK_TREE: 'wrong' },
+      env: { PATH: 'git-path', HOME: 'home', USERPROFILE: 'profile', GIT_DIR: 'wrong', GIT_WORK_TREE: 'wrong', GIT_DIFF_OPTS: '--unified=99' },
       execFile: (_file, _args, options, callback) => { invokedOptions = options; callback(null, '', ''); },
     });
     await runner.run(['status'], { cwd: '.' });
     expect(invokedOptions?.env).toMatchObject({ PATH: 'git-path', HOME: 'home', USERPROFILE: 'profile' });
     expect(invokedOptions?.env).not.toHaveProperty('GIT_DIR');
     expect(invokedOptions?.env).not.toHaveProperty('GIT_WORK_TREE');
+    expect(invokedOptions?.env).not.toHaveProperty('GIT_DIFF_OPTS');
   });
 });
 

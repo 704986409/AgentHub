@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  canonicalChangeState, parseChangeNumstat, parseChangeStatus, parseIndexFlags,
+  canonicalChangeState, canonicalTrackedIdentity, parseChangeNumstat, parseChangeStatus, parseIndexFlags,
   parseRawChanges, snapshotCaptureOptions, validateChangePath,
 } from '../src/workspace/GitWorkspaceChangeCapture.js';
 const id = 'a'.repeat(40);
@@ -56,6 +56,15 @@ describe('change capture deterministic contracts', () => {
   it('canonicalizes nested keys without locale or property construction order', () => {
     expect(canonicalChangeState({ z: [{ b: 2, a: 1 }], a: '中' })).toBe('{"a":"中","z":[{"a":1,"b":2}]}');
     expect(canonicalChangeState({ a: 1, b: 2 })).toBe(canonicalChangeState({ b: 2, a: 1 }));
+  });
+  it('projects only source identity fields into the canonical tracked identity', () => {
+    const source = { path: 'file', status: 'M', oldMode: '100644', newMode: '100644',
+      oldObjectId: id, newObjectId: 'b'.repeat(40), binary: false, addedLines: 1, deletedLines: 1 };
+    const presentationOnly = { ...source, binary: true, addedLines: null, deletedLines: null };
+    expect(canonicalTrackedIdentity(source)).toEqual({ path: 'file', status: 'M', oldMode: '100644',
+      newMode: '100644', oldObjectId: id, newObjectId: 'b'.repeat(40) });
+    expect(canonicalChangeState(canonicalTrackedIdentity(source)))
+      .toBe(canonicalChangeState(canonicalTrackedIdentity(presentationOnly)));
   });
 });
 

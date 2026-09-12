@@ -42,6 +42,14 @@ export interface GitTrackedChange {
   readonly addedLines: number | null;
   readonly deletedLines: number | null;
 }
+export interface CanonicalTrackedIdentity {
+  readonly path: string;
+  readonly status: string;
+  readonly oldMode: string;
+  readonly newMode: string;
+  readonly oldObjectId: string;
+  readonly newObjectId: string;
+}
 export type GitPatchCapture =
   | { readonly status: 'captured'; readonly text: string; readonly byteLength: number; readonly sha256: string }
   | { readonly status: 'empty'; readonly byteLength: 0; readonly sha256: string }
@@ -90,6 +98,17 @@ export function canonicalChangeState(value: unknown): string {
   if (value === null || typeof value === 'string' || typeof value === 'boolean' ||
     (typeof value === 'number' && Number.isFinite(value))) return JSON.stringify(value);
   return fail('GIT_CHANGE_CONTRACT_VIOLATION');
+}
+/** Source identity only; diff presentation/statistics are intentionally excluded. */
+export function canonicalTrackedIdentity(change: GitTrackedChange): CanonicalTrackedIdentity {
+  return {
+    path: change.path,
+    status: change.status,
+    oldMode: change.oldMode,
+    newMode: change.newMode,
+    oldObjectId: change.oldObjectId,
+    newObjectId: change.newObjectId,
+  };
 }
 function freeze<T>(value: T): T {
   if (value !== null && typeof value === 'object') {
@@ -247,7 +266,8 @@ export async function captureWorkspaceChanges(
     let patchRemaining = options.maxPatchBytes;
     const layer = async (endpoints: readonly string[]): Promise<GitChangeLayer> => {
       const args = ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color',
-        '--ignore-submodules=none', '--full-index', '--abbrev=64'];
+        '--diff-algorithm=myers', '--no-indent-heuristic', '--ignore-submodules=none',
+        '--full-index', '--abbrev=64'];
       const raw = parseRawChanges(await run([...args, '--raw', '-z', ...endpoints, '--']) ?? parseFailure());
       const stats = [...parseChangeNumstat(await run([...args, '--numstat', '-z', ...endpoints, '--']) ?? parseFailure())];
       const byPath = new Map<string, typeof stats>();
@@ -264,7 +284,8 @@ export async function captureWorkspaceChanges(
       if ([...byPath.values()].some(group => group.length > 0)) return parseFailure();
       let patch: GitPatchCapture = { status: 'not-requested' };
       if (options.includePatchText) {
-        const text = await run([...args, '--patch', ...endpoints, '--'], true);
+        const text = await run([...args, '--patch', '--unified=3', '--inter-hunk-context=0',
+          '--src-prefix=a/', '--dst-prefix=b/', ...endpoints, '--'], true);
         if (text === undefined || Buffer.byteLength(text) > patchRemaining) patch = { status: 'omitted-limit' };
         else {
           const byteLength = Buffer.byteLength(text);
@@ -321,9 +342,11 @@ export async function captureWorkspaceChanges(
       paths: ignoredPaths.slice(0, options.maxIgnoredPaths), truncated: ignoredPaths.length > options.maxIgnoredPaths };
     const after = await requireWorkspace();
     if (canonicalChangeState(workspace) !== canonicalChangeState(after)) return unstable();
-    const source = { taskId: workspace.taskId, branchName: workspace.branchName, baseCommit: workspace.baseCommit,
-      headCommit: workspace.headCommit, committed: committed.changes, staged: staged.changes,
-      unstaged: unstaged.changes, workingFiles, untracked, conflicts,
+    const source = { digestVersion: 1, taskId: workspace.taskId, branchName: workspace.branchName,
+      baseCommit: workspace.baseCommit, headCommit: workspace.headCommit,
+      committed: committed.changes.map(canonicalTrackedIdentity),
+      staged: staged.changes.map(canonicalTrackedIdentity),
+      unstaged: unstaged.changes.map(canonicalTrackedIdentity), workingFiles, untracked, conflicts,
       status: status.filter(entry => entry.kind !== '!') };
     const snapshot = { ...workspace, committed, staged, unstaged, workingFiles, untracked, conflicts, ignored,
       changedPaths, hasConflicts: conflicts.length > 0, changeSetSha256: sha(canonicalChangeState(source)) };

@@ -144,6 +144,27 @@ describe('change capture real Git', { timeout: 30_000 }, () => {
     expect(limited.unstaged.patch.status).toBe('omitted-limit');
     expect(limited.changeSetSha256).toBe(plain.changeSetSha256);
   });
+  it('keeps source identity stable when local diff algorithm changes', async () => {
+    const { wt, capture } = await setup();
+    await writeFile(path.join(wt, 'file'), 'D\nC\nC\nA\nA\n');
+    const first = await capture({ includePatchText: true });
+    await git(wt, ['config', 'diff.algorithm', 'patience']);
+    const second = await capture({ includePatchText: true });
+    expect(second.changeSetSha256).toBe(first.changeSetSha256);
+    expect(second.unstaged.changes).toEqual(first.unstaged.changes);
+    expect(second.unstaged.patch).toEqual(first.unstaged.patch);
+  });
+  it('keeps source identity stable when info attributes change binary presentation', async () => {
+    const { wt, capture } = await setup();
+    await writeFile(path.join(wt, 'file'), 'changed\n');
+    const first = await capture();
+    const attributes = path.resolve(wt, (await git(wt, ['rev-parse', '--git-path', 'info/attributes'])).stdout.trim());
+    await mkdir(path.dirname(attributes), { recursive: true });
+    await writeFile(attributes, 'file binary\n');
+    const second = await capture();
+    expect(second.changeSetSha256).toBe(first.changeSetSha256);
+    expect(second.unstaged.changes[0]).toMatchObject({ path: 'file', binary: true, addedLines: null, deletedLines: null });
+  });
   it('fails hard completeness limits and releases ownership after each failure', async () => {
     const { wt, capture } = await setup();
     await writeFile(path.join(wt, 'new'), '123');
@@ -213,7 +234,15 @@ describe('change capture real Git', { timeout: 30_000 }, () => {
       expect(call.cwd).toBe(wt);
       expect(call.args).toContain('--no-optional-locks');
       expect(call.args).toContain('core.fsmonitor=false');
-      if (call.args.includes('diff')) for (const flag of ['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color']) expect(call.args).toContain(flag);
+      if (call.args.includes('diff')) {
+        for (const flag of ['--no-ext-diff', '--no-textconv', '--no-renames', '--no-color',
+          '--diff-algorithm=myers', '--no-indent-heuristic']) expect(call.args).toContain(flag);
+        if (call.args.includes('--patch')) {
+          for (const flag of ['--unified=3', '--inter-hunk-context=0', '--src-prefix=a/', '--dst-prefix=b/']) {
+            expect(call.args).toContain(flag);
+          }
+        }
+      }
     }
     expect(await readFile(path.resolve(wt, indexPath))).toEqual(before);
     expect(Object.isFrozen(result.unstaged.changes[0])).toBe(true);
