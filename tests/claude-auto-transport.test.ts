@@ -61,6 +61,7 @@ class PersistentStub {
 }
 
 class ResumeStub {
+  public running = false;
   public active = false;
   public readonly requests: ClaudeTurnRequest[] = [];
   public resultSessionId = 'session-A';
@@ -105,6 +106,148 @@ describe('Claude Auto transport', () => {
     expect(auto.lastFallback?.reason).toBe(reason);
     expect(persistent.startCalls).toBe(state === 'supported' ? 1 : 0);
     expect(resume.requests).toHaveLength(0);
+    await auto.shutdown();
+  });
+
+  it('does not resurrect Resume when a Persistent turn rejects after Auto reaches STOPPED', async () => {
+    const persistent = new PersistentStub();
+    const resume = new ResumeStub();
+    const fallbackEvents: unknown[] = [];
+    let resumeFactoryCalls = 0;
+    let rejectTurn!: (reason: Error) => void;
+    persistent.runTurn = (request) => {
+      persistent.prompts.push(request.prompt);
+      persistent.lastSessionId = 'session-A';
+      return new Promise<ClaudePersistentTurnResult>((_resolve, reject) => { rejectTurn = reject; });
+    };
+    persistent.shutdown = () => {
+      persistent.shutdownCalls += 1;
+      persistent.running = false;
+      return Promise.resolve();
+    };
+    const auto = new ClaudeAutoTransport({
+      capabilityReport: report('supported'),
+      persistentFactory: () => persistent as unknown as ClaudePersistentStreamTransport,
+      resumeFactory: () => {
+        resumeFactoryCalls += 1;
+        return resume as unknown as ClaudeResumePerTurnTransport;
+      },
+      onFallback: (event) => fallbackEvents.push(event),
+    });
+    await auto.start();
+
+    const turn = auto.runTurn({ prompt: 'active' });
+    const turnFailure = expect(turn).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_TURN_FAILED', transport: 'persistent-stream', sessionId: 'session-A',
+    });
+    await auto.shutdown();
+    rejectTurn(new Error('late shutdown interruption'));
+    await turnFailure;
+
+    expect(auto.active).toBe(false);
+    expect(auto.requiresCleanup).toBe(false);
+    expect(resumeFactoryCalls).toBe(0);
+    expect(resume.requests).toHaveLength(0);
+    expect(fallbackEvents).toHaveLength(0);
+    expect(auto.lastFallback).toBeUndefined();
+    await auto.start();
+    expect(persistent.startCalls).toBe(2);
+    await auto.shutdown();
+  });
+
+  it('keeps STOPPING authoritative when an active Persistent turn rejects while its child is live', async () => {
+    const persistent = new PersistentStub();
+    const resume = new ResumeStub();
+    const shutdownBarrier = deferred();
+    const fallbackEvents: unknown[] = [];
+    let resumeFactoryCalls = 0;
+    let rejectTurn!: (reason: Error) => void;
+    persistent.runTurn = (request) => {
+      persistent.prompts.push(request.prompt);
+      persistent.lastSessionId = 'session-A';
+      return new Promise<ClaudePersistentTurnResult>((_resolve, reject) => { rejectTurn = reject; });
+    };
+    persistent.shutdown = async () => {
+      persistent.shutdownCalls += 1;
+      await shutdownBarrier.promise;
+      persistent.running = false;
+    };
+    const auto = new ClaudeAutoTransport({
+      capabilityReport: report('supported'),
+      persistentFactory: () => persistent as unknown as ClaudePersistentStreamTransport,
+      resumeFactory: () => {
+        resumeFactoryCalls += 1;
+        return resume as unknown as ClaudeResumePerTurnTransport;
+      },
+      onFallback: (event) => fallbackEvents.push(event),
+    });
+    await auto.start();
+
+    const turn = auto.runTurn({ prompt: 'active' });
+    const turnFailure = expect(turn).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_TURN_FAILED', transport: 'persistent-stream', sessionId: 'session-A',
+    });
+    const shutdown = auto.shutdown();
+    await Promise.resolve();
+    expect(persistent.running).toBe(true);
+    rejectTurn(new Error('shutdown interruption while live'));
+    await turnFailure;
+    expect(auto.requiresCleanup).toBe(false);
+    expect(resumeFactoryCalls).toBe(0);
+    expect(fallbackEvents).toHaveLength(0);
+
+    shutdownBarrier.resolve();
+    await shutdown;
+    expect(auto.requiresCleanup).toBe(false);
+    expect(resumeFactoryCalls).toBe(0);
+    expect(resume.requests).toHaveLength(0);
+    expect(auto.lastFallback).toBeUndefined();
+    await auto.start();
+    expect(persistent.startCalls).toBe(2);
+    await auto.shutdown();
+  });
+
+  it('stops an active Resume turn without switching transport or resurrecting Auto', async () => {
+    const persistent = new PersistentStub();
+    const resume = new ResumeStub();
+    let persistentFactoryCalls = 0;
+    let rejectTurn!: (reason: Error) => void;
+    resume.runTurn = (request) => {
+      resume.requests.push({ ...request });
+      resume.running = true;
+      return new Promise<ClaudeTurnResult>((_resolve, reject) => { rejectTurn = reject; });
+    };
+    resume.shutdown = () => {
+      resume.shutdownCalls += 1;
+      resume.running = false;
+      rejectTurn(new Error('resume stopped by shutdown'));
+      return Promise.resolve();
+    };
+    const auto = new ClaudeAutoTransport({
+      mode: 'resume-per-turn',
+      initialSessionId: 'session-A',
+      persistentFactory: () => {
+        persistentFactoryCalls += 1;
+        return persistent as unknown as ClaudePersistentStreamTransport;
+      },
+      resumeFactory: () => resume as unknown as ClaudeResumePerTurnTransport,
+    });
+    await auto.start();
+
+    const turn = auto.runTurn({ prompt: 'active resume' });
+    const turnFailure = expect(turn).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_TURN_FAILED', transport: 'resume-per-turn', sessionId: 'session-A',
+    });
+    await auto.shutdown();
+    await turnFailure;
+    expect(auto.active).toBe(false);
+    expect(auto.requiresCleanup).toBe(false);
+    expect(auto.selectedTransport).toBe('resume-per-turn');
+    expect(resume.requests).toHaveLength(1);
+    expect(persistentFactoryCalls).toBe(0);
+
+    await auto.start();
+    expect(persistentFactoryCalls).toBe(0);
     await auto.shutdown();
   });
 
@@ -558,6 +701,12 @@ function createAuto(
     resumeFactory: () => resume as unknown as ClaudeResumePerTurnTransport,
     ...options,
   });
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
 }
 
 function report(

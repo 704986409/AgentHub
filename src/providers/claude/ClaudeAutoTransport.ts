@@ -433,6 +433,17 @@ export class ClaudeAutoTransport {
       return normalizePersistentResult(result);
     } catch (cause) {
       this.capturePersistentSession();
+      const lifecycleState = this.currentState();
+      if (lifecycleState === 'STOPPING' || lifecycleState === 'STOPPED') {
+        throw new ClaudeAutoError(
+          'CLAUDE_AUTO_TURN_FAILED',
+          'Claude persistent turn ended during Auto shutdown',
+          'persistent-stream',
+          this.#sessionId,
+          'ambiguous',
+          { cause },
+        );
+      }
       if (isPersistentRunning(persistent)) {
         this.#state = 'FAILED';
         throw new ClaudeAutoError(

@@ -27,6 +27,7 @@ import {
   type ClaudeCapabilityEvidence,
   type ClaudeCapabilityName,
   type ClaudeCapabilityReport,
+  type ClaudePersistentTurnResult,
   type ClaudeProcessManagerOptions,
   type ClaudeRawMessage,
   type DomainEvent,
@@ -764,6 +765,66 @@ describe('Claude worker session', () => {
       code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED',
     });
     expect(resume.requests).toHaveLength(1);
+    await session.shutdown();
+  });
+
+  it('keeps actual Auto stopped and restartable after a late active Persistent shutdown rejection', async () => {
+    const persistent = new LifecyclePersistentStub('session-A');
+    const resume = new LifecycleResumeStub();
+    const lowerShutdown = deferred();
+    let rejectTurn!: (reason: Error) => void;
+    let resumeFactoryCalls = 0;
+    const fallbackEvents: unknown[] = [];
+    persistent.turnHandler = () => new Promise<ClaudePersistentTurnResult>((_resolve, reject) => {
+      rejectTurn = reject;
+    });
+    persistent.shutdownHandler = () => {
+      persistent.running = false;
+      lowerShutdown.resolve();
+      return Promise.resolve();
+    };
+    const { session, events } = createLifecycleSession(persistent, resume, {
+      onResumeFactory: () => { resumeFactoryCalls += 1; },
+      transportOptions: { onFallback: (event) => fallbackEvents.push(event) },
+    });
+    await session.start();
+
+    const turn = session.runTurn({ prompt: 'active shutdown' });
+    const turnFailure = expect(turn).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_TURN_FAILED', transport: 'persistent-stream', sessionId: 'session-A',
+    });
+    const shutdown = session.shutdown();
+    await lowerShutdown.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+    rejectTurn(new Error('late shutdown interruption'));
+    await turnFailure;
+    await shutdown;
+    const eventCount = events.length;
+
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+    expect(resumeFactoryCalls).toBe(0);
+    expect(resume.requests).toHaveLength(0);
+    expect(fallbackEvents).toHaveLength(0);
+    await Promise.resolve();
+    expect(events).toHaveLength(eventCount);
+
+    persistent.turnHandler = () => Promise.resolve({
+      sessionId: 'session-A',
+      resultText: workerText('COMPLETED'),
+      messageTypes: ['assistant', 'result'],
+      processId: 303,
+      durationMs: 1,
+      resultSubtype: 'success',
+      isError: false,
+    });
+    persistent.shutdownHandler = undefined;
+    await session.start();
+    await expect(session.runTurn({ prompt: 'clean restart' })).resolves.toMatchObject({
+      protocolValid: true, transport: 'persistent-stream', sessionId: 'session-A',
+    });
+    expect(resumeFactoryCalls).toBe(0);
     await session.shutdown();
   });
 
@@ -1550,24 +1611,29 @@ class LifecyclePersistentStub {
   public running = false;
   public active = false;
   public readonly prompts: string[] = [];
+  public startCalls = 0;
+  public turnHandler: ((request: { prompt: string }) => Promise<ClaudePersistentTurnResult>) | undefined;
+  public shutdownHandler: (() => Promise<void>) | undefined;
   public constructor(public lastSessionId?: string) {}
 
   public start(): Promise<void> {
+    this.startCalls += 1;
     this.running = true;
     return Promise.resolve();
   }
 
-  public runTurn(request: { prompt: string }): Promise<never> {
+  public runTurn(request: { prompt: string }): Promise<ClaudePersistentTurnResult> {
     this.prompts.push(request.prompt);
+    if (this.turnHandler !== undefined) return this.turnHandler(request);
     this.running = false;
     return Promise.reject(Object.assign(new Error('persistent turn failed'), {
       code: 'CLAUDE_PERSISTENT_TURN_TIMEOUT',
     }));
   }
 
-  public shutdown(): Promise<void> {
+  public async shutdown(): Promise<void> {
+    if (this.shutdownHandler !== undefined) return this.shutdownHandler();
     this.running = false;
-    return Promise.resolve();
   }
 }
 
@@ -1598,6 +1664,7 @@ function createLifecycleSession(
     eventBus?: EventBus;
     resultParser?: AgentHubWorkerResultParser;
     transportOptions?: Partial<ClaudeAutoTransportOptions>;
+    onResumeFactory?: () => void;
   } = {},
 ): { session: ClaudeWorkerSession; events: DomainEvent[] } {
   const eventBus = options.eventBus ?? new EventBus();
@@ -1611,7 +1678,10 @@ function createLifecycleSession(
       capabilityReport: report('supported'),
       ...options.transportOptions,
       persistentFactory: () => persistent as unknown as ClaudePersistentStreamTransport,
-      resumeFactory: () => resume as unknown as ClaudeResumePerTurnTransport,
+      resumeFactory: () => {
+        options.onResumeFactory?.();
+        return resume as unknown as ClaudeResumePerTurnTransport;
+      },
     },
   });
   return { session, events };
