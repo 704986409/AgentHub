@@ -32,6 +32,12 @@ export interface AgentRuntimeBinding {
   readonly profileHash: string;
 }
 
+interface AgentRuntimeTurnSnapshot {
+  readonly prompt: string;
+  readonly protocol: AgentOutputProtocol;
+  readonly timeoutMs?: number;
+}
+
 export type AgentRuntimeErrorCode =
   | 'AGENT_RUNTIME_INVALID_IDENTITY'
   | 'AGENT_RUNTIME_INVALID_CONFIG'
@@ -61,27 +67,35 @@ export class AgentRuntime {
   #binding: Readonly<AgentRuntimeBinding> | undefined;
   #session: AgentProviderSession | undefined;
   #sessionCapabilities: Readonly<AgentProviderCapabilities> | undefined;
+  #sessionId: string | undefined;
   #active = false;
   #startPromise: Promise<void> | undefined;
   #activeTurnPromise: Promise<AgentProviderTurnResult> | undefined;
   #shutdownPromise: Promise<void> | undefined;
 
   public constructor(options: AgentRuntimeOptions) {
-    validateIdentity(options);
-    if (options.providerConfig !== undefined && !isRecord(options.providerConfig)) {
+    if (!isRecord(options)) validateIdentity(options);
+    const agentId = options.agentId;
+    const projectId = options.projectId;
+    const providerId = options.providerId;
+    const providerFactory = options.providerFactory;
+    const eventBus = options.eventBus;
+    const providerConfig = options.providerConfig;
+    validateIdentity({ agentId, providerId, ...(projectId === undefined ? {} : { projectId }) });
+    if (providerConfig !== undefined && !isRecord(providerConfig)) {
       throw new AgentRuntimeError(
         'AGENT_RUNTIME_INVALID_CONFIG',
         'Agent runtime provider config must be an object',
       );
     }
-    this.agentId = options.agentId;
-    this.projectId = options.projectId;
-    this.providerId = options.providerId;
-    this.#providerFactory = options.providerFactory;
-    this.#eventBus = options.eventBus;
-    this.#providerConfig = options.providerConfig === undefined
+    this.agentId = agentId;
+    this.projectId = projectId;
+    this.providerId = providerId;
+    this.#providerFactory = providerFactory;
+    this.#eventBus = eventBus;
+    this.#providerConfig = providerConfig === undefined
       ? undefined
-      : Object.freeze({ ...options.providerConfig });
+      : Object.freeze({ ...providerConfig });
   }
 
   public get state(): AgentRuntimeState {
@@ -101,7 +115,7 @@ export class AgentRuntime {
   }
 
   public get sessionId(): string | undefined {
-    return this.#session?.sessionId;
+    return this.#sessionId;
   }
 
   public start(binding: AgentRuntimeBinding): Promise<void> {
@@ -116,14 +130,22 @@ export class AgentRuntime {
     }
     if (this.#state === 'FAILED') return Promise.reject(cleanupRequired());
 
+    this.#state = 'STARTING';
+
     let snapshot: Readonly<AgentRuntimeBinding>;
     try {
       snapshot = snapshotBinding(binding);
     } catch (error) {
+      const state = this.#currentState();
+      if (state !== 'STARTING') return Promise.reject(lifecycleErrorForState(state));
+      this.#state = 'IDLE';
       return rejectPreserving(error);
     }
+    const reservedState = this.#currentState();
+    if (reservedState !== 'STARTING') {
+      return Promise.reject(lifecycleErrorForState(reservedState));
+    }
     this.#binding = snapshot;
-    this.#state = 'STARTING';
 
     let session: AgentProviderSession;
     try {
@@ -138,6 +160,8 @@ export class AgentRuntime {
         ...(this.#providerConfig === undefined ? {} : { config: this.#providerConfig }),
       });
     } catch (error) {
+      const state = this.#currentState();
+      if (state !== 'STARTING') return Promise.reject(lifecycleErrorForState(state));
       this.#binding = undefined;
       this.#state = 'IDLE';
       return rejectPreserving(error);
@@ -148,6 +172,7 @@ export class AgentRuntime {
     let capabilities: Readonly<AgentProviderCapabilities>;
     try {
       lifecycle = inspectSessionLifecycle(session);
+      this.#sessionId = lifecycle.sessionId;
       capabilities = inspectSessionCapabilities(session);
     } catch (error) {
       const state = this.#currentState();
@@ -191,48 +216,58 @@ export class AgentRuntime {
         'An Agent runtime turn is already active',
       ));
     }
-    let lifecycle: ProviderSessionLifecycle;
-    try {
-      lifecycle = inspectSessionLifecycle(session);
-    } catch (error) {
-      const state = this.#currentState();
-      if (state !== 'OWNED' || this.#session !== session) {
-        return Promise.reject(lifecycleErrorForState(state));
-      }
-      this.#state = 'FAILED';
-      return rejectPreserving(error);
-    }
-    try {
-      this.#ensureTurnStillOwned(session);
-    } catch (error) {
-      return rejectPreserving(error);
-    }
-    if (!lifecycle.started) {
-      this.#state = 'FAILED';
-      return Promise.reject(providerContractViolation('Provider session is not started'));
-    }
-    if (lifecycle.active) {
-      this.#state = 'FAILED';
-      return Promise.reject(providerContractViolation('Provider session is already active'));
-    }
+
+    this.#active = true;
     const capabilities = this.#sessionCapabilities;
     if (capabilities === undefined) {
       this.#state = 'FAILED';
-      return Promise.reject(providerContractViolation('Provider session capabilities are unavailable'));
+      return this.#rejectTurnPreflight(
+        session,
+        providerContractViolation('Provider session capabilities are unavailable'),
+        true,
+      );
     }
+    let snapshot: Readonly<AgentRuntimeTurnSnapshot>;
     try {
-      validateAgentProviderTurnRequest(request, capabilities);
+      snapshot = snapshotTurnRequest(request);
+      validateAgentProviderTurnRequest(snapshot, capabilities);
+      this.#ensureReservedTurnStillOwned(session);
     } catch (error) {
-      return rejectPreserving(error);
-    }
-    try {
-      this.#ensureTurnStillOwned(session);
-    } catch (error) {
-      return rejectPreserving(error);
+      return this.#rejectTurnPreflight(session, error);
     }
 
-    this.#active = true;
-    const current = Promise.resolve().then(() => this.#performTurn(session, request));
+    let lifecycle: ProviderSessionLifecycle;
+    try {
+      lifecycle = inspectSessionLifecycle(session);
+      this.#sessionId = lifecycle.sessionId;
+    } catch (error) {
+      const failedByPreflight = this.#currentState() === 'OWNED';
+      if (failedByPreflight) this.#state = 'FAILED';
+      return this.#rejectTurnPreflight(session, error, failedByPreflight);
+    }
+    try {
+      this.#ensureReservedTurnStillOwned(session);
+    } catch (error) {
+      return this.#rejectTurnPreflight(session, error);
+    }
+    if (!lifecycle.started) {
+      this.#state = 'FAILED';
+      return this.#rejectTurnPreflight(
+        session,
+        providerContractViolation('Provider session is not started'),
+        true,
+      );
+    }
+    if (lifecycle.active) {
+      this.#state = 'FAILED';
+      return this.#rejectTurnPreflight(
+        session,
+        providerContractViolation('Provider session is already active'),
+        true,
+      );
+    }
+
+    const current = Promise.resolve().then(() => this.#performTurn(session, snapshot));
     this.#activeTurnPromise = current;
     void current.finally(() => {
       if (this.#activeTurnPromise === current) this.#activeTurnPromise = undefined;
@@ -256,6 +291,7 @@ export class AgentRuntime {
     try {
       await session.start();
       const lifecycle = inspectSessionLifecycle(session);
+      this.#sessionId = lifecycle.sessionId;
       if (!lifecycle.started || lifecycle.active) {
         throw providerContractViolation('Provider session did not start in a quiescent state');
       }
@@ -278,6 +314,7 @@ export class AgentRuntime {
         let lifecycle: ProviderSessionLifecycle;
         try {
           lifecycle = inspectSessionLifecycle(session);
+          this.#sessionId = lifecycle.sessionId;
         } catch (inspectionError) {
           this.#markFailedUnlessStopping();
           throw inspectionError;
@@ -293,6 +330,7 @@ export class AgentRuntime {
       let lifecycle: ProviderSessionLifecycle;
       try {
         lifecycle = inspectSessionLifecycle(session);
+        this.#sessionId = lifecycle.sessionId;
       } catch (error) {
         this.#markFailedUnlessStopping();
         throw error;
@@ -320,6 +358,7 @@ export class AgentRuntime {
     const session = this.#session;
     if (session === undefined) {
       this.#sessionCapabilities = undefined;
+      this.#sessionId = undefined;
       this.#binding = undefined;
       this.#state = 'IDLE';
       return;
@@ -336,6 +375,7 @@ export class AgentRuntime {
     let lifecycle: ProviderSessionLifecycle;
     try {
       lifecycle = inspectSessionLifecycle(session);
+      this.#sessionId = lifecycle.sessionId;
     } catch (error) {
       this.#state = 'FAILED';
       throw error;
@@ -346,6 +386,7 @@ export class AgentRuntime {
     }
     this.#session = undefined;
     this.#sessionCapabilities = undefined;
+    this.#sessionId = undefined;
     this.#binding = undefined;
     this.#active = false;
     this.#state = 'IDLE';
@@ -359,7 +400,7 @@ export class AgentRuntime {
     return this.#state;
   }
 
-  #ensureTurnStillOwned(session: AgentProviderSession): void {
+  #ensureReservedTurnStillOwned(session: AgentProviderSession): void {
     if (this.#state === 'FAILED') throw cleanupRequired();
     if (this.#state === 'STARTING' || this.#state === 'STOPPING') {
       throw lifecycleBusy(this.#state);
@@ -370,12 +411,25 @@ export class AgentRuntime {
         'Agent runtime does not own this provider session',
       );
     }
-    if (this.#active) {
-      throw new AgentRuntimeError(
-        'AGENT_RUNTIME_TURN_ALREADY_ACTIVE',
-        'An Agent runtime turn is already active',
-      );
+    if (!this.#active) {
+      throw providerContractViolation('Agent runtime turn reservation was lost');
     }
+  }
+
+  #rejectTurnPreflight(
+    session: AgentProviderSession,
+    error: unknown,
+    failedByPreflight = false,
+  ): Promise<never> {
+    this.#active = false;
+    const state = this.#currentState();
+    if (failedByPreflight && state === 'FAILED' && this.#session === session) {
+      return rejectPreserving(error);
+    }
+    if (state !== 'OWNED' || this.#session !== session) {
+      return Promise.reject(lifecycleErrorForState(state));
+    }
+    return rejectPreserving(error);
   }
 }
 
@@ -404,12 +458,17 @@ function inspectSessionLifecycle(session: AgentProviderSession): ProviderSession
 }
 
 function snapshotRuntimeCapabilities(value: unknown): Readonly<AgentProviderCapabilities> {
-  if (!isRecord(value) || typeof value.sessionContinuation !== 'boolean' ||
-    !Array.isArray(value.outputProtocols) || value.outputProtocols.length === 0) {
+  if (!isRecord(value)) {
+    throw providerContractViolation('Provider session capabilities are invalid');
+  }
+  const sessionContinuation = value.sessionContinuation;
+  const outputProtocols = value.outputProtocols;
+  if (typeof sessionContinuation !== 'boolean' ||
+    !Array.isArray(outputProtocols) || outputProtocols.length === 0) {
     throw providerContractViolation('Provider session capabilities are invalid');
   }
   const protocols: AgentOutputProtocol[] = [];
-  for (const protocol of value.outputProtocols) {
+  for (const protocol of outputProtocols) {
     if (typeof protocol !== 'string' ||
       !agentOutputProtocols.includes(protocol as AgentOutputProtocol) ||
       protocols.includes(protocol as AgentOutputProtocol)) {
@@ -419,7 +478,7 @@ function snapshotRuntimeCapabilities(value: unknown): Readonly<AgentProviderCapa
   }
   return Object.freeze({
     outputProtocols: Object.freeze(protocols),
-    sessionContinuation: value.sessionContinuation,
+    sessionContinuation,
   });
 }
 
@@ -442,19 +501,36 @@ function validateIdentity(identity: AgentRuntimeIdentity): void {
 }
 
 function snapshotBinding(binding: AgentRuntimeBinding): Readonly<AgentRuntimeBinding> {
-  if (!isRecord(binding) || !isNonBlankString(binding.taskId) ||
-    !isNonBlankString(binding.assignmentId) || !isNonBlankString(binding.specVersion) ||
-    !isNonBlankString(binding.profileHash)) {
-    throw new AgentRuntimeError(
-      'AGENT_RUNTIME_INVALID_BINDING',
-      'Agent runtime binding must contain non-blank identifiers',
-    );
+  if (!isRecord(binding)) throw invalidBinding();
+  const taskId = binding.taskId;
+  const assignmentId = binding.assignmentId;
+  const specVersion = binding.specVersion;
+  const profileHash = binding.profileHash;
+  if (!isNonBlankString(taskId) || !isNonBlankString(assignmentId) ||
+    !isNonBlankString(specVersion) || !isNonBlankString(profileHash)) {
+    throw invalidBinding();
   }
+  return Object.freeze({ taskId, assignmentId, specVersion, profileHash });
+}
+
+function invalidBinding(): AgentRuntimeError {
+  return new AgentRuntimeError(
+    'AGENT_RUNTIME_INVALID_BINDING',
+    'Agent runtime binding must contain non-blank identifiers',
+  );
+}
+
+function snapshotTurnRequest(request: AgentProviderTurnRequest): Readonly<AgentRuntimeTurnSnapshot> {
+  if (!isRecord(request)) {
+    return request;
+  }
+  const prompt = request.prompt;
+  const protocol = request.protocol;
+  const timeoutMs = request.timeoutMs;
   return Object.freeze({
-    taskId: binding.taskId,
-    assignmentId: binding.assignmentId,
-    specVersion: binding.specVersion,
-    profileHash: binding.profileHash,
+    prompt,
+    protocol,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
   });
 }
 
@@ -464,11 +540,16 @@ function validateProviderResult(
   providerId: AgentProviderId,
   sessionId: string | undefined,
 ): void {
-  if (!isRecord(result) || result.providerId !== providerId || result.protocol !== request.protocol ||
-    (result.sessionId !== undefined && !isNonBlankString(result.sessionId)) ||
-    (result.durationMs !== undefined &&
-      (typeof result.durationMs !== 'number' || !Number.isFinite(result.durationMs) || result.durationMs < 0)) ||
-    (result.sessionId !== undefined && sessionId !== undefined && result.sessionId !== sessionId)) {
+  if (!isRecord(result)) throw providerContractViolation('Provider returned inconsistent turn metadata');
+  const resultProviderId = result.providerId;
+  const protocol = result.protocol;
+  const resultSessionId = result.sessionId;
+  const durationMs = result.durationMs;
+  if (resultProviderId !== providerId || protocol !== request.protocol ||
+    (resultSessionId !== undefined && !isNonBlankString(resultSessionId)) ||
+    (durationMs !== undefined &&
+      (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || durationMs < 0)) ||
+    (resultSessionId !== undefined && sessionId !== undefined && resultSessionId !== sessionId)) {
     throw providerContractViolation('Provider returned inconsistent turn metadata');
   }
 }

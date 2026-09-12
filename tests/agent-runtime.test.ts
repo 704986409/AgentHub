@@ -53,6 +53,7 @@ class FakeSession implements AgentProviderSession {
   public onCapabilitiesRead: (() => void) | undefined;
   public startCalls = 0;
   public runCalls = 0;
+  public readonly requests: AgentProviderTurnRequest[] = [];
   public shutdownCalls = 0;
   public startBarrier: Promise<void> | undefined;
   public runBarrier: Promise<void> | undefined;
@@ -98,8 +99,9 @@ class FakeSession implements AgentProviderSession {
     if (this.activeAfterStart) this.active = true;
   }
 
-  public async runTurn(): Promise<AgentProviderTurnResult> {
+  public async runTurn(request: AgentProviderTurnRequest): Promise<AgentProviderTurnResult> {
     this.runCalls += 1;
+    this.requests.push(request);
     this.onRun?.();
     this.active = true;
     if (this.runBarrier !== undefined) await this.runBarrier;
@@ -156,6 +158,43 @@ describe('AgentRuntime', () => {
     await configured.runtime.start(bindingA());
     expect(configured.provider.options[0]?.config).toEqual({ mode: 'A' });
     await configured.runtime.shutdown();
+  });
+
+  it('reads constructor identity and providerConfig fields once and keeps the validated generation', async () => {
+    const factory = new AgentProviderFactory();
+    const provider = new FakeProvider();
+    factory.register(provider);
+    const eventBus = new EventBus();
+    const reads = { agentId: 0, projectId: 0, providerId: 0, providerConfig: 0 };
+    const options = {
+      providerFactory: factory,
+      eventBus,
+      get agentId() { reads.agentId += 1; return reads.agentId === 1 ? 'agent-first' : ''; },
+      get projectId() { reads.projectId += 1; return reads.projectId === 1 ? 'project-first' : ''; },
+      get providerId() { reads.providerId += 1; return reads.providerId === 1 ? 'fake' : ''; },
+      get providerConfig() {
+        reads.providerConfig += 1;
+        return reads.providerConfig === 1 ? { mode: 'A' } : { mode: 'B' };
+      },
+    };
+    const runtime = new AgentRuntime(options);
+    expect(reads).toEqual({ agentId: 1, projectId: 1, providerId: 1, providerConfig: 1 });
+    expect(runtime).toMatchObject({ agentId: 'agent-first', projectId: 'project-first', providerId: 'fake' });
+    await runtime.start(bindingA());
+    expect(provider.options[0]?.config).toEqual({ mode: 'A' });
+    await runtime.shutdown();
+  });
+
+  it('propagates a constructor getter failure without provider work', () => {
+    const factory = new AgentProviderFactory();
+    const provider = new FakeProvider();
+    factory.register(provider);
+    const failure = new Error('identity getter failed');
+    expect(() => new AgentRuntime({
+      get agentId(): string { throw failure; },
+      providerId: 'fake', providerFactory: factory, eventBus: new EventBus(),
+    })).toThrow(failure);
+    expect(provider.createCalls).toBe(0);
   });
 
   it.each([
@@ -248,6 +287,28 @@ describe('AgentRuntime', () => {
     await runtime.shutdown();
   });
 
+  it('reads provider result runtime metadata exactly once from stable locals', async () => {
+    const { runtime, provider } = harness();
+    await runtime.start(bindingA());
+    const reads = { providerId: 0, protocol: 0, sessionId: 0, durationMs: 0 };
+    const result = {
+      directiveStatus: 'valid',
+      directive,
+      get providerId() { reads.providerId += 1; return reads.providerId === 1 ? 'fake' : 'other'; },
+      get protocol() {
+        reads.protocol += 1;
+        return reads.protocol === 1 ? 'manager-directive' as const : 'worker-result' as const;
+      },
+      get sessionId() { reads.sessionId += 1; return reads.sessionId === 1 ? 'session-1' : 'other'; },
+      get durationMs() { reads.durationMs += 1; return reads.durationMs === 1 ? 1 : -1; },
+    } as AgentProviderTurnResult;
+    requireSession(provider).result = result;
+    await expect(runtime.runTurn(managerRequest())).resolves.toBe(result);
+    expect(reads).toEqual({ providerId: 1, protocol: 1, sessionId: 1, durationMs: 1 });
+    expect(runtime.state).toBe('OWNED');
+    await runtime.shutdown();
+  });
+
   it('retains a Factory-returned session when Runtime lifecycle inspection throws', async () => {
     const { runtime, provider } = harness();
     provider.nextSession = () => {
@@ -291,6 +352,67 @@ describe('AgentRuntime', () => {
     await runtime.shutdown();
   });
 
+  it('serves public sessionId from trusted Runtime cache without executing lower getters', async () => {
+    const { runtime, provider } = harness();
+    await runtime.start(bindingA());
+    const session = requireSession(provider);
+    const readsBeforeTelemetry = session.sessionIdReads;
+    session.onSessionIdRead = () => { throw new Error('telemetry touched lower getter'); };
+    expect(runtime.sessionId).toBe('session-1');
+    expect(runtime.sessionId).toBe('session-1');
+    expect(session.sessionIdReads).toBe(readsBeforeTelemetry);
+    expect(runtime.state).toBe('OWNED');
+    session.onSessionIdRead = undefined;
+    await runtime.shutdown();
+    expect(runtime.sessionId).toBeUndefined();
+  });
+
+  it('does not let public sessionId telemetry trigger provider shutdown side effects', async () => {
+    const { runtime, provider } = harness();
+    await runtime.start(bindingA());
+    const session = requireSession(provider);
+    let lowerGetterTriggered = false;
+    session.onSessionIdRead = () => {
+      lowerGetterTriggered = true;
+      void runtime.shutdown();
+    };
+    expect(runtime.sessionId).toBe('session-1');
+    expect(lowerGetterTriggered).toBe(false);
+    expect(runtime.state).toBe('OWNED');
+    session.onSessionIdRead = undefined;
+    await runtime.shutdown();
+  });
+
+  it('clears sessionId after release and caches the next assignment generation independently', async () => {
+    const { runtime, provider } = harness();
+    provider.nextSession = () => Object.assign(new FakeSession(), {
+      sessionId: provider.createCalls === 1 ? 'session-A' : 'session-B',
+    });
+    await runtime.start(bindingA());
+    expect(runtime.sessionId).toBe('session-A');
+    await runtime.shutdown();
+    expect(runtime.sessionId).toBeUndefined();
+    await runtime.start(bindingB());
+    expect(runtime.sessionId).toBe('session-B');
+    await runtime.shutdown();
+  });
+
+  it('refreshes trusted sessionId cache after start and turn settlement', async () => {
+    const { runtime, provider } = harness();
+    provider.nextSession = () => {
+      const session = new FakeSession();
+      session.onStart = () => { session.sessionId = 'started-session'; };
+      session.onRun = () => { session.sessionId = 'turn-session'; };
+      session.result = { ...managerResult(), sessionId: 'turn-session' };
+      return session;
+    };
+    await runtime.start(bindingA());
+    expect(runtime.sessionId).toBe('started-session');
+    await runtime.runTurn(managerRequest());
+    expect(runtime.sessionId).toBe('turn-session');
+    await runtime.shutdown();
+  });
+
   it.each([
     null,
     { outputProtocols: [], sessionContinuation: true },
@@ -325,6 +447,71 @@ describe('AgentRuntime', () => {
       expect(provider.createCalls).toBe(0);
     },
   );
+
+  it('reserves STARTING before a binding getter can attempt a nested start', async () => {
+    const { runtime, provider } = harness();
+    let nested: Promise<void> | undefined;
+    let taskIdReads = 0;
+    const binding = {
+      get taskId() {
+        taskIdReads += 1;
+        nested = runtime.start(bindingB());
+        return 'task-A';
+      },
+      assignmentId: 'assignment-A', specVersion: 'spec-A', profileHash: 'profile-A',
+    };
+    await runtime.start(binding);
+    await expect(nested).rejects.toMatchObject({ code: 'AGENT_RUNTIME_LIFECYCLE_BUSY' });
+    expect(taskIdReads).toBe(1);
+    expect(provider.createCalls).toBe(1);
+    expect(runtime.binding).toEqual(bindingA());
+    await runtime.shutdown();
+  });
+
+  it('lets binding-getter shutdown win before Factory or lower start dispatch', async () => {
+    const { runtime, provider } = harness();
+    let shutdown: Promise<void> | undefined;
+    const binding = {
+      get taskId() { shutdown = runtime.shutdown(); return 'task-A'; },
+      assignmentId: 'assignment-A', specVersion: 'spec-A', profileHash: 'profile-A',
+    };
+    await expect(runtime.start(binding)).rejects.toMatchObject({ code: 'AGENT_RUNTIME_LIFECYCLE_BUSY' });
+    await shutdown;
+    expect(provider.createCalls).toBe(0);
+    expect(runtime).toMatchObject({ state: 'IDLE', busy: false, binding: undefined });
+  });
+
+  it('reads every binding field exactly once before storing its frozen snapshot', async () => {
+    const { runtime } = harness();
+    const reads = { taskId: 0, assignmentId: 0, specVersion: 0, profileHash: 0 };
+    const first = bindingA();
+    const binding = Object.fromEntries(Object.keys(reads).map((key) => [key, undefined])) as unknown as AgentRuntimeBinding;
+    for (const key of Object.keys(reads) as (keyof typeof reads)[]) {
+      Object.defineProperty(binding, key, {
+        enumerable: true,
+        get() {
+          reads[key] += 1;
+          return reads[key] === 1 ? first[key] : '';
+        },
+      });
+    }
+    await runtime.start(binding);
+    expect(reads).toEqual({ taskId: 1, assignmentId: 1, specVersion: 1, profileHash: 1 });
+    expect(runtime.binding).toEqual(bindingA());
+    await runtime.shutdown();
+  });
+
+  it('releases STARTING when a binding getter throws before Factory construction', async () => {
+    const { runtime, provider } = harness();
+    const failure = new Error('binding getter failed');
+    const binding = {
+      get taskId(): string { throw failure; },
+      assignmentId: 'assignment-A', specVersion: 'spec-A', profileHash: 'profile-A',
+    };
+    await expect(runtime.start(binding)).rejects.toBe(failure);
+    expect(provider.createCalls).toBe(0);
+    expect(runtime).toMatchObject({ state: 'IDLE', busy: false, active: false, binding: undefined });
+  });
 
   it('snapshots binding and creates exact assignment context', async () => {
     const { runtime, provider } = harness();
@@ -493,6 +680,103 @@ describe('AgentRuntime', () => {
     await runtime.shutdown();
   });
 
+  it.each(['prompt', 'protocol', 'timeoutMs'] as const)(
+    'reserves the outer turn before the %s getter can attempt a nested turn',
+    async (triggerField) => {
+      const { runtime, provider } = harness();
+      await runtime.start(bindingA());
+      let nested: Promise<AgentProviderTurnResult> | undefined;
+      const reads = { prompt: 0, protocol: 0, timeoutMs: 0 };
+      const request = {
+        get prompt() {
+          reads.prompt += 1;
+          if (triggerField === 'prompt') nested = runtime.runTurn(managerRequest());
+          return 'outer';
+        },
+        get protocol() {
+          reads.protocol += 1;
+          if (triggerField === 'protocol') nested = runtime.runTurn(managerRequest());
+          return 'manager-directive' as const;
+        },
+        get timeoutMs() {
+          reads.timeoutMs += 1;
+          if (triggerField === 'timeoutMs') nested = runtime.runTurn(managerRequest());
+          return 1000;
+        },
+      };
+      await expect(runtime.runTurn(request)).resolves.toMatchObject({ directiveStatus: 'valid' });
+      await expect(nested).rejects.toMatchObject({ code: 'AGENT_RUNTIME_TURN_ALREADY_ACTIVE' });
+      expect(reads).toEqual({ prompt: 1, protocol: 1, timeoutMs: 1 });
+      expect(requireSession(provider).runCalls).toBe(1);
+      await runtime.shutdown();
+    },
+  );
+
+  it('passes one frozen request snapshot despite post-return caller mutation', async () => {
+    const { runtime, provider } = harness();
+    await runtime.start(bindingA());
+    const request: { prompt: string; protocol: 'manager-directive' | 'worker-result'; timeoutMs: number } = {
+      prompt: 'ORIGINAL', protocol: 'manager-directive', timeoutMs: 1000,
+    };
+    const turn = runtime.runTurn(request);
+    request.prompt = 'MUTATED';
+    request.protocol = 'worker-result';
+    request.timeoutMs = 1;
+    await turn;
+    const captured = requireSession(provider).requests[0];
+    expect(captured).toEqual({ prompt: 'ORIGINAL', protocol: 'manager-directive', timeoutMs: 1000 });
+    expect(Object.isFrozen(captured)).toBe(true);
+    await runtime.shutdown();
+  });
+
+  it('reads unstable request getters once and dispatches only their validated first values', async () => {
+    const { runtime, provider } = harness();
+    await runtime.start(bindingA());
+    const reads = { prompt: 0, protocol: 0, timeoutMs: 0 };
+    const request = {
+      get prompt() { reads.prompt += 1; return reads.prompt === 1 ? 'FIRST' : ''; },
+      get protocol() {
+        reads.protocol += 1;
+        return reads.protocol === 1 ? 'manager-directive' as const : 'worker-result' as const;
+      },
+      get timeoutMs() { reads.timeoutMs += 1; return reads.timeoutMs === 1 ? 1000 : 0; },
+    };
+    await runtime.runTurn(request);
+    expect(reads).toEqual({ prompt: 1, protocol: 1, timeoutMs: 1 });
+    expect(requireSession(provider).requests[0]).toEqual({
+      prompt: 'FIRST', protocol: 'manager-directive', timeoutMs: 1000,
+    });
+    await runtime.shutdown();
+  });
+
+  it('lets request-getter shutdown win without a post-STOPPING lower turn', async () => {
+    const { runtime, provider } = harness();
+    await runtime.start(bindingA());
+    let shutdown: Promise<void> | undefined;
+    const request = {
+      get prompt() { shutdown = runtime.shutdown(); return 'outer'; },
+      protocol: 'manager-directive' as const,
+    };
+    await expect(runtime.runTurn(request)).rejects.toMatchObject({ code: 'AGENT_RUNTIME_LIFECYCLE_BUSY' });
+    expect(requireSession(provider).runCalls).toBe(0);
+    await shutdown;
+    expect(runtime).toMatchObject({ state: 'IDLE', active: false });
+  });
+
+  it('releases the turn reservation when a request getter throws', async () => {
+    const { runtime, provider } = harness();
+    await runtime.start(bindingA());
+    const failure = new Error('request getter failed');
+    await expect(runtime.runTurn({
+      get prompt(): string { throw failure; },
+      protocol: 'manager-directive',
+    })).rejects.toBe(failure);
+    expect(runtime).toMatchObject({ state: 'OWNED', active: false });
+    expect(requireSession(provider).runCalls).toBe(0);
+    await expect(runtime.runTurn(managerRequest())).resolves.toMatchObject({ directiveStatus: 'valid' });
+    await runtime.shutdown();
+  });
+
   it('quarantines a lower session that is already active before Runtime turn dispatch', async () => {
     const { runtime, provider } = harness();
     await runtime.start(bindingA());
@@ -535,6 +819,28 @@ describe('AgentRuntime', () => {
     await expect(runtime.runTurn(workerRequest())).rejects.toMatchObject({ code: 'AGENT_PROVIDER_UNSUPPORTED_PROTOCOL' });
     expect(session.runCalls).toBe(1);
     expect(session.capabilityReads).toBe(2);
+    await runtime.shutdown();
+  });
+
+  it('reads capability object fields once while creating the Runtime-owned snapshot', async () => {
+    const { runtime, provider } = harness();
+    const reads = { outputProtocols: 0, sessionContinuation: 0 };
+    provider.nextSession = () => {
+      const session = new FakeSession();
+      session.onCapabilitiesRead = () => {
+        if (session.capabilityReads === 2) {
+          session.capabilities = {
+            get outputProtocols() { reads.outputProtocols += 1; return ['manager-directive'] as const; },
+            get sessionContinuation() { reads.sessionContinuation += 1; return true; },
+          };
+        }
+      };
+      return session;
+    };
+    await runtime.start(bindingA());
+    expect(reads).toEqual({ outputProtocols: 1, sessionContinuation: 1 });
+    await runtime.runTurn(managerRequest());
+    expect(reads).toEqual({ outputProtocols: 1, sessionContinuation: 1 });
     await runtime.shutdown();
   });
 
@@ -707,6 +1013,7 @@ describe('AgentRuntime', () => {
     ]);
     expect(outcome).toBe(failure);
     expect(runtime).toMatchObject({ state: 'FAILED', busy: true, active: true, binding: bindingA() });
+    expect(runtime.sessionId).toBe('session-1');
     gate.resolve();
     await turn;
     expect(runtime).toMatchObject({ state: 'FAILED', busy: true, active: false, binding: bindingA() });
@@ -714,6 +1021,7 @@ describe('AgentRuntime', () => {
     session.shutdownError = undefined;
     await runtime.shutdown();
     expect(runtime.state).toBe('IDLE');
+    expect(runtime.sessionId).toBeUndefined();
     expect(provider.createCalls).toBe(1);
   });
 
