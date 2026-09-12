@@ -9,6 +9,8 @@ import {
 
 import { captureWorkspaceChanges, snapshotCaptureOptions, canonicalChangeState, gitCapturePrefix,
   type CaptureWorkspaceChangesOptions, type GitWorkspaceChangeSnapshot } from './GitWorkspaceChangeCapture.js';
+import { collectBuildTestEvidence, evidencePlanKey, snapshotBuildTestEvidencePlan,
+  snapshotBuildTestEvidenceOptions, type BuildTestEvidence, type BuildTestEvidencePlan, type BuildTestEvidenceCollectorOptions } from './BuildTestEvidenceCollector.js';
 
 const excludeRule = '/.agenthub/worktrees/';
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
@@ -83,8 +85,9 @@ export interface GitWorktreeRecord {
 interface PendingOperation {
   readonly token: object;
   readonly taskId: string;
-  readonly kind: 'create' | 'remove' | 'capture';
+  readonly kind: 'create' | 'remove' | 'capture' | 'evidence';
   readonly captureKey?: string;
+  readonly evidenceKey?: string;
   readonly baseRef?: string;
   readonly promise: Promise<unknown>;
 }
@@ -244,6 +247,50 @@ export class GitWorktreeManager {
     } catch (error) {
       return Promise.reject(asError(error));
     }
+  }
+
+  public collectBuildTestEvidence(
+    taskIdValue: string, plan: BuildTestEvidencePlan,
+    options: Pick<BuildTestEvidenceCollectorOptions, 'maxOutputBytes' | 'maxPreviewBytes'> = {},
+  ): Promise<BuildTestEvidence> {
+    let taskId: string;
+    let snapshot: BuildTestEvidencePlan;
+    try {
+      taskId = validateTaskId(taskIdValue);
+      snapshot = snapshotBuildTestEvidencePlan(plan);
+    } catch (error) { return Promise.reject(asError(error)); }
+    let optionsSnapshot: Pick<BuildTestEvidenceCollectorOptions, 'maxOutputBytes' | 'maxPreviewBytes'>;
+    try {
+      optionsSnapshot = snapshotBuildTestEvidenceOptions(options);
+    } catch (error) { return Promise.reject(asError(error)); }
+    const key = operationKey(taskId);
+    const evidenceKeyValue = evidencePlanKey(snapshot, optionsSnapshot);
+    const pending = this.#coordination.operations.get(key);
+    if (pending !== undefined) {
+      if (pending.kind === 'evidence' && pending.evidenceKey === evidenceKeyValue) {
+        return pending.promise as Promise<BuildTestEvidence>;
+      }
+      return Promise.reject(operationBusy(taskId));
+    }
+    const token = {};
+    const operation = this.#collectEvidence(taskId, snapshot, optionsSnapshot);
+    const current = operation.finally(() => {
+      if (this.#coordination.operations.get(key)?.token === token) this.#coordination.operations.delete(key);
+    });
+    this.#coordination.operations.set(key, { token, taskId, kind: 'evidence', evidenceKey: evidenceKeyValue, promise: current });
+    return current;
+  }
+
+  async #collectEvidence(taskId: string, plan: BuildTestEvidencePlan,
+    options: Pick<BuildTestEvidenceCollectorOptions, 'maxOutputBytes' | 'maxPreviewBytes'>): Promise<BuildTestEvidence> {
+    const workspace = await this.#inspect(taskId, gitCapturePrefix);
+    if (workspace === undefined) throw new GitWorktreeError('GIT_WORKTREE_CONTRACT_VIOLATION', 'Task worktree does not exist', 'evidence', taskId);
+    return collectBuildTestEvidence(plan, {
+      runner: this.#runner,
+      inspect: () => this.#inspect(taskId, gitCapturePrefix),
+      worktree: workspace,
+      ...options,
+    });
   }
 
   public removeWorkspace(taskIdValue: string): Promise<void> {
