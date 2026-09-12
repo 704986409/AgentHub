@@ -179,6 +179,10 @@ export class ClaudeAutoTransport {
     return this.#active;
   }
 
+  public get requiresCleanup(): boolean {
+    return this.#state === 'FAILED';
+  }
+
   public get sessionId(): string | undefined {
     return this.#sessionId;
   }

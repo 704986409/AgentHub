@@ -39,12 +39,14 @@ interface FakeTurn {
   error?: Error;
   raw?: ClaudeRawMessage[];
   wait?: Promise<void>;
+  requiresCleanupAfterError?: boolean;
 }
 
 class FakeAuto {
   public selectedTransport: 'persistent-stream' | 'resume-per-turn' | undefined = 'persistent-stream';
   public sessionId: string | undefined;
   public active = false;
+  public requiresCleanup = false;
   public lastFallback = undefined;
   public startCalls = 0;
   public runCalls = 0;
@@ -70,7 +72,10 @@ class FakeAuto {
       const turn = this.turns.shift() ?? { result: autoResult(workerText('COMPLETED')) };
       for (const message of turn.raw ?? []) this.options.onRawMessage?.(message);
       if (turn.wait !== undefined) await turn.wait;
-      if (turn.error !== undefined) throw turn.error;
+      if (turn.error !== undefined) {
+        this.requiresCleanup = turn.requiresCleanupAfterError ?? this.requiresCleanup;
+        throw turn.error;
+      }
       const result = turn.result ?? autoResult(workerText('COMPLETED'));
       this.selectedTransport = result.transport;
       this.sessionId = result.sessionId;
@@ -83,6 +88,7 @@ class FakeAuto {
   public shutdown(): Promise<void> {
     this.shutdownCalls += 1;
     if (this.shutdownError !== undefined) return Promise.reject(this.shutdownError);
+    this.requiresCleanup = false;
     return Promise.resolve();
   }
 }
@@ -160,6 +166,7 @@ describe('Claude worker session', () => {
     const ownershipError = new ClaudeAutoError(code, 'ownership unresolved');
     const { session, fake, events } = createFakeSession();
     fake.startError = ownershipError;
+    fake.requiresCleanup = true;
 
     await expect(session.start()).rejects.toBe(ownershipError);
     expect(session.started).toBe(false);
@@ -561,6 +568,7 @@ describe('Claude worker session', () => {
     expect(fake.runCalls).toBe(1);
     expect(session.active).toBe(false);
     expect(session.started).toBe(true);
+    expect(fake.requiresCleanup).toBe(false);
     expect(events.map((event) => event.eventType).filter(isExecutionTerminal)).toEqual([
       AgentRuntimeEventType.AGENT_EXECUTION_FAILED,
     ]);
@@ -570,6 +578,117 @@ describe('Claude worker session', () => {
     await session.shutdown();
     expect(session.started).toBe(false);
     expect(session.active).toBe(false);
+  });
+
+  it('quarantines a generic TURN_FAILED when Auto reports FAILED lifecycle state', async () => {
+    const error = new ClaudeAutoError(
+      'CLAUDE_AUTO_TURN_FAILED', 'fatal generic failure', 'persistent-stream', undefined, 'ambiguous',
+    );
+    const { session, fake, events } = createFakeSession();
+    fake.turns.push({ error, requiresCleanupAfterError: true });
+    await session.start();
+
+    await expect(session.runTurn({ prompt: 'fatal' })).rejects.toBe(error);
+    expect(session.started).toBe(false);
+    expect(session.active).toBe(false);
+    expect(fake.runCalls).toBe(1);
+    expect(events.filter((event) => event.eventType === executionStartedType)).toHaveLength(1);
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runTurn({ prompt: 'blocked' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runRevision({ prompt: 'blocked' })).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    expect(fake.runCalls).toBe(1);
+
+    await session.shutdown();
+    expect(fake.requiresCleanup).toBe(false);
+    await session.start();
+    expect(session.started).toBe(true);
+    await session.shutdown();
+  });
+
+  it('commits fatal generic dirty state before failure mapping throws', async () => {
+    const transportError = new ClaudeAutoError('CLAUDE_AUTO_TURN_FAILED', 'fatal generic failure');
+    const mapperError = new Error('fatal failure mapper failed');
+    const eventBus = new EventBus();
+    eventBus.subscribe((event) => {
+      if (event.eventType === executionFailedType) throw mapperError;
+    });
+    const { session, fake } = createFakeSession({ eventBus });
+    fake.turns.push({ error: transportError, requiresCleanupAfterError: true });
+    await session.start();
+
+    await expect(session.runTurn({ prompt: 'fatal' })).rejects.toBe(mapperError);
+    expect(session.started).toBe(false);
+    await expect(session.runRevision({ prompt: 'blocked' })).rejects.toMatchObject({
+      code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED',
+    });
+    expect(fake.runCalls).toBe(1);
+    await session.shutdown();
+  });
+
+  it('preserves fatal transport semantics when raw mapping also fails and quarantines reuse', async () => {
+    const rawMapperError = new Error('fatal raw mapper failed');
+    const transportError = new ClaudeAutoError('CLAUDE_AUTO_TURN_FAILED', 'fatal generic failure');
+    const eventBus = new EventBus();
+    eventBus.subscribe((event) => {
+      if (event.eventType === providerObservedType) throw rawMapperError;
+    });
+    const { session, fake } = createFakeSession({ eventBus });
+    fake.turns.push({ raw: [rawInit()], error: transportError, requiresCleanupAfterError: true });
+    await session.start();
+
+    await expect(session.runTurn({ prompt: 'fatal' })).rejects.toBe(transportError);
+    expect(session.started).toBe(false);
+    await expect(session.runTurn({ prompt: 'blocked' })).rejects.toMatchObject({
+      code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED',
+    });
+    expect(fake.runCalls).toBe(1);
+    await session.shutdown();
+  });
+
+  it('uses actual Auto FAILED state to quarantine Session before a second execution starts', async () => {
+    const persistent = new LifecyclePersistentStub();
+    const resume = new LifecycleResumeStub();
+    const { session, events } = createLifecycleSession(persistent, resume);
+    await session.start();
+
+    await expect(session.runTurn({ prompt: 'fatal actual Auto' })).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_TURN_FAILED', retrySafety: 'ambiguous',
+    });
+    expect(session.started).toBe(false);
+    expect(persistent.prompts).toHaveLength(1);
+    const startedCount = events.filter((event) => event.eventType === executionStartedType).length;
+    await expect(session.runTurn({ prompt: 'must stay local' })).rejects.toMatchObject({
+      code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED',
+    });
+    expect(events.filter((event) => event.eventType === executionStartedType)).toHaveLength(startedCount);
+    expect(persistent.prompts).toHaveLength(1);
+    expect(resume.requests).toHaveLength(0);
+
+    await session.shutdown();
+    await session.start();
+    expect(session.started).toBe(true);
+    await session.shutdown();
+  });
+
+  it('uses actual Auto READY fallback state to permit an explicit Resume revision without replay', async () => {
+    const persistent = new LifecyclePersistentStub('session-A');
+    const resume = new LifecycleResumeStub();
+    const { session } = createLifecycleSession(persistent, resume);
+    await session.start();
+
+    await expect(session.runTurn({ prompt: 'ambiguous actual Auto' })).rejects.toMatchObject({
+      code: 'CLAUDE_AUTO_TURN_FAILED', retrySafety: 'ambiguous',
+    });
+    expect(session.started).toBe(true);
+    expect(persistent.prompts).toHaveLength(1);
+    expect(resume.requests).toHaveLength(0);
+
+    await expect(session.runRevision({ prompt: 'explicit revision' })).resolves.toMatchObject({
+      protocolValid: true, transport: 'resume-per-turn', sessionId: 'session-A',
+    });
+    expect(persistent.prompts).toHaveLength(1);
+    expect(resume.requests).toHaveLength(1);
+    await session.shutdown();
   });
 
   it.each([
@@ -582,7 +701,7 @@ describe('Claude worker session', () => {
     fake.selectedTransport = transport;
     fake.sessionId = 'session-A';
     fake.turns.push(
-      { error: ownershipError },
+      { error: ownershipError, requiresCleanupAfterError: true },
       { result: autoResult(workerText('COMPLETED'), { transport }) },
     );
     await session.start();
@@ -622,6 +741,28 @@ describe('Claude worker session', () => {
     expect(session.started).toBe(true);
   });
 
+  it('uses Auto lifecycle truth for a generic start failure', async () => {
+    const error = new ClaudeAutoError('CLAUDE_AUTO_TURN_FAILED', 'fatal start failure');
+    const { session, fake } = createFakeSession();
+    fake.startError = error;
+    fake.requiresCleanup = true;
+
+    await expect(session.start()).rejects.toBe(error);
+    expect(session.started).toBe(false);
+    await expect(session.start()).rejects.toMatchObject({ code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED' });
+    await expect(session.runTurn({ prompt: 'blocked' })).rejects.toMatchObject({
+      code: 'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED',
+    });
+    expect(fake.startCalls).toBe(1);
+    expect(fake.runCalls).toBe(0);
+
+    fake.startError = undefined;
+    await session.shutdown();
+    await session.start();
+    expect(session.started).toBe(true);
+    await session.shutdown();
+  });
+
   it('sets turn ownership dirty state before failure-event mapping can throw', async () => {
     const ownershipError = new ClaudeAutoError(
       'CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED', 'owned', 'persistent-stream', 'session-A', 'ambiguous',
@@ -632,7 +773,7 @@ describe('Claude worker session', () => {
       if (event.eventType === executionFailedType) throw mapperError;
     });
     const { session, fake } = createFakeSession({ eventBus });
-    fake.turns.push({ error: ownershipError });
+    fake.turns.push({ error: ownershipError, requiresCleanupAfterError: true });
     await session.start();
 
     await expect(session.runTurn({ prompt: 'owned turn' })).rejects.toBe(mapperError);
@@ -655,7 +796,7 @@ describe('Claude worker session', () => {
       if (event.eventType === providerObservedType) throw rawMapperError;
     });
     const { session, fake } = createFakeSession({ eventBus });
-    fake.turns.push({ raw: [rawInit()], error: ownershipError });
+    fake.turns.push({ raw: [rawInit()], error: ownershipError, requiresCleanupAfterError: true });
     await session.start();
 
     await expect(session.runTurn({ prompt: 'owned turn' })).rejects.toBe(ownershipError);
@@ -1271,6 +1412,69 @@ function report(persistentState: 'supported' | 'unsupported'): ClaudeCapabilityR
     unsupportedCapabilities: checks.filter((check) => !check.supported).map((check) => check.capability),
     checks, diagnostics: [],
   };
+}
+
+class LifecyclePersistentStub {
+  public running = false;
+  public active = false;
+  public readonly prompts: string[] = [];
+  public constructor(public lastSessionId?: string) {}
+
+  public start(): Promise<void> {
+    this.running = true;
+    return Promise.resolve();
+  }
+
+  public runTurn(request: { prompt: string }): Promise<never> {
+    this.prompts.push(request.prompt);
+    this.running = false;
+    return Promise.reject(Object.assign(new Error('persistent turn failed'), {
+      code: 'CLAUDE_PERSISTENT_TURN_TIMEOUT',
+    }));
+  }
+
+  public shutdown(): Promise<void> {
+    this.running = false;
+    return Promise.resolve();
+  }
+}
+
+class LifecycleResumeStub {
+  public running = false;
+  public active = false;
+  public readonly requests: { prompt: string; sessionId?: string }[] = [];
+
+  public runTurn(request: { prompt: string; sessionId?: string }): Promise<ClaudeAutoTurnResult> {
+    this.requests.push({ ...request });
+    return Promise.resolve(autoResult(workerText('COMPLETED'), {
+      transport: 'resume-per-turn',
+      sessionId: request.sessionId ?? 'session-A',
+    }));
+  }
+
+  public shutdown(): Promise<void> {
+    this.running = false;
+    return Promise.resolve();
+  }
+}
+
+function createLifecycleSession(
+  persistent: LifecyclePersistentStub,
+  resume: LifecycleResumeStub,
+): { session: ClaudeWorkerSession; events: DomainEvent[] } {
+  const eventBus = new EventBus();
+  const events: DomainEvent[] = [];
+  eventBus.subscribe((event) => events.push(event));
+  const session = new ClaudeWorkerSession({
+    eventBus,
+    context: { provider: 'claude' },
+    transportOptions: {
+      capabilityReport: report('supported'),
+      persistentFactory: () => persistent as unknown as ClaudePersistentStreamTransport,
+      resumeFactory: () => resume as unknown as ClaudeResumePerTurnTransport,
+    },
+  });
+  return { session, events };
 }
 
 function readOption(args: readonly string[], name: string): string | undefined {

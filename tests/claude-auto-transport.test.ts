@@ -80,6 +80,16 @@ class ResumeStub {
 }
 
 describe('Claude Auto transport', () => {
+  it('exposes cleanup readiness without exposing mutable lifecycle state', async () => {
+    const persistent = new PersistentStub();
+    const auto = createAuto(persistent, new ResumeStub());
+    expect(auto.requiresCleanup).toBe(false);
+    await auto.start();
+    expect(auto.requiresCleanup).toBe(false);
+    await auto.shutdown();
+    expect(auto.requiresCleanup).toBe(false);
+  });
+
   it.each([
     ['supported', 'persistent-stream', undefined],
     ['unsupported', 'resume-per-turn', 'PERSISTENT_CAPABILITY_UNSUPPORTED'],
@@ -221,6 +231,7 @@ describe('Claude Auto transport', () => {
     const auto = createAuto(persistent, resume);
 
     await expect(auto.start()).rejects.toMatchObject({ code: 'CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED' });
+    expect(auto.requiresCleanup).toBe(true);
     await expect(auto.shutdown()).rejects.toMatchObject({ code: 'CLAUDE_AUTO_SHUTDOWN_FAILED' });
     expect(persistent.shutdownCalls).toBe(1);
     expect(persistent.running).toBe(true);
@@ -230,6 +241,7 @@ describe('Claude Auto transport', () => {
     await auto.shutdown();
     expect(persistent.shutdownCalls).toBe(2);
     expect(persistent.running).toBe(false);
+    expect(auto.requiresCleanup).toBe(false);
   });
 
   it('enforces explicit lifecycle and can restart the selected transport after shutdown', async () => {
@@ -284,6 +296,7 @@ describe('Claude Auto transport', () => {
     await expect(auto.runTurn({ prompt: 'ambiguous prompt' })).rejects.toMatchObject({
       code: 'CLAUDE_AUTO_TURN_FAILED', retrySafety: 'ambiguous',
     });
+    expect(auto.requiresCleanup).toBe(false);
     expect(persistent.prompts).toEqual(['ambiguous prompt']);
     expect(resume.requests).toEqual([]);
     expect(auto.lastFallback).toMatchObject({ reason: 'PERSISTENT_FAILED_AFTER_DISPATCH' });
@@ -305,6 +318,7 @@ describe('Claude Auto transport', () => {
     await expect(auto.runTurn({ prompt: 'unknown session' })).rejects.toMatchObject({
       code: 'CLAUDE_AUTO_TURN_FAILED', retrySafety: 'ambiguous',
     });
+    expect(auto.requiresCleanup).toBe(true);
     expect(auto.selectedTransport).toBe('persistent-stream');
     expect(resume.requests).toEqual([]);
     await expect(auto.runTurn({ prompt: 'must not start fresh' })).rejects.toMatchObject({ code: 'CLAUDE_AUTO_NOT_STARTED' });
@@ -322,6 +336,7 @@ describe('Claude Auto transport', () => {
     await expect(auto.runTurn({ prompt: 'only once' })).rejects.toMatchObject({
       code: 'CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED', retrySafety: 'ambiguous',
     });
+    expect(auto.requiresCleanup).toBe(true);
     await expect(auto.runTurn({ prompt: 'blocked while owned' })).rejects.toMatchObject({
       code: 'CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED',
     });
@@ -362,6 +377,7 @@ describe('Claude Auto transport', () => {
       retrySafety: 'ambiguous',
       cause: { code: 'CLAUDE_TURN_TIMEOUT' },
     });
+    expect(auto.requiresCleanup).toBe(true);
     expect(resume.running).toBe(true);
     await expect(auto.runTurn({ prompt: 'blocked' })).rejects.toMatchObject({
       code: 'CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED',
@@ -379,6 +395,7 @@ describe('Claude Auto transport', () => {
     expect(calls).toHaveLength(1);
     expect(manager.running).toBe(false);
     expect(resume.running).toBe(false);
+    expect(auto.requiresCleanup).toBe(false);
   });
 
   it('treats Persistent session mismatch as terminal without current or future Resume execution', async () => {
@@ -396,6 +413,7 @@ describe('Claude Auto transport', () => {
       retrySafety: 'ambiguous',
       cause: { code: 'CLAUDE_PERSISTENT_SESSION_ID_MISMATCH' },
     });
+    expect(auto.requiresCleanup).toBe(true);
     expect(persistent.prompts).toEqual(['establish session A', 'identity mismatch X']);
     expect(resume.requests).toEqual([]);
     expect(auto.selectedTransport).toBe('persistent-stream');

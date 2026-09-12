@@ -227,10 +227,7 @@ export class ClaudeWorkerSession {
         });
       } catch (error) {
         this.#takeRawMappingError();
-        if (requiresCleanupAfterAutoFailure(error)) {
-          this.#started = false;
-          this.#cleanupRequired = true;
-        }
+        this.#promoteCleanupRequiredFromAuto();
         this.#mapper.observeExecutionFailure(error, failureObservation(error, this.#auto));
         throw error;
       }
@@ -262,7 +259,7 @@ export class ClaudeWorkerSession {
       await this.#auto.start();
     } catch (error) {
       this.#takeRawMappingError();
-      this.#cleanupRequired = requiresCleanupAfterAutoFailure(error);
+      this.#promoteCleanupRequiredFromAuto();
       throw error;
     }
 
@@ -310,19 +307,18 @@ export class ClaudeWorkerSession {
     const error = this.#takeRawMappingError();
     if (error !== undefined) throw error;
   }
+
+  #promoteCleanupRequiredFromAuto(): void {
+    if (!this.#auto.requiresCleanup) return;
+    this.#started = false;
+    this.#cleanupRequired = true;
+  }
 }
 
 function cleanupRequiredError(): ClaudeWorkerSessionError {
   return new ClaudeWorkerSessionError(
     'CLAUDE_WORKER_SESSION_CLEANUP_REQUIRED',
     'Claude worker session requires successful shutdown before it can be used',
-  );
-}
-
-function requiresCleanupAfterAutoFailure(error: unknown): boolean {
-  return error instanceof ClaudeAutoError && (
-    error.code === 'CLAUDE_AUTO_PERSISTENT_OWNERSHIP_UNRESOLVED'
-    || error.code === 'CLAUDE_AUTO_RESUME_OWNERSHIP_UNRESOLVED'
   );
 }
 
