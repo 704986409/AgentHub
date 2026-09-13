@@ -2,9 +2,10 @@ import { createHash } from 'node:crypto';
 import { access, mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, expectTypeOf, it } from 'vitest';
 
-import { TaskCommandRunner, TaskCommandRunnerError, snapshotTaskCommandEnvironment } from '../src/index.js';
+import { TaskCommandRunner, TaskCommandRunnerError } from '../src/index.js';
+import type { TaskCommandRunSpec } from '../src/index.js';
 
 const roots: string[] = [];
 
@@ -125,14 +126,16 @@ describe('TaskCommandRunner', { timeout: 20_000 }, () => {
     }
   });
 
-  it('canonicalizes environment identity, changes it with values, and exposes only a digest', () => {
-    const a = snapshotTaskCommandEnvironment([], { ALPHA: '1', BETA: '2' }, {});
-    const reordered = snapshotTaskCommandEnvironment([], { BETA: '2', ALPHA: '1' }, {});
-    const changed = snapshotTaskCommandEnvironment([], { ALPHA: 'different', BETA: '2' }, {});
+  it('owns canonical environment identity and exposes only its digest', async () => {
+    const root = await temporaryRoot('agenthub environment identity ');
+    const runner = new TaskCommandRunner({ worktreePath: root });
+    const a = await runner.run({ ...command(''), env: { ALPHA: '1', BETA: '2' } });
+    const reordered = await runner.run({ ...command(''), env: { BETA: '2', ALPHA: '1' } });
+    const changed = await runner.run({ ...command(''), env: { ALPHA: 'different', BETA: '2' } });
     expect(a.executionEnvironmentSha256).toBe(reordered.executionEnvironmentSha256);
     expect(a.executionEnvironmentSha256).not.toBe(changed.executionEnvironmentSha256);
-    const mixedCase = snapshotTaskCommandEnvironment([], { MixedCase: 'x' }, {});
-    const upperCase = snapshotTaskCommandEnvironment([], { MIXEDCASE: 'x' }, {});
+    const mixedCase = await runner.run({ ...command(''), env: { MixedCase: 'x' } });
+    const upperCase = await runner.run({ ...command(''), env: { MIXEDCASE: 'x' } });
     if (process.platform === 'win32') {
       expect(mixedCase.executionEnvironmentSha256).toBe(upperCase.executionEnvironmentSha256);
     } else {
@@ -140,7 +143,8 @@ describe('TaskCommandRunner', { timeout: 20_000 }, () => {
     }
     expect(JSON.stringify({ executionEnvironmentSha256: changed.executionEnvironmentSha256 }))
       .not.toContain('different');
-    expect(Object.isFrozen(a.environment)).toBe(true);
+    expectTypeOf<Parameters<TaskCommandRunner['run']>>()
+      .toEqualTypeOf<[spec: TaskCommandRunSpec]>();
   });
 
   it('rejects command and environment resource-bound violations including null env', async () => {
@@ -158,12 +162,18 @@ describe('TaskCommandRunner', { timeout: 20_000 }, () => {
       .rejects.toMatchObject({ code: 'INVALID_ENV' });
     await expect(runner.run({ ...command(''), env: null as unknown as Record<string, string> }))
       .rejects.toMatchObject({ code: 'INVALID_ENV' });
-    expect(() => snapshotTaskCommandEnvironment(['SAFE_VALUE'], {}, {
-      SAFE_VALUE: 'x'.repeat(1024 * 1024 + 1),
-    })).toThrow(TaskCommandRunnerError);
-    expect(() => snapshotTaskCommandEnvironment(
-      Array.from({ length: 256 }, (_, i) => `SAFE_${String(i)}`), {}, {},
-    )).not.toThrow();
+    const previous = process.env.SAFE_VALUE;
+    process.env.SAFE_VALUE = 'x'.repeat(1024 * 1024 + 1);
+    try {
+      await expect(runner.run({ ...command(''), inheritEnv: ['SAFE_VALUE'] }))
+        .rejects.toBeInstanceOf(TaskCommandRunnerError);
+    } finally {
+      if (previous === undefined) delete process.env.SAFE_VALUE;
+      else process.env.SAFE_VALUE = previous;
+    }
+    await expect(runner.run({ ...command(''),
+      inheritEnv: Array.from({ length: 256 }, (_, i) => `SAFE_${String(i)}`) }))
+      .resolves.toMatchObject({ outcome: 'passed' });
   });
 
   it('contains cwd and rejects missing, file-like, linked, absolute, parent, and shell-script cwd/executable inputs', async () => {

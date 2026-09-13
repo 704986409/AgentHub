@@ -8,9 +8,7 @@ import { captureGitEvidenceContext, type GitEvidenceContextSnapshot } from './Gi
 import {
   TaskCommandRunner,
   TaskCommandRunnerError,
-  snapshotTaskCommandEnvironment,
   type CommandStreamEvidence,
-  type TaskCommandEnvironmentSnapshot,
   type TaskCommandOutcome,
   type TaskCommandRunResult,
 } from './TaskCommandRunner.js';
@@ -93,8 +91,6 @@ export interface BuildTestEvidenceCollectorOptions {
   readonly captureContext?: (runner: GitCommandRunnerLike, workspace: TaskWorkspace) => Promise<GitEvidenceContextSnapshot>;
   /** Internal manager seam used to permanently quarantine ambiguous cleanup. */
   readonly onCleanupAmbiguity?: () => void;
-  /** Environment snapshots captured by the manager at evidence-request entry. */
-  readonly environmentSnapshots?: readonly TaskCommandEnvironmentSnapshot[];
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -162,9 +158,8 @@ export function snapshotBuildTestEvidencePlan(value: unknown): BuildTestEvidence
 export function evidencePlanKey(
   plan: BuildTestEvidencePlan,
   options: Pick<BuildTestEvidenceCollectorOptions, 'maxOutputBytes' | 'maxPreviewBytes'> = {},
-  executionEnvironmentSha256: readonly string[] = [],
 ): string {
-  return sha({ plan, options, executionEnvironmentSha256 });
+  return sha({ plan, options });
 }
 
 export function snapshotBuildTestEvidenceOptions(
@@ -191,11 +186,6 @@ export async function collectBuildTestEvidence(
 ): Promise<BuildTestEvidence> {
   const plan = snapshotBuildTestEvidencePlan(planValue);
   const optionsSnapshot = snapshotBuildTestEvidenceOptions(options);
-  const environmentSnapshots = options.environmentSnapshots ?? plan.commands.map((command) =>
-    snapshotTaskCommandEnvironment(command.inheritEnv ?? [], command.env ?? {}));
-  if (environmentSnapshots.length !== plan.commands.length) {
-    throw new BuildTestEvidenceError('INVALID_PLAN');
-  }
   const captureSource = options.captureSource ?? capture;
   const captureContext = options.captureContext ?? captureGitEvidenceContext;
   let initial: GitWorkspaceChangeSnapshot | undefined;
@@ -215,7 +205,7 @@ export async function collectBuildTestEvidence(
   const commands: CommandEvidence[] = [];
   let stopReason: 'command-failed' | 'infrastructure-failed' | 'workspace-mutated' | undefined;
   let anyCommandFailed = false;
-  for (const [commandIndex, command] of plan.commands.entries()) {
+  for (const command of plan.commands) {
     if (stopReason !== undefined) break;
     let before: GitWorkspaceChangeSnapshot | undefined;
     let beforeContext: GitEvidenceContextSnapshot;
@@ -233,8 +223,6 @@ export async function collectBuildTestEvidence(
     let run: TaskCommandRunResult | undefined;
     let cleanupFailed = false;
     try {
-      const environmentSnapshot = environmentSnapshots[commandIndex];
-      if (environmentSnapshot === undefined) throw new BuildTestEvidenceError('INVALID_PLAN');
       run = await taskRunner.run({
         executable: command.executable,
         args: command.args ?? [],
@@ -242,7 +230,7 @@ export async function collectBuildTestEvidence(
         timeoutMs: command.timeoutMs,
         inheritEnv: command.inheritEnv ?? [],
         env: command.env ?? {},
-      }, environmentSnapshot);
+      });
     } catch (error) {
       if (error instanceof TaskCommandRunnerError && error.result !== undefined) {
         run = error.result;

@@ -9,9 +9,8 @@ import {
 
 import { captureWorkspaceChanges, snapshotCaptureOptions, canonicalChangeState, gitCapturePrefix,
   type CaptureWorkspaceChangesOptions, type GitWorkspaceChangeSnapshot } from './GitWorkspaceChangeCapture.js';
-import { collectBuildTestEvidence, evidencePlanKey, snapshotBuildTestEvidencePlan,
+import { collectBuildTestEvidence, snapshotBuildTestEvidencePlan,
   snapshotBuildTestEvidenceOptions, type BuildTestEvidence, type BuildTestEvidencePlan, type BuildTestEvidenceCollectorOptions } from './BuildTestEvidenceCollector.js';
-import { snapshotTaskCommandEnvironment, type TaskCommandEnvironmentSnapshot } from './TaskCommandRunner.js';
 
 const excludeRule = '/.agenthub/worktrees/';
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
@@ -54,8 +53,6 @@ export interface GitWorktreeManagerOptions {
   readonly repositoryRoot: string;
   readonly gitExecutable?: string;
   readonly runner?: GitCommandRunnerLike;
-  /** Optional command runner dependency used by deterministic infrastructure tests. */
-  readonly taskRunner?: BuildTestEvidenceCollectorOptions['taskRunner'];
 }
 
 export interface CreateTaskWorkspaceRequest {
@@ -91,7 +88,6 @@ interface PendingOperation {
   readonly taskId: string;
   readonly kind: 'create' | 'remove' | 'capture' | 'evidence';
   readonly captureKey?: string;
-  readonly evidenceKey?: string;
   readonly baseRef?: string;
   readonly promise: Promise<unknown>;
 }
@@ -105,6 +101,7 @@ interface RepositoryCoordination {
 
 const repositoryCoordinators = new Map<string, WeakRef<RepositoryCoordination>>();
 const repositoryQuarantines = new Map<string, Set<string>>();
+const internalTaskRunners = new WeakMap<GitWorktreeManager, BuildTestEvidenceCollectorOptions['taskRunner']>();
 const coordinatorFinalizer = new FinalizationRegistry<{ key: string; ref: WeakRef<RepositoryCoordination> }>(
   ({ key, ref }) => { if (repositoryCoordinators.get(key) === ref) repositoryCoordinators.delete(key); },
 );
@@ -116,17 +113,14 @@ export class GitWorktreeManager {
   readonly #worktreesRoot: string;
   readonly #repositoryKey: string;
   readonly #coordination: RepositoryCoordination;
-  readonly #taskRunner?: BuildTestEvidenceCollectorOptions['taskRunner'];
 
-  private constructor(repositoryRoot: string, gitDir: string, runner: GitCommandRunnerLike,
-    taskRunner?: BuildTestEvidenceCollectorOptions['taskRunner']) {
+  private constructor(repositoryRoot: string, gitDir: string, runner: GitCommandRunnerLike) {
     this.#repositoryRoot = repositoryRoot;
     this.#gitDir = gitDir;
     this.#worktreesRoot = path.join(repositoryRoot, '.agenthub', 'worktrees');
     this.#repositoryKey = canonicalRepositoryKey(repositoryRoot);
     this.#runner = runner;
     this.#coordination = coordinationFor(repositoryRoot);
-    this.#taskRunner = taskRunner;
   }
 
   public static async open(options: GitWorktreeManagerOptions): Promise<GitWorktreeManager> {
@@ -136,11 +130,6 @@ export class GitWorktreeManager {
     const repositoryRootValue = options.repositoryRoot;
     const runnerValue = options.runner;
     const gitExecutableValue = options.gitExecutable;
-    const taskRunnerValue = options.taskRunner;
-    if (taskRunnerValue !== undefined &&
-      (!isRecord(taskRunnerValue) || typeof taskRunnerValue.run !== 'function')) {
-      throw new GitWorktreeError('GIT_WORKTREE_CONTRACT_VIOLATION', 'Task command runner is invalid', 'open');
-    }
     if (typeof repositoryRootValue !== 'string' || repositoryRootValue.length === 0) {
       throw new GitWorktreeError('GIT_WORKTREE_NOT_REPOSITORY', 'Repository root is invalid', 'open');
     }
@@ -194,7 +183,7 @@ export class GitWorktreeManager {
         'GIT_WORKTREE_UNSUPPORTED_REPOSITORY', 'Primary Git metadata identity is inconsistent', 'open',
       );
     }
-    const manager = new GitWorktreeManager(requestedRoot, gitDir, runner, taskRunnerValue);
+    const manager = new GitWorktreeManager(requestedRoot, gitDir, runner);
     await manager.#assertNoTrackedWorkspaceContent();
     return manager;
   }
@@ -281,39 +270,29 @@ export class GitWorktreeManager {
       snapshot = snapshotBuildTestEvidencePlan(plan);
     } catch (error) { return Promise.reject(asError(error)); }
     let optionsSnapshot: Pick<BuildTestEvidenceCollectorOptions, 'maxOutputBytes' | 'maxPreviewBytes'>;
-    let environmentSnapshots: readonly TaskCommandEnvironmentSnapshot[];
     try {
       optionsSnapshot = snapshotBuildTestEvidenceOptions(options);
-      environmentSnapshots = Object.freeze(snapshot.commands.map((command) =>
-        snapshotTaskCommandEnvironment(command.inheritEnv ?? [], command.env ?? {})));
     } catch (error) { return Promise.reject(asError(error)); }
     if (isTaskQuarantined(this.#repositoryKey, taskId)) {
       return Promise.reject(taskQuarantined(taskId));
     }
     const key = operationKey(taskId);
-    const evidenceKeyValue = evidencePlanKey(snapshot, optionsSnapshot,
-      environmentSnapshots.map((environment) => environment.executionEnvironmentSha256));
     const pending = this.#coordination.operations.get(key);
-    if (pending !== undefined) {
-      if (pending.kind === 'evidence' && pending.evidenceKey === evidenceKeyValue) {
-        return pending.promise as Promise<BuildTestEvidence>;
-      }
-      return Promise.reject(operationBusy(taskId));
-    }
+    if (pending !== undefined) return Promise.reject(operationBusy(taskId));
     const token = {};
-    const operation = this.#collectEvidence(taskId, snapshot, optionsSnapshot, environmentSnapshots);
+    const operation = this.#collectEvidence(taskId, snapshot, optionsSnapshot);
     const current = operation.finally(() => {
       if (this.#coordination.operations.get(key)?.token === token) this.#coordination.operations.delete(key);
     });
-    this.#coordination.operations.set(key, { token, taskId, kind: 'evidence', evidenceKey: evidenceKeyValue, promise: current });
+    this.#coordination.operations.set(key, { token, taskId, kind: 'evidence', promise: current });
     return current;
   }
 
   async #collectEvidence(taskId: string, plan: BuildTestEvidencePlan,
-    options: Pick<BuildTestEvidenceCollectorOptions, 'maxOutputBytes' | 'maxPreviewBytes'>,
-    environmentSnapshots: readonly TaskCommandEnvironmentSnapshot[]): Promise<BuildTestEvidence> {
+    options: Pick<BuildTestEvidenceCollectorOptions, 'maxOutputBytes' | 'maxPreviewBytes'>): Promise<BuildTestEvidence> {
     const workspace = await this.#inspect(taskId, gitCapturePrefix);
     if (workspace === undefined) throw new GitWorktreeError('GIT_WORKTREE_CONTRACT_VIOLATION', 'Task worktree does not exist', 'evidence', taskId);
+    const taskRunner = internalTaskRunners.get(this);
     return collectBuildTestEvidence(plan, {
       runner: this.#runner,
       inspect: () => this.#inspect(taskId, gitCapturePrefix),
@@ -321,8 +300,7 @@ export class GitWorktreeManager {
       onCleanupAmbiguity: () => {
         quarantineTask(this.#repositoryKey, taskId);
       },
-      environmentSnapshots,
-      ...(this.#taskRunner === undefined ? {} : { taskRunner: this.#taskRunner }),
+      ...(taskRunner === undefined ? {} : { taskRunner }),
       ...options,
     });
   }
@@ -875,19 +853,26 @@ function quarantineTask(repositoryKey: string, taskId: string): void {
   tasks.add(operationKey(taskId));
 }
 
-/** Test-only seam: models transient coordinator collection without touching durable quarantine. */
-export function releaseTransientRepositoryCoordinationForTesting(repositoryRoot: string): void {
-  repositoryCoordinators.delete(canonicalRepositoryKey(repositoryRoot));
-}
-
-/** Test-only observation seam for process-lifetime quarantine identity. */
-export function quarantineTaskForTesting(repositoryRoot: string, taskId: string): void {
-  quarantineTask(canonicalRepositoryKey(repositoryRoot), validateTaskId(taskId));
-}
-
-export function isTaskQuarantinedForTesting(repositoryRoot: string, taskId: string): boolean {
-  return isTaskQuarantined(canonicalRepositoryKey(repositoryRoot), validateTaskId(taskId));
-}
+/** Non-barrel internal authority used only by the workspace test harness. */
+export const gitWorktreeManagerInternal = Object.freeze({
+  async openWithTaskRunner(
+    options: GitWorktreeManagerOptions,
+    taskRunner: NonNullable<BuildTestEvidenceCollectorOptions['taskRunner']>,
+  ): Promise<GitWorktreeManager> {
+    const manager = await GitWorktreeManager.open(options);
+    internalTaskRunners.set(manager, taskRunner);
+    return manager;
+  },
+  releaseTransientCoordination(repositoryRoot: string): void {
+    repositoryCoordinators.delete(canonicalRepositoryKey(repositoryRoot));
+  },
+  quarantine(repositoryRoot: string, taskId: string): void {
+    quarantineTask(canonicalRepositoryKey(repositoryRoot), validateTaskId(taskId));
+  },
+  isQuarantined(repositoryRoot: string, taskId: string): boolean {
+    return isTaskQuarantined(canonicalRepositoryKey(repositoryRoot), validateTaskId(taskId));
+  },
+});
 
 function findByPath(records: readonly GitWorktreeRecord[], expectedPath: string): GitWorktreeRecord | undefined {
   return records.find((record) => samePath(path.resolve(record.worktreePath), expectedPath));

@@ -6,7 +6,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { GitCommandRunner, GitWorktreeManager, TaskCommandRunnerError,
   type BuildTestEvidencePlan, type TaskCommandRunResult } from '../src/index.js';
-import { releaseTransientRepositoryCoordinationForTesting } from '../src/workspace/GitWorktreeManager.js';
+import { openGitWorktreeManagerWithTaskRunner,
+  releaseTransientRepositoryCoordination } from '../src/workspace/internal/GitWorktreeManagerTestHarness.js';
 
 const gitRunner = new GitCommandRunner();
 const roots: string[] = [];
@@ -198,13 +199,13 @@ describe('Build/Test evidence real integration', { timeout: 60_000 }, () => {
     expect(missing.commands[0]).toMatchObject({ outcome: 'spawn-failed' });
   });
 
-  it('coordinates identical evidence across managers and blocks conflicting same-task operations', async () => {
+  it('blocks every concurrent same-task operation across managers', async () => {
     const { repo, manager } = await workspaceFixture('agenthub evidence coordination ');
     const peer = await GitWorktreeManager.open({ repositoryRoot: repo });
     const slowPlan = plan(['slow', 'test', 'setTimeout(()=>process.stdout.write("done"),400)']);
     const first = manager.collectBuildTestEvidence('TASK-A', slowPlan);
-    const joined = peer.collectBuildTestEvidence('TASK-A', slowPlan);
-    expect(joined).toBe(first);
+    await expect(peer.collectBuildTestEvidence('TASK-A', slowPlan))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_OPERATION_BUSY' });
     await expect(manager.captureWorkspaceChanges('TASK-A')).rejects.toMatchObject({ code: 'GIT_WORKTREE_OPERATION_BUSY' });
     await expect(peer.removeWorkspace('TASK-A')).rejects.toMatchObject({ code: 'GIT_WORKTREE_OPERATION_BUSY' });
     await expect(peer.collectBuildTestEvidence('TASK-A', plan(['other', 'test', 'process.exit(0)'])))
@@ -213,7 +214,7 @@ describe('Build/Test evidence real integration', { timeout: 60_000 }, () => {
     await expect(manager.captureWorkspaceChanges('TASK-A')).resolves.toMatchObject({ taskId: 'TASK-A' });
   });
 
-  it('joins the same effective environment and rejects a changed inherited environment', async () => {
+  it('blocks concurrent evidence and snapshots each sequential execution environment internally', async () => {
     const { repo, manager } = await workspaceFixture('agenthub evidence environment join ');
     const peer = await GitWorktreeManager.open({ repositoryRoot: repo });
     const previous = process.env.AGENTHUB_TEST_SAFE;
@@ -226,13 +227,11 @@ describe('Build/Test evidence real integration', { timeout: 60_000 }, () => {
         inheritEnv: ['AGENTHUB_TEST_SAFE'],
       }] };
       const first = manager.collectBuildTestEvidence('TASK-A', envPlan);
-      const joined = peer.collectBuildTestEvidence('TASK-A', envPlan);
-      expect(joined).toBe(first);
-      process.env.AGENTHUB_TEST_SAFE = valueB;
       await expect(peer.collectBuildTestEvidence('TASK-A', envPlan))
         .rejects.toMatchObject({ code: 'GIT_WORKTREE_OPERATION_BUSY' });
       const evidenceA = await first;
       expect(evidenceA.commands[0]?.stdout.preview).toBe(hash(valueA));
+      process.env.AGENTHUB_TEST_SAFE = valueB;
       const evidenceB = await peer.collectBuildTestEvidence('TASK-A', envPlan);
       expect(evidenceB.commands[0]?.stdout.preview).toBe(hash(valueB));
       expect(evidenceB.commands[0]?.executionEnvironmentSha256)
@@ -246,30 +245,13 @@ describe('Build/Test evidence real integration', { timeout: 60_000 }, () => {
     }
   });
 
-  it('includes changed default-safe PATH in evidence join identity', async () => {
-    const { repo, manager } = await workspaceFixture('agenthub evidence default environment join ');
-    const peer = await GitWorktreeManager.open({ repositoryRoot: repo });
-    const originalPath = process.env.PATH;
-    const stablePlan = plan(['default-environment', 'test', 'setTimeout(()=>process.stdout.write("done"),400)']);
-    const first = manager.collectBuildTestEvidence('TASK-A', stablePlan);
-    try {
-      process.env.PATH = `${originalPath ?? ''}${path.delimiter}agenthub-different-path`;
-      await expect(peer.collectBuildTestEvidence('TASK-A', stablePlan))
-        .rejects.toMatchObject({ code: 'GIT_WORKTREE_OPERATION_BUSY' });
-    } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
-    }
-    await expect(first).resolves.toMatchObject({ outcome: 'passed' });
-  });
-
   it('keeps cleanup quarantine durable across transient coordinator replacement and repository reopen', async () => {
     const repo = await createRepository('agenthub evidence durable quarantine ');
     const factual = factualCleanupFailure();
-    const manager = await GitWorktreeManager.open({
-      repositoryRoot: repo,
-      taskRunner: { run: () => Promise.reject(new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED', factual)) },
-    });
+    const manager = await openGitWorktreeManagerWithTaskRunner(
+      { repositoryRoot: repo },
+      { run: () => Promise.reject(new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED', factual)) },
+    );
     await manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' });
     await manager.createWorkspace({ taskId: 'TASK-B', baseRef: 'HEAD' });
     const evidence = await manager.collectBuildTestEvidence('TASK-A', plan(['cleanup', 'test', 'process.exit(0)']));
@@ -282,7 +264,7 @@ describe('Build/Test evidence real integration', { timeout: 60_000 }, () => {
       manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' }),
     ]) await expect(operation).rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
 
-    releaseTransientRepositoryCoordinationForTesting(repo);
+    releaseTransientRepositoryCoordination(repo);
     const reopened = await GitWorktreeManager.open({ repositoryRoot: repo });
     for (const operation of [
       reopened.captureWorkspaceChanges('TASK-A'),

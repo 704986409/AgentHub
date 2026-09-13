@@ -369,22 +369,18 @@ describe('GitWorktreeManager real Git integration', { timeout: 15_000 }, () => {
 
   it('snapshots manager open options exactly once', async () => {
     const repo = await createRepository('agenthub open snapshot ');
-    await expect(GitWorktreeManager.open({ repositoryRoot: repo,
-      taskRunner: null as unknown as never })).rejects.toMatchObject({ code: 'GIT_WORKTREE_CONTRACT_VIOLATION' });
     let rootReads = 0;
     let runnerReads = 0;
     let executableReads = 0;
-    let taskRunnerReads = 0;
     const options = Object.defineProperties({}, {
       repositoryRoot: { get: () => { rootReads += 1; return rootReads === 1 ? repo : 'wrong'; } },
       runner: { get: () => { runnerReads += 1; return runner; } },
       gitExecutable: { get: () => { executableReads += 1; return 'unused'; } },
-      taskRunner: { get: () => { taskRunnerReads += 1; return undefined; } },
     }) as { repositoryRoot: string; runner: GitCommandRunner; gitExecutable: string };
     const manager = await GitWorktreeManager.open(options);
     expect(manager.repositoryRoot).toBe(await realCanonical(repo));
-    expect({ rootReads, runnerReads, executableReads, taskRunnerReads })
-      .toEqual({ rootReads: 1, runnerReads: 1, executableReads: 1, taskRunnerReads: 1 });
+    expect({ rootReads, runnerReads, executableReads })
+      .toEqual({ rootReads: 1, runnerReads: 1, executableReads: 1 });
   });
 });
 

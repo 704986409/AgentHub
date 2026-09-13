@@ -33,7 +33,7 @@ export interface TaskCommandRunResult {
   readonly cleanupFailed?: boolean;
 }
 
-export interface TaskCommandEnvironmentSnapshot {
+interface TaskCommandEnvironmentSnapshot {
   readonly environment: Readonly<NodeJS.ProcessEnv>;
   readonly executionEnvironmentSha256: string;
 }
@@ -82,10 +82,7 @@ export class TaskCommandRunner {
     this.#maxPreviewBytes = boundedPositive(options.maxPreviewBytes ?? defaultMaxPreviewBytes, maxPreviewBytes);
   }
 
-  public async run(
-    spec: TaskCommandRunSpec,
-    environmentSnapshot?: TaskCommandEnvironmentSnapshot,
-  ): Promise<TaskCommandRunResult> {
+  public async run(spec: TaskCommandRunSpec): Promise<TaskCommandRunResult> {
     // Read each caller-owned field exactly once before the first await. Every
     // subsequent validation, timer, and spawn operation uses this snapshot.
     const executableValue = spec.executable;
@@ -112,8 +109,7 @@ export class TaskCommandRunner {
     }
     const inheritEnv: string[] = Array.from(inheritEnvValue as readonly string[]);
     const env = { ...envValue } as Record<string, string>;
-    const { environment, executionEnvironmentSha256 } = environmentSnapshot ??
-      snapshotTaskCommandEnvironment(inheritEnv, env);
+    const { environment, executionEnvironmentSha256 } = snapshotTaskCommandEnvironment(inheritEnv, env);
     await this.#validateCwd(cwd);
     const stdout = createAccumulator(this.#maxPreviewBytes);
     const stderr = createAccumulator(this.#maxPreviewBytes);
@@ -359,7 +355,7 @@ async function waitForSettlement(child: ChildProcess): Promise<void> {
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
-export function snapshotTaskCommandEnvironment(
+function snapshotTaskCommandEnvironment(
   inheritEnv: readonly string[],
   explicit: Readonly<Record<string, string>>,
   processEnvironment: NodeJS.ProcessEnv = { ...process.env },

@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { parseWorktreePorcelain, validateTaskId } from '../src/index.js';
-import { isTaskQuarantinedForTesting, quarantineTaskForTesting,
-  releaseTransientRepositoryCoordinationForTesting } from '../src/workspace/GitWorktreeManager.js';
+import { parseWorktreePorcelain, validateTaskId,
+  type GitWorktreeManagerOptions } from '../src/index.js';
+import * as workspaceApi from '../src/workspace/index.js';
+import { isTaskQuarantined, quarantineTask,
+  releaseTransientRepositoryCoordination } from '../src/workspace/internal/GitWorktreeManagerTestHarness.js';
 
 describe('GitWorktreeManager validation', () => {
   it.each(['TASK-123', 'task_abc', 'abc.def', 'A', 'a'.repeat(64)])('accepts safe task ID %s', (taskId) => {
@@ -21,11 +23,26 @@ describe('GitWorktreeManager process quarantine identity', () => {
   it('survives transient coordinator release and uses the canonical repository plus task key', () => {
     const repository = pathForTest('AgentHub-Quarantine-Repository');
     const alias = process.platform === 'win32' ? repository.toLocaleUpperCase('en-US') : repository;
-    quarantineTaskForTesting(repository, 'TASK-A');
-    releaseTransientRepositoryCoordinationForTesting(repository);
-    expect(isTaskQuarantinedForTesting(alias, 'TASK-A')).toBe(true);
-    expect(isTaskQuarantinedForTesting(repository, 'TASK-B')).toBe(false);
-    expect(isTaskQuarantinedForTesting(pathForTest('different-repository'), 'TASK-A')).toBe(false);
+    quarantineTask(repository, 'TASK-A');
+    releaseTransientRepositoryCoordination(repository);
+    expect(isTaskQuarantined(alias, 'TASK-A')).toBe(true);
+    expect(isTaskQuarantined(repository, 'TASK-B')).toBe(false);
+    expect(isTaskQuarantined(pathForTest('different-repository'), 'TASK-A')).toBe(false);
+  });
+});
+
+describe('GitWorktreeManager public trust boundary', () => {
+  it('does not expose internal environment or manager test seams through production barrels', () => {
+    expect(workspaceApi).not.toHaveProperty('gitWorktreeManagerInternal');
+    expect(workspaceApi).not.toHaveProperty('snapshotTaskCommandEnvironment');
+    expect(workspaceApi).not.toHaveProperty('TaskCommandEnvironmentSnapshot');
+    expect(Object.keys(workspaceApi).some((key) => /ForTesting|TestHarness/u.test(key))).toBe(false);
+    const options: GitWorktreeManagerOptions = {
+      repositoryRoot: 'unused',
+      // @ts-expect-error Production manager options cannot inject command evidence.
+      taskRunner: { run: () => Promise.resolve({}) },
+    };
+    expect(options.repositoryRoot).toBe('unused');
   });
 });
 
