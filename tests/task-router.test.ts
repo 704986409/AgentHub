@@ -169,6 +169,56 @@ describe('TaskRouter deterministic ranking and identity', () => {
     expect(reversed).toEqual(first);
   });
 
+  it('canonicalizes IDLE, BUSY, and OFFLINE as the same static route identity', () => {
+    const plans = [AgentStatus.IDLE, AgentStatus.BUSY, AgentStatus.OFFLINE]
+      .map((status) => route({ agents: [agent({ status })], providerCapabilities: [provider()] }));
+    for (const plan of plans) {
+      expect(plan.candidates).toEqual([{
+        rank: 1,
+        agentId: 'AGENT-A',
+        providerId: 'provider-a',
+        routingPriority: 1,
+        scope: 'project',
+      }]);
+      expect(plan.rejected).toEqual([]);
+      expect(plan.routePlanSha256).toBe(plans[0]?.routePlanSha256);
+    }
+  });
+
+  it('canonicalizes equivalent statically disabled representations', () => {
+    const disabledAgents = [
+      agent({ enabled: false, status: AgentStatus.IDLE }),
+      agent({ enabled: false, status: AgentStatus.BUSY }),
+      agent({ enabled: false, status: AgentStatus.DISABLED }),
+      agent({ enabled: true, status: AgentStatus.DISABLED }),
+    ];
+    const plans = disabledAgents.map((disabledAgent) => route({
+      agents: [disabledAgent],
+      providerCapabilities: [provider()],
+    }));
+    for (const plan of plans) {
+      expect(plan.candidates).toEqual([]);
+      expect(plan.rejected).toEqual([{
+        agentId: 'AGENT-A',
+        providerId: 'provider-a',
+        reasons: ['AGENT_DISABLED'],
+      }]);
+      expect(plan.routePlanSha256).toBe(plans[0]?.routePlanSha256);
+    }
+  });
+
+  it('changes route identity across the static enabled boundary', () => {
+    const enabled = route({ agents: [agent()], providerCapabilities: [provider()] });
+    for (const disabled of [
+      route({ agents: [agent({ enabled: false })], providerCapabilities: [provider()] }),
+      route({ agents: [agent({ status: AgentStatus.DISABLED })], providerCapabilities: [provider()] }),
+    ]) {
+      expect(disabled.candidates).toEqual([]);
+      expect(disabled.rejected[0]?.reasons).toEqual(['AGENT_DISABLED']);
+      expect(disabled.routePlanSha256).not.toBe(enabled.routePlanSha256);
+    }
+  });
+
   it('rejects duplicate agent and provider identities instead of deduplicating', () => {
     expectRouterError(
       () => route({ agents: [agent(), agent()], providerCapabilities: [provider()] }),
@@ -206,6 +256,20 @@ describe('TaskRouter snapshot, digest, validation, and immutability', () => {
       .not.toBe(first.routePlanSha256);
     expect(router.route({ ...base, providerCapabilities: [provider('provider-a', ['worker-result'])] }).routePlanSha256)
       .not.toBe(first.routePlanSha256);
+  });
+
+  it.each([
+    ['provider', agent({ provider: 'provider-b' }), [provider('provider-a'), provider('provider-b')]],
+    ['projectId', agent({ projectId: null }), [provider()]],
+    ['authority', agent({ authority: AgentAuthority.ADMIN }), [provider()]],
+    ['allowedComplexities', agent({ allowedComplexities: [TaskComplexity.COMPLEX] }), [provider()]],
+    ['allowedRiskLevels', agent({ allowedRiskLevels: [TaskRisk.HIGH] }), [provider()]],
+    ['capabilities', agent({ capabilities: ['coding'] }), [provider()]],
+    ['specialties', agent({ specialties: ['typescript'] }), [provider()]],
+  ] as const)('binds the static agent %s field into route identity', (_field, changedAgent, providers) => {
+    const baseline = route({ agents: [agent()], providerCapabilities: providers });
+    const changed = route({ agents: [changedAgent], providerCapabilities: providers });
+    expect(changed.routePlanSha256).not.toBe(baseline.routePlanSha256);
   });
 
   it('detaches caller collections, leaves inputs untouched, and deeply freezes the plan', () => {

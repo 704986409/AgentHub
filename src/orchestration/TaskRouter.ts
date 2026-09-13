@@ -118,6 +118,38 @@ interface RequestSnapshot {
   readonly requirements: RequirementsSnapshot;
 }
 
+interface CanonicalTaskRouteIdentity {
+  readonly id: string;
+  readonly projectId: string;
+  readonly complexity: TaskComplexity;
+  readonly risk: TaskRisk;
+  readonly requiredCapabilities: readonly string[];
+  readonly requiredSpecialties: readonly string[];
+}
+
+interface CanonicalStaticAgentRouteIdentity {
+  readonly id: string;
+  readonly projectId: string | null;
+  readonly provider: string;
+  readonly staticallyEnabled: boolean;
+  readonly allowedComplexities: readonly TaskComplexity[];
+  readonly allowedRiskLevels: readonly TaskRisk[];
+  readonly capabilities: readonly string[];
+  readonly specialties: readonly string[];
+  readonly authority: AgentAuthority;
+  readonly routingPriority: number;
+}
+
+interface CanonicalProviderRouteIdentity {
+  readonly providerId: string;
+  readonly outputProtocols: readonly AgentOutputProtocol[];
+}
+
+interface CanonicalRoutingRequirements {
+  readonly minimumAuthority: AgentAuthority | null;
+  readonly requiredOutputProtocols: readonly AgentOutputProtocol[];
+}
+
 const authorityRank: Readonly<Record<AgentAuthority, number>> = Object.freeze({
   [AgentAuthority.READ_ONLY]: 0,
   [AgentAuthority.STANDARD]: 1,
@@ -160,10 +192,14 @@ export class TaskRouter {
     const candidates = eligible.map((candidate, index) => ({ rank: index + 1, ...candidate }));
     const digestInput = {
       version: 1,
-      task: snapshot.task,
-      requirements: snapshot.requirements,
-      providers: [...snapshot.providers].sort((left, right) => compare(left.providerId, right.providerId)),
-      agents: [...snapshot.agents].sort((left, right) => compare(left.id, right.id)),
+      task: canonicalTaskRouteIdentity(snapshot.task),
+      requirements: canonicalRoutingRequirements(snapshot.requirements),
+      providers: snapshot.providers
+        .map(canonicalProviderRouteIdentity)
+        .sort((left, right) => compare(left.providerId, right.providerId)),
+      agents: snapshot.agents
+        .map(canonicalAgentRouteIdentity)
+        .sort((left, right) => compare(left.id, right.id)),
       candidates,
       rejected,
     };
@@ -275,6 +311,46 @@ function snapshotRequirements(value: unknown): RequirementsSnapshot {
     minimumAuthority,
     requiredOutputProtocols,
   });
+}
+
+function canonicalTaskRouteIdentity(task: TaskRoutingSnapshot): CanonicalTaskRouteIdentity {
+  return {
+    id: task.id,
+    projectId: task.projectId,
+    complexity: task.complexity,
+    risk: task.risk,
+    requiredCapabilities: task.requiredCapabilities,
+    requiredSpecialties: task.requiredSpecialties,
+  };
+}
+
+function canonicalAgentRouteIdentity(agent: AgentRoutingSnapshot): CanonicalStaticAgentRouteIdentity {
+  return {
+    id: agent.id,
+    projectId: agent.projectId,
+    provider: agent.provider,
+    staticallyEnabled: agent.enabled && agent.status !== AgentStatus.DISABLED,
+    allowedComplexities: agent.allowedComplexities,
+    allowedRiskLevels: agent.allowedRiskLevels,
+    capabilities: agent.capabilities,
+    specialties: agent.specialties,
+    authority: agent.authority,
+    routingPriority: agent.routingPriority,
+  };
+}
+
+function canonicalProviderRouteIdentity(provider: ProviderRoutingSnapshot): CanonicalProviderRouteIdentity {
+  return {
+    providerId: provider.providerId,
+    outputProtocols: provider.outputProtocols,
+  };
+}
+
+function canonicalRoutingRequirements(requirements: RequirementsSnapshot): CanonicalRoutingRequirements {
+  return {
+    minimumAuthority: requirements.minimumAuthority,
+    requiredOutputProtocols: requirements.requiredOutputProtocols,
+  };
 }
 
 function rejectReasons(
