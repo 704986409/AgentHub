@@ -17,4 +17,8 @@ export type { CaptureWorkspaceChangesOptions, GitChangeCaptureErrorCode, GitWork
 export { ReviewEvidenceError, createReviewEvidence } from './ReviewEvidence.js';
 export type { ReviewVerdict, ReviewFindingSeverity, ReviewFindingInput, ReviewDecisionInput,
   ReviewFinding, ReviewEvidence } from './ReviewEvidence.js';
+export { snapshotMergeGateDecision } from './MergeGate.js';
 export type { MergeGatePolicy, MergeGateReason, MergeGateDecision } from './MergeGate.js';
+
+export { GitMergeError } from './GitMergeIntegration.js';
+export type { GitMergeErrorCode, MergeTaskRequest, TaskMergeOutcome, TaskMergeResult } from './GitMergeIntegration.js';

@@ -15,6 +15,8 @@ import { captureGitEvidenceContext } from './GitEvidenceContext.js';
 import { evaluateMergeGateSnapshot, snapshotMergeGateInputs, type MergeGateDecision, type MergeGatePolicy,
   type MergeGateInputSnapshot } from './MergeGate.js';
 import type { ReviewEvidence } from './ReviewEvidence.js';
+import { GitMergeError, performEvidenceGatedMerge, snapshotMergeTaskRequest,
+  type GitMergeHooks, type MergeTaskRequest, type TaskMergeResult } from './GitMergeIntegration.js';
 
 const excludeRule = '/.agenthub/worktrees/';
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
@@ -90,7 +92,7 @@ export interface GitWorktreeRecord {
 interface PendingOperation {
   readonly token: object;
   readonly taskId: string;
-  readonly kind: 'create' | 'remove' | 'capture' | 'evidence' | 'merge-gate';
+  readonly kind: 'create' | 'remove' | 'capture' | 'evidence' | 'merge-gate' | 'merge';
   readonly captureKey?: string;
   readonly baseRef?: string;
   readonly promise: Promise<unknown>;
@@ -101,11 +103,14 @@ type VerifiedWorkspace = Omit<TaskWorkspace, 'baseCommit'>;
 interface RepositoryCoordination {
   readonly operations: Map<string, PendingOperation>;
   excludePromise?: Promise<void>;
+  merge?: Readonly<{ token: object; taskId: string; promise: Promise<TaskMergeResult> }>;
 }
 
 const repositoryCoordinators = new Map<string, WeakRef<RepositoryCoordination>>();
 const repositoryQuarantines = new Map<string, Set<string>>();
+const mergeRepositoryQuarantines = new Set<string>();
 const internalTaskRunners = new WeakMap<GitWorktreeManager, BuildTestEvidenceCollectorOptions['taskRunner']>();
+const internalMergeHooks = new WeakMap<GitWorktreeManager, GitMergeHooks>();
 const coordinatorFinalizer = new FinalizationRegistry<{ key: string; ref: WeakRef<RepositoryCoordination> }>(
   ({ key, ref }) => { if (repositoryCoordinators.get(key) === ref) repositoryCoordinators.delete(key); },
 );
@@ -355,6 +360,51 @@ export class GitWorktreeManager {
     );
     const context = await captureGitEvidenceContext(this.#runner, workspace);
     return evaluateMergeGateSnapshot(taskId, current, context, input);
+  }
+
+  public mergeTaskWorkspace(requestValue: MergeTaskRequest): Promise<TaskMergeResult> {
+    let request;
+    try { request = snapshotMergeTaskRequest(requestValue, validateTaskId); }
+    catch (error) { return Promise.reject(asError(error)); }
+    const { taskId } = request;
+    if (isTaskQuarantined(this.#repositoryKey, taskId)) return Promise.reject(taskQuarantined(taskId));
+    if (mergeRepositoryQuarantines.has(this.#repositoryKey)) {
+      return Promise.reject(new GitMergeError('GIT_MERGE_REPOSITORY_QUARANTINED', taskId));
+    }
+    const key = operationKey(taskId);
+    if (this.#coordination.operations.get(key) !== undefined) return Promise.reject(operationBusy(taskId));
+    if (this.#coordination.merge !== undefined) {
+      return Promise.reject(new GitMergeError('GIT_MERGE_REPOSITORY_BUSY', taskId));
+    }
+    const token = {};
+    const operation = performEvidenceGatedMerge(this.#runner, this.#repositoryRoot, request, {
+      inspectTask: () => this.#inspect(taskId, gitCapturePrefix),
+      captureSource: (workspace) => this.#captureTrusted(taskId, workspace),
+      captureContext: (workspace) => captureGitEvidenceContext(this.#runner, workspace),
+      readBaseMarker: () => this.#requireBaseMarker(taskId, gitCapturePrefix),
+      quarantineRepository: () => { mergeRepositoryQuarantines.add(this.#repositoryKey); },
+    }, internalMergeHooks.get(this));
+    const current = operation.finally(() => {
+      if (this.#coordination.operations.get(key)?.token === token) this.#coordination.operations.delete(key);
+      if (this.#coordination.merge?.token === token) delete this.#coordination.merge;
+    });
+    this.#coordination.operations.set(key, { token, taskId, kind: 'merge', promise: current });
+    this.#coordination.merge = { token, taskId, promise: current };
+    return current;
+  }
+
+  async #captureTrusted(taskId: string, workspace?: TaskWorkspace): Promise<GitWorkspaceChangeSnapshot> {
+    const verified = workspace ?? await this.#inspect(taskId, gitCapturePrefix);
+    if (verified === undefined) {
+      throw new GitMergeError('GIT_MERGE_SOURCE_UNSTABLE', taskId);
+    }
+    return captureWorkspaceChanges(this.#runner, () => this.#inspect(taskId, gitCapturePrefix), {
+      includePatchText: false,
+      maxPatchBytes: 1,
+      maxChangedPaths: 4096,
+      maxFingerprintBytes: 64 * 1024 * 1024,
+      maxIgnoredPaths: 4096,
+    });
   }
 
   public removeWorkspace(taskIdValue: string): Promise<void> {
@@ -923,6 +973,12 @@ export const gitWorktreeManagerInternal = Object.freeze({
   },
   isQuarantined(repositoryRoot: string, taskId: string): boolean {
     return isTaskQuarantined(canonicalRepositoryKey(repositoryRoot), validateTaskId(taskId));
+  },
+  setMergeHooks(manager: GitWorktreeManager, hooks: GitMergeHooks | undefined): void {
+    if (hooks === undefined) internalMergeHooks.delete(manager); else internalMergeHooks.set(manager, hooks);
+  },
+  isMergeQuarantined(repositoryRoot: string): boolean {
+    return mergeRepositoryQuarantines.has(canonicalRepositoryKey(repositoryRoot));
   },
 });
 
