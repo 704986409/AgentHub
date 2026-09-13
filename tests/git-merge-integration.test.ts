@@ -5,8 +5,8 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { createReviewEvidence, GitWorktreeManager, snapshotMergeGateDecision,
-  type BuildTestEvidencePlan } from '../src/index.js';
+import { createReviewEvidence, GitCommandRunner, GitWorktreeManager, snapshotMergeGateDecision,
+  type BuildTestEvidencePlan, type GitCommandRunnerLike } from '../src/index.js';
 import { setMergeHooks } from '../src/workspace/internal/GitWorktreeManagerTestHarness.js';
 
 const execFileAsync = promisify(execFile);
@@ -131,6 +131,37 @@ describe('Git merge integration value contracts', { timeout: 180_000 }, () => {
     expect(await git(fixture.repo, ['status', '--porcelain=v1', '--untracked-files=all'])).toBe('');
   });
 
+  it('blocks mergeOptions introduced after preflight and before the final semantics check', async () => {
+    const fixture = await readyFixture('agenthub merge options race ');
+    const gate = await fixture.manager.evaluateMergeGate('TASK-A', fixture.evidence, fixture.review);
+    const targetBefore = (await git(fixture.repo, ['rev-parse', 'HEAD'])).trim();
+    setMergeHooks(fixture.manager, {
+      afterPreflight: async () => { await git(fixture.repo, ['config', 'branch.main.mergeOptions', '-s ours']); },
+    });
+    await expect(fixture.manager.mergeTaskWorkspace({ taskId: 'TASK-A', targetBranch: 'main',
+      buildEvidence: fixture.evidence, reviewEvidence: fixture.review, gateDecision: gate })).rejects
+      .toMatchObject({ code: 'GIT_MERGE_UNSAFE_GIT_EXTENSION' });
+    expect((await git(fixture.repo, ['rev-parse', 'HEAD'])).trim()).toBe(targetBefore);
+    expect(await git(fixture.repo, ['status', '--porcelain=v1', '--untracked-files=all'])).toBe('');
+  });
+
+  it('rejects a malformed merge-tree result without mutating primary', async () => {
+    const realRunner = new GitCommandRunner();
+    const malformedRunner: GitCommandRunnerLike = {
+      run: async (args, options) => {
+        const result = await realRunner.run(args, options);
+        return args.includes('merge-tree') ? { ...result, stdout: 'not-an-object-id\n' } : result;
+      },
+    };
+    const fixture = await readyFixture('agenthub merge malformed tree ', malformedRunner);
+    const gate = await fixture.manager.evaluateMergeGate('TASK-A', fixture.evidence, fixture.review);
+    const targetBefore = (await git(fixture.repo, ['rev-parse', 'HEAD'])).trim();
+    await expect(fixture.manager.mergeTaskWorkspace({ taskId: 'TASK-A', targetBranch: 'main',
+      buildEvidence: fixture.evidence, reviewEvidence: fixture.review, gateDecision: gate })).rejects
+      .toMatchObject({ code: 'GIT_MERGE_UNSUPPORTED' });
+    expect((await git(fixture.repo, ['rev-parse', 'HEAD'])).trim()).toBe(targetBefore);
+  });
+
   it('aborts an actual failed merge and releases merge authority after verified cleanup', async () => {
     const fixture = await readyFixture('agenthub merge cleanup ');
     const gate = await fixture.manager.evaluateMergeGate('TASK-A', fixture.evidence, fixture.review);
@@ -177,6 +208,24 @@ describe('Git merge integration value contracts', { timeout: 180_000 }, () => {
       .toMatchObject({ code: 'GIT_MERGE_REPOSITORY_QUARANTINED' });
   });
 
+  it('quarantines a clean merge commit whose tree differs from the trusted preflight tree', async () => {
+    const fixture = await readyFixture('agenthub merge semantic mismatch ');
+    const gate = await fixture.manager.evaluateMergeGate('TASK-A', fixture.evidence, fixture.review);
+    setMergeHooks(fixture.manager, {
+      afterMerge: async () => {
+        await git(fixture.repo, ['rm', 'task.txt']);
+        await git(fixture.repo, ['commit', '--amend', '--no-edit']);
+      },
+    });
+    const request = { taskId: 'TASK-A', targetBranch: 'main', buildEvidence: fixture.evidence,
+      reviewEvidence: fixture.review, gateDecision: gate };
+    await expect(fixture.manager.mergeTaskWorkspace(request)).rejects
+      .toMatchObject({ code: 'GIT_MERGE_CLEANUP_FAILED' });
+    expect(await git(fixture.repo, ['status', '--porcelain=v1'])).toBe('');
+    await expect(fixture.manager.mergeTaskWorkspace(request)).rejects
+      .toMatchObject({ code: 'GIT_MERGE_REPOSITORY_QUARANTINED' });
+  });
+
   it('returns a deterministic immutable result and an idempotent retry', async () => {
     const fixture = await readyFixture('agenthub merge result ');
     const gate = await fixture.manager.evaluateMergeGate('TASK-A', fixture.evidence, fixture.review);
@@ -191,8 +240,10 @@ describe('Git merge integration value contracts', { timeout: 180_000 }, () => {
   });
 });
 
-async function readyFixture(prefix: string) {
-  const repo = await createRepo(prefix); const manager = await GitWorktreeManager.open({ repositoryRoot: repo });
+async function readyFixture(prefix: string, runner?: GitCommandRunnerLike) {
+  const repo = await createRepo(prefix); const manager = await GitWorktreeManager.open({
+    repositoryRoot: repo, ...(runner === undefined ? {} : { runner }),
+  });
   const workspace = await manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' });
   await writeFile(path.join(workspace.worktreePath, 'task.txt'), 'task\n');
   await git(workspace.worktreePath, ['add', 'task.txt']); await git(workspace.worktreePath, ['commit', '-m', 'task']);

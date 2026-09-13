@@ -79,6 +79,9 @@ export interface GitMergeHooks {
   readonly afterMerge?: () => Promise<void> | void;
   readonly afterMergeFailure?: () => Promise<void> | void;
 }
+interface MergePreflightResult {
+  readonly expectedTree: string;
+}
 
 function mergeGitPrefix(repositoryRoot: string): readonly string[] {
   // A unique absolute nonexistent path inside Git's private directory cannot become tracked
@@ -122,12 +125,13 @@ export async function performEvidenceGatedMerge(
 ): Promise<TaskMergeResult> {
   const taskId = request.taskId;
   await requireValidTarget(runner, repositoryRoot, request.targetBranch, taskId);
+  await requireNoTargetMergeOptions(runner, repositoryRoot, request.targetBranch, taskId);
   const initial = await requireStableTaskView(request, callbacks, hooks);
   const freshGate = evaluateMergeGateSnapshot(taskId, initial.source, initial.context, request.input);
   requireMatchingGate(request.suppliedGate, freshGate, taskId);
   await requirePrimaryBranch(runner, repositoryRoot, request.targetBranch, taskId);
   await requirePrimaryClean(runner, repositoryRoot, taskId);
-  await requireSafeGitExtensions(runner, repositoryRoot, taskId);
+  await requireSafeGitExtensions(runner, repositoryRoot, request.targetBranch, taskId);
   const targetHeadBefore = await revParse(runner, repositoryRoot, 'HEAD', taskId);
   const taskHead = initial.workspace.headCommit;
   if (await isAncestor(runner, repositoryRoot, taskHead, targetHeadBefore, taskId)) {
@@ -135,9 +139,11 @@ export async function performEvidenceGatedMerge(
     return mergeResult(request, targetHeadBefore, targetHeadBefore, 'already-merged');
   }
   await requireNoIgnoredCollision(runner, repositoryRoot, targetHeadBefore, taskHead, taskId);
-  await requireConflictFree(runner, repositoryRoot, targetHeadBefore, taskHead, taskId);
+  const preflight = await requireConflictFree(runner, repositoryRoot, targetHeadBefore, taskHead, taskId);
   await hooks.afterPreflight?.();
-  await requireImmediatePreMutationState(runner, repositoryRoot, request, callbacks, initial, targetHeadBefore);
+  await requireImmediatePreMutationState(
+    runner, repositoryRoot, request, callbacks, initial, targetHeadBefore, taskHead,
+  );
   let mergeStarted = false;
   try {
     await hooks.beforeMerge?.();
@@ -158,7 +164,7 @@ export async function performEvidenceGatedMerge(
   try {
     await hooks.afterMerge?.();
     const targetHeadAfter = await verifyPostconditions(
-      runner, repositoryRoot, request, callbacks, initial, targetHeadBefore, taskHead,
+      runner, repositoryRoot, request, callbacks, initial, targetHeadBefore, taskHead, preflight.expectedTree,
     );
     return mergeResult(request, targetHeadBefore, targetHeadAfter, 'merged');
   } catch {
@@ -197,13 +203,16 @@ function requireMatchingGate(supplied: MergeGateDecision, fresh: MergeGateDecisi
 }
 async function requireImmediatePreMutationState(
   runner: GitCommandRunnerLike, repositoryRoot: string, request: MergeRequestSnapshot,
-  callbacks: GitMergeCallbacks, initial: Awaited<ReturnType<typeof requireStableTaskView>>, targetHeadBefore: string,
+  callbacks: GitMergeCallbacks, initial: Awaited<ReturnType<typeof requireStableTaskView>>,
+  targetHeadBefore: string, taskHead: string,
 ): Promise<void> {
   await requirePrimaryBranch(runner, repositoryRoot, request.targetBranch, request.taskId);
   await requirePrimaryClean(runner, repositoryRoot, request.taskId);
   if (await revParse(runner, repositoryRoot, 'HEAD', request.taskId) !== targetHeadBefore) {
     throw new GitMergeError('GIT_MERGE_STALE_GATE', request.taskId);
   }
+  await requireSafeGitExtensions(runner, repositoryRoot, request.targetBranch, request.taskId);
+  await requireSafeSelectedAttributes(runner, repositoryRoot, targetHeadBefore, taskHead, request.taskId);
   await requireTaskIdentity(callbacks, initial.workspace, initial.source, initial.context, request.taskId);
 }
 async function requireTaskIdentity(
@@ -235,7 +244,10 @@ async function requirePrimaryClean(runner: GitCommandRunnerLike, root: string, t
   const result = await run(runner, [...gitCapturePrefix, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], root);
   if (result.stdout.length > 0) throw new GitMergeError('GIT_MERGE_PRIMARY_DIRTY', taskId);
 }
-async function requireSafeGitExtensions(runner: GitCommandRunnerLike, root: string, taskId: string): Promise<void> {
+async function requireSafeGitExtensions(
+  runner: GitCommandRunnerLike, root: string, targetBranch: string, taskId: string,
+): Promise<void> {
+  await requireNoTargetMergeOptions(runner, root, targetBranch, taskId);
   const mergeDrivers = await configuredExtensions(runner, root, '^merge\\..*\\.driver$', taskId);
   if (mergeDrivers.length > 0) throw new GitMergeError('GIT_MERGE_UNSAFE_GIT_EXTENSION', taskId);
 
@@ -245,6 +257,14 @@ async function requireSafeGitExtensions(runner: GitCommandRunnerLike, root: stri
   if (filters.some(({ scope }) => scope === 'local' || scope === 'worktree')) {
     throw new GitMergeError('GIT_MERGE_UNSAFE_GIT_EXTENSION', taskId);
   }
+}
+async function requireNoTargetMergeOptions(
+  runner: GitCommandRunnerLike, root: string, targetBranch: string, taskId: string,
+): Promise<void> {
+  const mergeOptions = await run(runner,
+    [...gitCapturePrefix, 'config', '--null', '--show-scope', '--get-all', `branch.${targetBranch}.mergeOptions`],
+    root, [0, 1]);
+  if (mergeOptions.exitCode === 0) throw new GitMergeError('GIT_MERGE_UNSAFE_GIT_EXTENSION', taskId);
 }
 async function configuredExtensions(
   runner: GitCommandRunnerLike, root: string, pattern: string, taskId: string,
@@ -277,30 +297,43 @@ async function requireNoIgnoredCollision(
 }
 async function requireConflictFree(
   runner: GitCommandRunnerLike, root: string, targetHead: string, taskHead: string, taskId: string,
+): Promise<MergePreflightResult> {
+  await requireSafeSelectedAttributes(runner, root, targetHead, taskHead, taskId);
+  const result = await run(runner, [...mergeGitPrefix(root), 'merge-tree', '--write-tree', targetHead, taskHead], root, [0, 1]);
+  if (result.exitCode === 1) throw new GitMergeError('GIT_MERGE_CONFLICT', taskId);
+  if (result.exitCode !== 0) throw new GitMergeError('GIT_MERGE_UNSUPPORTED', taskId);
+  const expectedTree = result.stdout.trim();
+  if (!isObjectId(expectedTree)) throw new GitMergeError('GIT_MERGE_UNSUPPORTED', taskId);
+  return Object.freeze({ expectedTree });
+}
+async function requireSafeSelectedAttributes(
+  runner: GitCommandRunnerLike, root: string, targetHead: string, taskHead: string, taskId: string,
 ): Promise<void> {
   const changed = await run(runner, [...gitCapturePrefix, 'diff', '--name-only', '-z', targetHead, taskHead, '--'], root);
   const paths = nulList(changed.stdout);
   if (paths.length > 0) {
-    // Audit the live worktree plus both input trees. The source-side check closes the case
-    // where the task itself introduces .gitattributes selecting an inherited executable filter.
-    await requireNoSelectedFilter(runner, root, paths, taskId);
-    await requireNoSelectedFilter(runner, root, paths, taskId, targetHead);
-    await requireNoSelectedFilter(runner, root, paths, taskId, taskHead);
+    // Audit the live worktree plus both immutable input trees. Named merge attributes
+    // could become executable after a late merge.<name>.driver configuration change.
+    await requireSafeAttributesInView(runner, root, paths, taskId);
+    await requireSafeAttributesInView(runner, root, paths, taskId, targetHead);
+    await requireSafeAttributesInView(runner, root, paths, taskId, taskHead);
   }
-  const result = await run(runner, [...mergeGitPrefix(root), 'merge-tree', '--write-tree', '--quiet', targetHead, taskHead], root, [0, 1]);
-  if (result.exitCode === 1) throw new GitMergeError('GIT_MERGE_CONFLICT', taskId);
-  if (result.exitCode !== 0) throw new GitMergeError('GIT_MERGE_UNSUPPORTED', taskId);
 }
-async function requireNoSelectedFilter(
+async function requireSafeAttributesInView(
   runner: GitCommandRunnerLike, root: string, paths: readonly string[], taskId: string, source?: string,
 ): Promise<void> {
   const attributes = await run(runner,
-    [...gitCapturePrefix, 'check-attr', '-z', ...(source === undefined ? [] : ['--source', source]), 'filter', '--', ...paths], root);
+    [...gitCapturePrefix, 'check-attr', '-z', ...(source === undefined ? [] : ['--source', source]),
+      'filter', 'merge', '--', ...paths], root);
   const fields = nulList(attributes.stdout);
   if (fields.length % 3 !== 0) throw new GitMergeError('GIT_MERGE_CONTRACT_VIOLATION', taskId);
   for (let index = 0; index < fields.length; index += 3) {
+    const attribute = fields[index + 1];
     const value = fields[index + 2];
-    if (value !== undefined && value !== 'unspecified' && value !== 'unset') {
+    const safe = attribute === 'merge'
+      ? value === 'unspecified' || value === 'set' || value === 'unset'
+      : attribute === 'filter' && (value === 'unspecified' || value === 'unset');
+    if (!safe) {
       throw new GitMergeError('GIT_MERGE_UNSAFE_GIT_EXTENSION', taskId);
     }
   }
@@ -319,6 +352,7 @@ async function cleanupFailedMerge(
 async function verifyPostconditions(
   runner: GitCommandRunnerLike, root: string, request: MergeRequestSnapshot, callbacks: GitMergeCallbacks,
   initial: Awaited<ReturnType<typeof requireStableTaskView>>, targetBefore: string, taskHead: string,
+  expectedTree: string,
 ): Promise<string> {
   await requirePrimaryBranch(runner, root, request.targetBranch, request.taskId);
   await requirePrimaryClean(runner, root, request.taskId);
@@ -327,6 +361,9 @@ async function verifyPostconditions(
     !await isAncestor(runner, root, taskHead, targetAfter, request.taskId)) throw new GitMergeError('GIT_MERGE_CONTRACT_VIOLATION', request.taskId);
   const parents = (await run(runner, [...gitCapturePrefix, 'rev-list', '--parents', '-n', '1', targetAfter], root)).stdout.trim().split(/\s+/u);
   if (parents.length !== 3 || parents[1] !== targetBefore || parents[2] !== taskHead) {
+    throw new GitMergeError('GIT_MERGE_CONTRACT_VIOLATION', request.taskId);
+  }
+  if (await revParseTree(runner, root, targetAfter, request.taskId) !== expectedTree) {
     throw new GitMergeError('GIT_MERGE_CONTRACT_VIOLATION', request.taskId);
   }
   const taskBranch = await revParse(runner, root, `refs/heads/${initial.workspace.branchName}`, request.taskId);
@@ -354,9 +391,16 @@ function mergeResult(request: MergeRequestSnapshot, targetBefore: string, target
 async function revParse(runner: GitCommandRunnerLike, root: string, ref: string, taskId: string): Promise<string> {
   const result = await run(runner, [...gitCapturePrefix, 'rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], root);
   const value = result.stdout.trim();
-  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(value)) throw new GitMergeError('GIT_MERGE_CONTRACT_VIOLATION', taskId);
+  if (!isObjectId(value)) throw new GitMergeError('GIT_MERGE_CONTRACT_VIOLATION', taskId);
   return value;
 }
+async function revParseTree(runner: GitCommandRunnerLike, root: string, ref: string, taskId: string): Promise<string> {
+  const result = await run(runner, [...gitCapturePrefix, 'rev-parse', '--verify', '--end-of-options', `${ref}^{tree}`], root);
+  const value = result.stdout.trim();
+  if (!isObjectId(value)) throw new GitMergeError('GIT_MERGE_CONTRACT_VIOLATION', taskId);
+  return value;
+}
+function isObjectId(value: string): boolean { return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(value); }
 async function isAncestor(runner: GitCommandRunnerLike, root: string, ancestor: string, descendant: string, taskId: string): Promise<boolean> {
   const result = await run(runner, [...gitCapturePrefix, 'merge-base', '--is-ancestor', ancestor, descendant], root, [0, 1]);
   if (result.exitCode !== 0 && result.exitCode !== 1) throw new GitMergeError('GIT_MERGE_CONTRACT_VIOLATION', taskId);

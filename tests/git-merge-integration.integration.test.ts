@@ -18,6 +18,8 @@ describe('Git merge real integration and V0.5 acceptance', { timeout: 120_000 },
     await writeFile(hook, `#!/bin/sh\necho bad > "${sentinel.replaceAll('\\', '/')}"\n`, 'utf8');
     if (process.platform !== 'win32') await execFileAsync('chmod', ['+x', hook]);
     const baseMarkerBefore = (await git(f.repo, ['rev-parse', 'refs/agenthub/bases/TASK-A'])).trim();
+    const targetBefore = (await git(f.repo, ['rev-parse', 'HEAD'])).trim();
+    const expectedTree = (await git(f.repo, ['merge-tree', '--write-tree', targetBefore, f.taskHead])).trim();
     const result = await f.manager.mergeTaskWorkspace(f.request);
     expect(result.outcome).toBe('merged');
     expect(await status(f.repo)).toBe('');
@@ -25,7 +27,40 @@ describe('Git merge real integration and V0.5 acceptance', { timeout: 120_000 },
     expect((await git(f.repo, ['rev-parse', f.workspace.branchName])).trim()).toBe(f.taskHead);
     expect((await git(f.workspace.worktreePath, ['rev-parse', 'HEAD'])).trim()).toBe(f.taskHead);
     expect((await git(f.repo, ['rev-parse', 'refs/agenthub/bases/TASK-A'])).trim()).toBe(baseMarkerBefore);
+    expect((await git(f.repo, ['rev-parse', 'HEAD^{tree}'])).trim()).toBe(expectedTree);
     await expect(access(sentinel)).rejects.toBeDefined();
+  });
+
+  it('blocks target branch mergeOptions before mutation and merges normally after removal', async () => {
+    const f = await fixture('agenthub merge options ');
+    const targetBefore = (await git(f.repo, ['rev-parse', 'HEAD'])).trim();
+    for (const value of ['-s ours', '-X ours']) {
+      await git(f.repo, ['config', 'branch.main.mergeOptions', value]);
+      await expect(f.manager.mergeTaskWorkspace(f.request)).rejects
+        .toMatchObject({ code: 'GIT_MERGE_UNSAFE_GIT_EXTENSION' });
+      expect((await git(f.repo, ['rev-parse', 'HEAD'])).trim()).toBe(targetBefore);
+      expect(await status(f.repo)).toBe('');
+      await expect(access(path.join(f.repo, 'task.txt'))).rejects.toBeDefined();
+      await git(f.repo, ['config', '--unset-all', 'branch.main.mergeOptions']);
+    }
+    await expect(f.manager.mergeTaskWorkspace(f.request)).resolves.toMatchObject({ outcome: 'merged' });
+    expect((await readFile(path.join(f.repo, 'task.txt'), 'utf8')).trim()).toBe('task');
+  });
+
+  it('blocks named merge attributes without a configured driver', async () => {
+    const f = await fixture('agenthub merge named attribute ', 'task.txt', 'task\n', '*.txt merge=evil\n');
+    const targetBefore = (await git(f.repo, ['rev-parse', 'HEAD'])).trim();
+    await expect(f.manager.mergeTaskWorkspace(f.request)).rejects
+      .toMatchObject({ code: 'GIT_MERGE_UNSAFE_GIT_EXTENSION' });
+    expect((await git(f.repo, ['rev-parse', 'HEAD'])).trim()).toBe(targetBefore);
+    expect(await status(f.repo)).toBe('');
+  });
+
+  it('allows built-in set and unset merge attribute states', async () => {
+    const attributes = 'task.txt merge\n.agenthub-disabled-hooks/post-merge -merge\n';
+    const f = await fixture('agenthub merge builtin attributes ', 'task.txt', 'task\n', attributes);
+    await expect(f.manager.mergeTaskWorkspace(f.request)).resolves.toMatchObject({ outcome: 'merged' });
+    expect((await readFile(path.join(f.repo, 'task.txt'), 'utf8')).trim()).toBe('task');
   });
 
   it('merges a nonconflicting independently advanced target as a two-parent merge commit', async () => {
@@ -58,14 +93,19 @@ describe('Git merge real integration and V0.5 acceptance', { timeout: 120_000 },
   });
 });
 
-async function fixture(prefix: string, taskPath='task.txt', content='task\n') {
+async function fixture(prefix: string, taskPath='task.txt', content='task\n', attributes?: string) {
   const repo=await createRepo(prefix); const manager=await GitWorktreeManager.open({repositoryRoot:repo});
   const workspace=await manager.createWorkspace({taskId:'TASK-A',baseRef:'HEAD'});
   await writeFile(path.join(workspace.worktreePath,taskPath),content);
   const trackedHook=path.join(workspace.worktreePath,'.agenthub-disabled-hooks','post-merge');
   await mkdir(path.dirname(trackedHook), { recursive: true });
   await writeFile(trackedHook,'#!/bin/sh\nexit 87\n');
-  await git(workspace.worktreePath,['add',taskPath,'.agenthub-disabled-hooks/post-merge']);
+  const taskPaths = [taskPath, '.agenthub-disabled-hooks/post-merge'];
+  if (attributes !== undefined) {
+    await writeFile(path.join(workspace.worktreePath, '.gitattributes'), attributes);
+    taskPaths.push('.gitattributes');
+  }
+  await git(workspace.worktreePath,['add',...taskPaths]);
   await git(workspace.worktreePath,['update-index','--chmod=+x','.agenthub-disabled-hooks/post-merge']);
   await git(workspace.worktreePath,['commit','-m','task']);
   const evidence=await manager.collectBuildTestEvidence('TASK-A',plan()); const review=createReviewEvidence(evidence,{reviewId:'review',reviewerId:'reviewer',verdict:'ACCEPT',summary:'accepted'});
