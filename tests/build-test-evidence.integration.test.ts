@@ -12,7 +12,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await removeTemporaryRoot(root);
 });
 
-describe('Build/Test evidence real integration', { timeout: 30_000 }, () => {
+describe('Build/Test evidence real integration', { timeout: 60_000 }, () => {
   it('collects deterministic passing evidence in a real task worktree with spaces', async () => {
     const { manager, workspace } = await workspaceFixture('agenthub evidence pass ');
     const evidence = await manager.collectBuildTestEvidence('TASK-A', plan(
@@ -60,6 +60,8 @@ describe('Build/Test evidence real integration', { timeout: 30_000 }, () => {
       ['ignored', 'build', 'require("node:fs").writeFileSync("ignored-artifact.txt","generated")'],
     ));
     expect(ignored.outcome).toBe('passed');
+    expect(ignored.commands[0]).toMatchObject({ sourceStable: true,
+      sourceVisibilityAfter: { status: 'captured', stable: true } });
 
     const tracked = await manager.collectBuildTestEvidence('TASK-A', plan(
       ['tracked', 'test', 'require("node:fs").writeFileSync("tracked.txt","mutated")'],
@@ -72,6 +74,70 @@ describe('Build/Test evidence real integration', { timeout: 30_000 }, () => {
       ['untracked', 'test', 'require("node:fs").writeFileSync("new-source.txt","source")'],
     ));
     expect(untracked.outcome).toBe('workspace-mutated');
+  });
+
+  it('detects an info/exclude mutation even when the new source becomes ignored', async () => {
+    const { manager, workspace } = await workspaceFixture('agenthub evidence info exclude ');
+    const excludePath = await gitPath(workspace.worktreePath, 'info/exclude');
+    const sourcePath = path.join(workspace.worktreePath, 'generated-source.ts');
+    const script = `require('node:fs').appendFileSync(${JSON.stringify(excludePath)},'\\ngenerated-source.ts\\n');require('node:fs').writeFileSync(${JSON.stringify(sourcePath)},'hidden source')`;
+    const evidence = await manager.collectBuildTestEvidence('TASK-A', plan(['exclude', 'build', script]));
+    expect(evidence).toMatchObject({ outcome: 'workspace-mutated', build: 'failed' });
+    expect(evidence.commands[0]).toMatchObject({ sourceStable: true,
+      sourceVisibilityAfter: { status: 'captured', stable: false } });
+  });
+
+  it('detects effective core.excludesFile content changes without exposing the policy', async () => {
+    const { manager, workspace } = await workspaceFixture('agenthub evidence excludes file ');
+    const excludesPath = path.join(workspace.repositoryRoot, 'effective-excludes.txt');
+    await writeFile(excludesPath, 'ignored-by-effective-file.txt\\n', 'utf8');
+    await git(workspace.worktreePath, ['config', 'core.excludesFile', excludesPath]);
+    const script = `require('node:fs').appendFileSync(${JSON.stringify(excludesPath)},'new-policy-entry\\n')`;
+    const evidence = await manager.collectBuildTestEvidence('TASK-A', plan(['effective-excludes', 'test', script]));
+    expect(evidence).toMatchObject({ outcome: 'workspace-mutated', test: 'failed' });
+    expect(evidence.commands[0]).toMatchObject({ sourceStable: true,
+      sourceVisibilityAfter: { status: 'captured', stable: false } });
+    const serialized = JSON.stringify(evidence);
+    expect(serialized).not.toContain(excludesPath);
+    expect(serialized).not.toContain('new-policy-entry');
+  });
+
+  it('detects effective core.excludesFile setting changes', async () => {
+    const { manager, workspace } = await workspaceFixture('agenthub evidence excludes setting ');
+    const excludesPath = path.join(workspace.repositoryRoot, 'effective-excludes.txt');
+    const replacementPath = path.join(workspace.repositoryRoot, 'replacement-excludes.txt');
+    await writeFile(excludesPath, '', 'utf8');
+    await writeFile(replacementPath, '', 'utf8');
+    await git(workspace.worktreePath, ['config', 'core.excludesFile', excludesPath]);
+    const script = `require('node:child_process').execFileSync('git',['config','core.excludesFile',${JSON.stringify(replacementPath)}],{stdio:'ignore'})`;
+    const evidence = await manager.collectBuildTestEvidence('TASK-A', plan(['setting', 'test', script]));
+    expect(evidence).toMatchObject({ outcome: 'workspace-mutated', test: 'failed' });
+    expect(evidence.commands[0]?.sourceVisibilityAfter).toMatchObject({ status: 'captured', stable: false });
+  });
+
+  it('treats tracked .gitignore changes as source mutations', async () => {
+    const { manager, workspace } = await workspaceFixture('agenthub evidence gitignore ');
+    await writeFile(path.join(workspace.worktreePath, '.gitignore'), 'initial-ignored.txt\\n', 'utf8');
+    await git(workspace.worktreePath, ['add', '.gitignore']);
+    await git(workspace.worktreePath, ['commit', '-m', 'add tracked ignore policy']);
+    const script = `require('node:fs').appendFileSync(${JSON.stringify(path.join(workspace.worktreePath, '.gitignore'))},'tracked-hidden.txt\\n');require('node:fs').writeFileSync(${JSON.stringify(path.join(workspace.worktreePath, 'tracked-hidden.txt'))},'source')`;
+    const evidence = await manager.collectBuildTestEvidence('TASK-A', plan(['gitignore', 'test', script]));
+    expect(evidence).toMatchObject({ outcome: 'workspace-mutated', test: 'failed' });
+    expect(evidence.commands[0]).toMatchObject({ sourceStable: false });
+  });
+
+  it('detects local .git/info/attributes changes and keeps raw metadata private', async () => {
+    const { manager, workspace } = await workspaceFixture('agenthub evidence attributes ');
+    const attributesPath = await gitPath(workspace.worktreePath, 'info/attributes');
+    const rawMarker = 'private-attributes-marker';
+    const script = `require('node:fs').appendFileSync(${JSON.stringify(attributesPath)},'\\n*.private ${rawMarker}\\n')`;
+    const evidence = await manager.collectBuildTestEvidence('TASK-A', plan(['attributes', 'test', script]));
+    expect(evidence).toMatchObject({ outcome: 'workspace-mutated', test: 'failed' });
+    expect(evidence.commands[0]).toMatchObject({ sourceStable: true,
+      sourceVisibilityAfter: { status: 'captured', stable: false } });
+    const serialized = JSON.stringify(evidence);
+    expect(serialized).not.toContain(attributesPath);
+    expect(serialized).not.toContain(rawMarker);
   });
 
   it('rejects a conflicted baseline before executing any command', async () => {
@@ -203,6 +269,11 @@ async function createRepository(prefix: string): Promise<string> {
   return repo;
 }
 function git(cwd: string, args: readonly string[]) { return gitRunner.run(args, { cwd }); }
+async function gitPath(cwd: string, name: string): Promise<string> {
+  const result = await gitRunner.run(['rev-parse', '--path-format=absolute', '--git-path', name], { cwd });
+  if (result.exitCode !== 0) throw new Error(`Unable to resolve Git path ${name}`);
+  return result.stdout.trim();
+}
 function deepFrozen(value: unknown): void {
   if (value !== null && typeof value === 'object') {
     expect(Object.isFrozen(value)).toBe(true);

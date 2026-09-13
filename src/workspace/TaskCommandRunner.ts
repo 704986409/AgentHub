@@ -29,6 +29,7 @@ export interface TaskCommandRunResult {
   readonly durationMs: number;
   readonly stdout: CommandStreamEvidence;
   readonly stderr: CommandStreamEvidence;
+  readonly cleanupFailed?: boolean;
 }
 
 export interface TaskCommandRunnerOptions {
@@ -44,9 +45,16 @@ const defaultSafeEnvironment = [
 const secretKey = /(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)/i;
 const defaultMaxOutputBytes = 64 * 1024 * 1024;
 const defaultMaxPreviewBytes = 64 * 1024;
+const maxOutputBytes = 1024 * 1024 * 1024;
+const maxPreviewBytes = 1024 * 1024;
+const maxTimeoutMs = 60 * 60 * 1000;
+const cleanupDeadlineMs = 2_000;
 
 export class TaskCommandRunnerError extends Error {
-  public constructor(public readonly code: 'UNSAFE_CWD' | 'INVALID_COMMAND' | 'INVALID_ENV' | 'PROCESS_CLEANUP_FAILED') {
+  public constructor(
+    public readonly code: 'UNSAFE_CWD' | 'INVALID_COMMAND' | 'INVALID_ENV' | 'PROCESS_CLEANUP_FAILED',
+    public readonly result?: TaskCommandRunResult,
+  ) {
     super(code);
     this.name = 'TaskCommandRunnerError';
   }
@@ -59,30 +67,44 @@ export class TaskCommandRunner {
 
   public constructor(options: TaskCommandRunnerOptions) {
     this.#worktreePath = path.resolve(options.worktreePath);
-    this.#maxOutputBytes = positive(options.maxOutputBytes ?? defaultMaxOutputBytes);
-    this.#maxPreviewBytes = positive(options.maxPreviewBytes ?? defaultMaxPreviewBytes);
+    this.#maxOutputBytes = boundedPositive(options.maxOutputBytes ?? defaultMaxOutputBytes, maxOutputBytes);
+    this.#maxPreviewBytes = boundedPositive(options.maxPreviewBytes ?? defaultMaxPreviewBytes, maxPreviewBytes);
   }
 
   public async run(spec: TaskCommandRunSpec): Promise<TaskCommandRunResult> {
-    const executable = validateString(spec.executable, 'INVALID_COMMAND');
+    // Read each caller-owned field exactly once before the first await. Every
+    // subsequent validation, timer, and spawn operation uses this snapshot.
+    const executableValue = spec.executable;
+    const argsValue = spec.args;
+    const cwdValue = spec.cwd;
+    const timeoutValue = spec.timeoutMs;
+    const inheritEnvValue = spec.inheritEnv;
+    const envValue = spec.env;
+    const executable = validateString(executableValue, 'INVALID_COMMAND');
     if (/\.(?:cmd|bat)$/iu.test(executable)) throw new TaskCommandRunnerError('INVALID_COMMAND');
-    const args = [...spec.args];
+    if (!Array.isArray(argsValue)) throw new TaskCommandRunnerError('INVALID_COMMAND');
+    const args: string[] = Array.from(argsValue as readonly string[]);
     if (!args.every((arg) => typeof arg === 'string' && !arg.includes('\0'))) {
       throw new TaskCommandRunnerError('INVALID_COMMAND');
     }
-    if (!Number.isSafeInteger(spec.timeoutMs) || spec.timeoutMs < 1) {
+    if (!Number.isSafeInteger(timeoutValue) || timeoutValue < 1 || timeoutValue > maxTimeoutMs) {
       throw new TaskCommandRunnerError('INVALID_COMMAND');
     }
-    await this.#validateCwd(spec.cwd);
-    const environment = buildEnvironment(spec.inheritEnv, spec.env);
+    const cwd = cwdValue;
+    if (!Array.isArray(inheritEnvValue) || typeof envValue !== 'object' || Array.isArray(envValue)) {
+      throw new TaskCommandRunnerError('INVALID_ENV');
+    }
+    const inheritEnv: string[] = Array.from(inheritEnvValue as readonly string[]);
+    const env = { ...envValue } as Record<string, string>;
+    await this.#validateCwd(cwd);
+    const environment = buildEnvironment(inheritEnv, env);
     const stdout = createAccumulator(this.#maxPreviewBytes);
     const stderr = createAccumulator(this.#maxPreviewBytes);
     const started = process.hrtime.bigint();
     let child: ChildProcess;
     // The directory is checked once while validating the request and again
-    // immediately before spawn.  This closes the small replace/junction
-    // window between validation and process creation.
-    const spawnCwd = await this.#validateCwd(spec.cwd);
+    // immediately before spawn. Both checks use the same snapshotted string.
+    const spawnCwd = await this.#validateCwd(cwd);
     try {
       child = spawn(executable, args, {
         cwd: spawnCwd,
@@ -111,26 +133,25 @@ export class TaskCommandRunner {
     };
     child.stdout?.on('data', (chunk: Buffer | string) => onData(stdout, chunk));
     child.stderr?.on('data', (chunk: Buffer | string) => onData(stderr, chunk));
-    const timer = setTimeout(() => terminate('timed-out'), spec.timeoutMs);
+    const timer = setTimeout(() => terminate('timed-out'), timeoutValue);
     return await new Promise<TaskCommandRunResult>((resolve, reject) => {
       let settled = false;
       const finish = async (code: number | null, signal: NodeJS.Signals | null): Promise<void> => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        const finalOutcome = outcome ?? (code === 0 ? 'passed' : 'failed');
+        const values = { ...resultValues(finalOutcome, started, stdout, stderr),
+          ...(code === null ? {} : { exitCode: code }),
+          ...(signal === null ? {} : { signal }), };
         try {
           await killPromise;
-          const finalOutcome = outcome ?? (code === 0 ? 'passed' : 'failed');
-          resolve({
-            outcome: finalOutcome,
-            ...(code === null ? {} : { exitCode: code }),
-            ...(signal === null ? {} : { signal }),
-            ...resultValues(finalOutcome, started, stdout, stderr),
-          });
-        } catch (error) {
-          // Deliberately do not expose the command, argv, cwd, or environment
-          // in this error.  Cleanup ambiguity is infrastructure failure.
-          reject(error instanceof TaskCommandRunnerError ? error : new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED'));
+          resolve({ outcome: finalOutcome, ...values });
+        } catch {
+          // Preserve factual process and stream evidence on cleanup failure;
+          // callers must still classify the operation as infrastructure-failed.
+          const factual = Object.freeze({ outcome: finalOutcome, ...values, cleanupFailed: true });
+          reject(new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED', factual));
         }
       };
       finishProcess = (code, signal) => { void finish(code, signal); };
@@ -220,26 +241,67 @@ function resultValues(_outcome: TaskCommandOutcome, started: bigint, stdout: Acc
 async function terminateProcess(child: ChildProcess): Promise<void> {
   if (child.pid === undefined) return;
   if (process.platform === 'win32') {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    await new Promise<void>((resolve, reject) => {
-      const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
-        shell: false, windowsHide: true, stdio: 'ignore',
-      });
-      killer.once('error', () => reject(new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED')));
-      killer.once('close', (code) => {
-        if (code === 0 || child.exitCode !== null || child.signalCode !== null) resolve();
-        else reject(new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED'));
-      });
-    });
+    await boundedTaskkill(child.pid);
+    await waitForSettlement(child);
   } else {
     let signalled = false;
     try { process.kill(-child.pid, 'SIGTERM'); signalled = true; } catch { try { child.kill('SIGTERM'); signalled = true; } catch { /* already dead */ } }
     if (!signalled && child.exitCode === null) throw new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED');
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    try { process.kill(-child.pid, 'SIGKILL'); } catch { if (child.exitCode === null) throw new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED'); }
+    await delay(50);
+    if (child.exitCode === null && child.signalCode === null) {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* already dead */ } }
+    }
+    await waitForSettlement(child);
   }
 }
 
+async function boundedTaskkill(pid: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error === undefined) resolve(); else reject(error);
+    };
+    const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+      shell: false, windowsHide: true, stdio: 'ignore',
+    });
+    const timer = setTimeout(() => {
+      try { killer.kill(); } catch { /* best effort */ }
+      finish(new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED'));
+    }, cleanupDeadlineMs);
+    killer.once('error', () => finish(new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED')));
+    killer.once('close', (code) => {
+      if (code === 0) finish();
+      else finish(new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED'));
+    });
+  });
+}
+
+async function waitForSettlement(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener('close', onClose);
+      child.removeListener('error', onError);
+      if (error === undefined) resolve(); else reject(error);
+    };
+    const onClose = (): void => finish();
+    const onError = (): void => finish(new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED'));
+    const timer = setTimeout(() => finish(new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED')), cleanupDeadlineMs);
+    child.once('close', onClose);
+    child.once('error', onError);
+  });
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 function buildEnvironment(inheritEnv: readonly string[], explicit: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
   const requested = new Map<string, string>();
@@ -285,7 +347,10 @@ function validateString(value: unknown, code: 'INVALID_COMMAND'): string {
   }
   return value;
 }
-function positive(value: number): number { if (!Number.isSafeInteger(value) || value <= 0) throw new RangeError('positive integer required'); return value; }
+function boundedPositive(value: number, maximum: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) throw new RangeError('bounded positive integer required');
+  return value;
+}
 function contained(root: string, target: string): boolean {
   const relative = path.relative(root, target);
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));

@@ -4,7 +4,14 @@ import {
   canonicalChangeState,
   type GitWorkspaceChangeSnapshot,
 } from './GitWorkspaceChangeCapture.js';
-import { TaskCommandRunner, type CommandStreamEvidence, type TaskCommandOutcome } from './TaskCommandRunner.js';
+import { captureGitEvidenceContext, type GitEvidenceContextSnapshot } from './GitEvidenceContext.js';
+import {
+  TaskCommandRunner,
+  TaskCommandRunnerError,
+  type CommandStreamEvidence,
+  type TaskCommandOutcome,
+  type TaskCommandRunResult,
+} from './TaskCommandRunner.js';
 import type { GitCommandRunnerLike } from './GitCommandRunner.js';
 import type { TaskWorkspace } from './GitWorktreeManager.js';
 
@@ -21,6 +28,12 @@ export interface EvidenceCommandSpec {
   readonly env?: Readonly<Record<string, string>>;
 }
 export interface BuildTestEvidencePlan { readonly commands: readonly EvidenceCommandSpec[]; }
+export type SourceAfterEvidence =
+  | { readonly status: 'captured'; readonly changeSetSha256: string; readonly stable: boolean }
+  | { readonly status: 'capture-failed' };
+export type VisibilityAfterEvidence =
+  | { readonly status: 'captured'; readonly sourceVisibilitySha256: string; readonly stable: boolean }
+  | { readonly status: 'capture-failed' };
 export interface CommandEvidence {
   readonly commandId: string;
   readonly phase: EvidenceCommandPhase;
@@ -35,18 +48,24 @@ export interface CommandEvidence {
   readonly stdout: CommandStreamEvidence;
   readonly stderr: CommandStreamEvidence;
   readonly sourceBeforeSha256: string;
-  readonly sourceAfterSha256: string;
+  readonly sourceVisibilityBeforeSha256: string;
+  readonly sourceAfter: SourceAfterEvidence;
+  readonly sourceVisibilityAfter: VisibilityAfterEvidence;
+  /** Retained for consumers of the V0.5.3 shape. */
+  readonly sourceAfterSha256?: string;
   readonly sourceStable: boolean;
+  readonly cleanupFailed?: boolean;
 }
 export interface BuildTestEvidence {
-  readonly version: 1;
+  readonly version: 2;
   readonly taskId: string;
   readonly branchName: string;
   readonly baseCommit: string;
   readonly headCommit: string;
   readonly changeSetSha256: string;
-  readonly build: 'passed' | 'failed' | 'not-run';
-  readonly test: 'passed' | 'failed' | 'not-run';
+  readonly sourceVisibilitySha256: string;
+  readonly build: 'passed' | 'failed' | 'infrastructure-failed' | 'not-run';
+  readonly test: 'passed' | 'failed' | 'infrastructure-failed' | 'not-run';
   readonly outcome: 'passed' | 'failed' | 'workspace-mutated' | 'infrastructure-failed';
   readonly commands: readonly CommandEvidence[];
   readonly evidenceSha256: string;
@@ -65,6 +84,10 @@ export interface BuildTestEvidenceCollectorOptions {
   readonly worktree: TaskWorkspace;
   readonly maxOutputBytes?: number;
   readonly maxPreviewBytes?: number;
+  /** Trusted seams used by unit tests; the manager does not expose these. */
+  readonly taskRunner?: Pick<TaskCommandRunner, 'run'>;
+  readonly captureSource?: (runner: GitCommandRunnerLike, inspect: () => Promise<TaskWorkspace | undefined>) => Promise<GitWorkspaceChangeSnapshot | undefined>;
+  readonly captureContext?: (runner: GitCommandRunnerLike, workspace: TaskWorkspace) => Promise<GitEvidenceContextSnapshot>;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -140,10 +163,11 @@ export function snapshotBuildTestEvidenceOptions(
   const maxOutputBytes = value.maxOutputBytes;
   const maxPreviewBytes = value.maxPreviewBytes;
   for (const candidate of [maxOutputBytes, maxPreviewBytes]) {
-    if (candidate !== undefined && (typeof candidate !== 'number' || !Number.isSafeInteger(candidate) || candidate <= 0)) {
+    if (candidate !== undefined && (typeof candidate !== 'number' || !Number.isSafeInteger(candidate) || candidate <= 0 || candidate > 1024 * 1024 * 1024)) {
       throw new BuildTestEvidenceError('INVALID_PLAN');
     }
   }
+  if (typeof maxPreviewBytes === 'number' && maxPreviewBytes > 1024 * 1024) throw new BuildTestEvidenceError('INVALID_PLAN');
   return Object.freeze({
     ...(typeof maxOutputBytes === 'number' ? { maxOutputBytes } : {}),
     ...(typeof maxPreviewBytes === 'number' ? { maxPreviewBytes } : {}),
@@ -156,14 +180,18 @@ export async function collectBuildTestEvidence(
 ): Promise<BuildTestEvidence> {
   const plan = snapshotBuildTestEvidencePlan(planValue);
   const optionsSnapshot = snapshotBuildTestEvidenceOptions(options);
+  const captureSource = options.captureSource ?? capture;
+  const captureContext = options.captureContext ?? captureGitEvidenceContext;
   let initial: GitWorkspaceChangeSnapshot | undefined;
+  let initialContext: GitEvidenceContextSnapshot;
   try {
-    initial = await capture(options.runner, options.inspect);
+    initial = await captureSource(options.runner, options.inspect);
+    initialContext = await captureContext(options.runner, options.worktree);
   } catch {
     throw new BuildTestEvidenceError('INFRASTRUCTURE_FAILED');
   }
   if (initial === undefined || initial.hasConflicts) throw new BuildTestEvidenceError('WORKSPACE_MUTATED');
-  const taskRunner = new TaskCommandRunner({
+  const taskRunner = options.taskRunner ?? new TaskCommandRunner({
     worktreePath: options.worktree.worktreePath,
     ...(optionsSnapshot.maxOutputBytes === undefined ? {} : { maxOutputBytes: optionsSnapshot.maxOutputBytes }),
     ...(optionsSnapshot.maxPreviewBytes === undefined ? {} : { maxPreviewBytes: optionsSnapshot.maxPreviewBytes }),
@@ -174,14 +202,20 @@ export async function collectBuildTestEvidence(
   for (const command of plan.commands) {
     if (stopReason !== undefined) break;
     let before: GitWorkspaceChangeSnapshot | undefined;
+    let beforeContext: GitEvidenceContextSnapshot;
     try {
-      before = await capture(options.runner, options.inspect);
+      before = await captureSource(options.runner, options.inspect);
+      beforeContext = await captureContext(options.runner, options.worktree);
     } catch {
       stopReason = 'infrastructure-failed';
       break;
     }
-    if (!sameIdentity(initial, before)) { stopReason = 'workspace-mutated'; break; }
-    let run;
+    if (!sameSourceIdentity(initial, before) || beforeContext.sourceVisibilitySha256 !== initialContext.sourceVisibilitySha256) {
+      stopReason = 'workspace-mutated';
+      break;
+    }
+    let run: TaskCommandRunResult | undefined;
+    let cleanupFailed = false;
     try {
       run = await taskRunner.run({
         executable: command.executable,
@@ -191,19 +225,30 @@ export async function collectBuildTestEvidence(
         inheritEnv: command.inheritEnv ?? [],
         env: command.env ?? {},
       });
-    } catch {
-      stopReason = 'infrastructure-failed';
-      break;
+    } catch (error) {
+      if (error instanceof TaskCommandRunnerError && error.result !== undefined) {
+        run = error.result;
+        cleanupFailed = true;
+      } else {
+        stopReason = 'infrastructure-failed';
+        break;
+      }
     }
     const sourceBeforeSha256 = before.changeSetSha256;
     let after: GitWorkspaceChangeSnapshot | undefined;
-    try {
-      after = await capture(options.runner, options.inspect);
-    } catch {
-      stopReason = 'infrastructure-failed';
-      break;
-    }
-    const sourceStable = sameIdentity(initial, after);
+    let afterContext: GitEvidenceContextSnapshot | undefined;
+    let sourceCaptureFailed = false;
+    let visibilityCaptureFailed = false;
+    try { after = await captureSource(options.runner, options.inspect); if (after === undefined) sourceCaptureFailed = true; } catch { sourceCaptureFailed = true; }
+    try { afterContext = await captureContext(options.runner, options.worktree); } catch { visibilityCaptureFailed = true; }
+    const sourceStable = !sourceCaptureFailed && sameSourceIdentity(initial, after);
+    const visibilityStable = !visibilityCaptureFailed && afterContext?.sourceVisibilitySha256 === initialContext.sourceVisibilitySha256;
+    const sourceAfter: SourceAfterEvidence = sourceCaptureFailed || after === undefined
+      ? { status: 'capture-failed' }
+      : { status: 'captured', changeSetSha256: after.changeSetSha256, stable: sourceStable };
+    const sourceVisibilityAfter: VisibilityAfterEvidence = visibilityCaptureFailed || afterContext === undefined
+      ? { status: 'capture-failed' }
+      : { status: 'captured', sourceVisibilitySha256: afterContext.sourceVisibilitySha256, stable: visibilityStable };
     const evidence: CommandEvidence = Object.freeze({
       commandId: command.id,
       phase: command.phase,
@@ -218,43 +263,56 @@ export async function collectBuildTestEvidence(
       stdout: run.stdout,
       stderr: run.stderr,
       sourceBeforeSha256,
-      sourceAfterSha256: after === undefined ? '' : after.changeSetSha256,
+      sourceVisibilityBeforeSha256: beforeContext.sourceVisibilitySha256,
+      sourceAfter,
+      sourceVisibilityAfter,
+      ...(sourceAfter.status === 'captured' ? { sourceAfterSha256: sourceAfter.changeSetSha256 } : {}),
       sourceStable,
+      ...(cleanupFailed ? { cleanupFailed: true } : {}),
     });
     commands.push(evidence);
-    if (!sourceStable) { stopReason = 'workspace-mutated'; break; }
-    if (run.outcome === 'spawn-failed') {
+    if (sourceCaptureFailed || visibilityCaptureFailed || cleanupFailed) {
+      stopReason = 'infrastructure-failed';
+    } else if (!sourceStable || !visibilityStable) {
+      stopReason = 'workspace-mutated';
+    } else if (run.outcome === 'spawn-failed') {
       stopReason = 'infrastructure-failed';
     } else if (run.outcome !== 'passed') {
       anyCommandFailed = true;
       if (!command.continueOnFailure) stopReason = 'command-failed';
     }
   }
-  const outcome: BuildTestEvidence['outcome'] = stopReason === 'infrastructure-failed' ? 'infrastructure-failed' : stopReason === 'workspace-mutated' ? 'workspace-mutated' : (stopReason === 'command-failed' || anyCommandFailed) ? 'failed' : 'passed';
-  const phase = (name: EvidenceCommandPhase): 'passed' | 'failed' | 'not-run' => {
+  const outcome: BuildTestEvidence['outcome'] = stopReason === 'infrastructure-failed' ? 'infrastructure-failed' :
+    stopReason === 'workspace-mutated' ? 'workspace-mutated' :
+      (stopReason === 'command-failed' || anyCommandFailed) ? 'failed' : 'passed';
+  const phase = (name: EvidenceCommandPhase): BuildTestEvidence['build'] => {
     const selected = commands.filter((command) => command.phase === name);
     if (selected.length === 0) return 'not-run';
-    return selected.every((command) => command.outcome === 'passed') ? 'passed' : 'failed';
+    if (selected.some((command) => command.sourceAfter.status === 'capture-failed' ||
+      command.sourceVisibilityAfter.status === 'capture-failed' || command.cleanupFailed === true)) return 'infrastructure-failed';
+    return selected.every((command) => command.outcome === 'passed' && command.sourceStable &&
+      command.sourceVisibilityAfter.status === 'captured' && command.sourceVisibilityAfter.stable) ? 'passed' : 'failed';
   };
   const base: Omit<BuildTestEvidence, 'evidenceSha256'> = {
-    version: 1 as const,
+    version: 2,
     taskId: initial.taskId,
     branchName: initial.branchName,
     baseCommit: initial.baseCommit,
     headCommit: initial.headCommit,
     changeSetSha256: initial.changeSetSha256,
+    sourceVisibilitySha256: initialContext.sourceVisibilitySha256,
     build: phase('build'),
     test: phase('test'),
     outcome,
     commands: Object.freeze(commands),
   };
-  return Object.freeze({ ...base, evidenceSha256: sha(canonicalEvidence(base)) });
+  return deepFreeze({ ...base, evidenceSha256: sha(canonicalEvidence(base)) }) as BuildTestEvidence;
 }
 
 async function capture(runner: GitCommandRunnerLike, inspect: () => Promise<TaskWorkspace | undefined>): Promise<GitWorkspaceChangeSnapshot | undefined> {
   return captureWorkspaceChanges(runner, inspect, { includePatchText: false, maxPatchBytes: 1, maxChangedPaths: 4096, maxFingerprintBytes: 64 * 1024 * 1024, maxIgnoredPaths: 4096 });
 }
-function sameIdentity(a: GitWorkspaceChangeSnapshot, b: GitWorkspaceChangeSnapshot | undefined): b is GitWorkspaceChangeSnapshot {
+function sameSourceIdentity(a: GitWorkspaceChangeSnapshot, b: GitWorkspaceChangeSnapshot | undefined): b is GitWorkspaceChangeSnapshot {
   return b !== undefined && a.taskId === b.taskId && a.branchName === b.branchName && a.baseCommit === b.baseCommit && a.headCommit === b.headCommit && a.changeSetSha256 === b.changeSetSha256;
 }
 function canonicalCommandSpec(command: EvidenceCommandSpec): unknown { return { id: command.id, phase: command.phase, executable: command.executable, args: command.args ?? [], cwd: command.cwd ?? '.', timeoutMs: command.timeoutMs, continueOnFailure: command.continueOnFailure ?? false, inheritEnv: command.inheritEnv ?? [], env: command.env ?? {} }; }
@@ -271,7 +329,14 @@ function canonicalEvidence(value: unknown): unknown {
   return value;
 }
 function sha(value: unknown): string { return createHash('sha256').update(canonicalChangeState(value)).digest('hex'); }
-
 function isRecord(value: unknown): value is UnknownRecord {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function deepFreeze(value: unknown, seen = new WeakSet()): unknown {
+  if (value !== null && typeof value === 'object' && !seen.has(value)) {
+    seen.add(value);
+    Object.freeze(value);
+    for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested, seen);
+  }
+  return value;
 }

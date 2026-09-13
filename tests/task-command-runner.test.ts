@@ -13,6 +13,45 @@ afterEach(async () => {
 });
 
 describe('TaskCommandRunner', { timeout: 20_000 }, () => {
+  it('snapshots every run field once and owns the snapshot before asynchronous validation', async () => {
+    const root = await temporaryRoot('agenthub runner snapshot ');
+    const values = {
+      executable: process.execPath,
+      args: ['-e', 'process.stdout.write(process.cwd())'],
+      cwd: '.',
+      timeoutMs: 5_000,
+      inheritEnv: [] as string[],
+      env: {} as Record<string, string>,
+    };
+    const reads = { executable: 0, args: 0, cwd: 0, timeoutMs: 0, inheritEnv: 0, env: 0 };
+    const spec = {
+      get executable() { reads.executable++; return values.executable; },
+      get args() { reads.args++; return values.args; },
+      get cwd() { reads.cwd++; return values.cwd; },
+      get timeoutMs() { reads.timeoutMs++; return values.timeoutMs; },
+      get inheritEnv() { reads.inheritEnv++; return values.inheritEnv; },
+      get env() { reads.env++; return values.env; },
+    };
+    const pending = new TaskCommandRunner({ worktreePath: root }).run(spec);
+    values.args = ['-e', 'process.stdout.write("mutated")'];
+    values.cwd = 'missing';
+    values.timeoutMs = 1;
+    values.inheritEnv = ['PATH'];
+    values.env = { MUTATED: 'yes' };
+    const result = await pending;
+    expect(result.outcome).toBe('passed');
+    expect(result.stdout.preview).toBe(await import('node:fs/promises').then(async (m) => m.realpath(root)));
+    expect(reads).toEqual({ executable: 1, args: 1, cwd: 1, timeoutMs: 1, inheritEnv: 1, env: 1 });
+  });
+
+  it('rejects direct runner limits above the public bounds', async () => {
+    const root = await temporaryRoot('agenthub runner bounds ');
+    expect(() => new TaskCommandRunner({ worktreePath: root, maxOutputBytes: Number.MAX_SAFE_INTEGER })).toThrow(RangeError);
+    expect(() => new TaskCommandRunner({ worktreePath: root, maxPreviewBytes: Number.MAX_SAFE_INTEGER })).toThrow(RangeError);
+    await expect(new TaskCommandRunner({ worktreePath: root }).run({ ...command(''), timeoutMs: Number.MAX_SAFE_INTEGER }))
+      .rejects.toMatchObject({ code: 'INVALID_COMMAND' });
+  });
+
   it('executes explicit argv without a shell and records bounded stream evidence', async () => {
     const root = await temporaryRoot('agenthub runner ');
     const runner = new TaskCommandRunner({ worktreePath: root, maxPreviewBytes: 5 });
@@ -98,6 +137,17 @@ describe('TaskCommandRunner', { timeout: 20_000 }, () => {
     const parentScript = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});setInterval(()=>{},1000)`;
     const result = await new TaskCommandRunner({ worktreePath: root }).run(command(parentScript, 150));
     expect(result.outcome).toBe('timed-out');
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    await expect(access(marker)).rejects.toBeDefined();
+  });
+
+  it('cleans a descendant process tree on output limit', async () => {
+    const root = await temporaryRoot('agenthub output cleanup ');
+    const marker = path.join(root, 'orphan-marker.txt');
+    const childScript = `setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'orphan'),700)`;
+    const parentScript = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});process.stdout.write('x'.repeat(4096));setInterval(()=>{},1000)`;
+    const result = await new TaskCommandRunner({ worktreePath: root, maxOutputBytes: 32 }).run(command(parentScript));
+    expect(result.outcome).toBe('output-limit');
     await new Promise((resolve) => setTimeout(resolve, 900));
     await expect(access(marker)).rejects.toBeDefined();
   });
