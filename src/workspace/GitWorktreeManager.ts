@@ -11,6 +11,7 @@ import { captureWorkspaceChanges, snapshotCaptureOptions, canonicalChangeState, 
   type CaptureWorkspaceChangesOptions, type GitWorkspaceChangeSnapshot } from './GitWorkspaceChangeCapture.js';
 import { collectBuildTestEvidence, evidencePlanKey, snapshotBuildTestEvidencePlan,
   snapshotBuildTestEvidenceOptions, type BuildTestEvidence, type BuildTestEvidencePlan, type BuildTestEvidenceCollectorOptions } from './BuildTestEvidenceCollector.js';
+import { snapshotTaskCommandEnvironment, type TaskCommandEnvironmentSnapshot } from './TaskCommandRunner.js';
 
 const excludeRule = '/.agenthub/worktrees/';
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
@@ -53,6 +54,8 @@ export interface GitWorktreeManagerOptions {
   readonly repositoryRoot: string;
   readonly gitExecutable?: string;
   readonly runner?: GitCommandRunnerLike;
+  /** Optional command runner dependency used by deterministic infrastructure tests. */
+  readonly taskRunner?: BuildTestEvidenceCollectorOptions['taskRunner'];
 }
 
 export interface CreateTaskWorkspaceRequest {
@@ -97,11 +100,11 @@ type VerifiedWorkspace = Omit<TaskWorkspace, 'baseCommit'>;
 
 interface RepositoryCoordination {
   readonly operations: Map<string, PendingOperation>;
-  readonly quarantinedTasks: Set<string>;
   excludePromise?: Promise<void>;
 }
 
 const repositoryCoordinators = new Map<string, WeakRef<RepositoryCoordination>>();
+const repositoryQuarantines = new Map<string, Set<string>>();
 const coordinatorFinalizer = new FinalizationRegistry<{ key: string; ref: WeakRef<RepositoryCoordination> }>(
   ({ key, ref }) => { if (repositoryCoordinators.get(key) === ref) repositoryCoordinators.delete(key); },
 );
@@ -111,14 +114,19 @@ export class GitWorktreeManager {
   readonly #repositoryRoot: string;
   readonly #gitDir: string;
   readonly #worktreesRoot: string;
+  readonly #repositoryKey: string;
   readonly #coordination: RepositoryCoordination;
+  readonly #taskRunner?: BuildTestEvidenceCollectorOptions['taskRunner'];
 
-  private constructor(repositoryRoot: string, gitDir: string, runner: GitCommandRunnerLike) {
+  private constructor(repositoryRoot: string, gitDir: string, runner: GitCommandRunnerLike,
+    taskRunner?: BuildTestEvidenceCollectorOptions['taskRunner']) {
     this.#repositoryRoot = repositoryRoot;
     this.#gitDir = gitDir;
     this.#worktreesRoot = path.join(repositoryRoot, '.agenthub', 'worktrees');
+    this.#repositoryKey = canonicalRepositoryKey(repositoryRoot);
     this.#runner = runner;
     this.#coordination = coordinationFor(repositoryRoot);
+    this.#taskRunner = taskRunner;
   }
 
   public static async open(options: GitWorktreeManagerOptions): Promise<GitWorktreeManager> {
@@ -128,6 +136,11 @@ export class GitWorktreeManager {
     const repositoryRootValue = options.repositoryRoot;
     const runnerValue = options.runner;
     const gitExecutableValue = options.gitExecutable;
+    const taskRunnerValue = options.taskRunner;
+    if (taskRunnerValue !== undefined &&
+      (!isRecord(taskRunnerValue) || typeof taskRunnerValue.run !== 'function')) {
+      throw new GitWorktreeError('GIT_WORKTREE_CONTRACT_VIOLATION', 'Task command runner is invalid', 'open');
+    }
     if (typeof repositoryRootValue !== 'string' || repositoryRootValue.length === 0) {
       throw new GitWorktreeError('GIT_WORKTREE_NOT_REPOSITORY', 'Repository root is invalid', 'open');
     }
@@ -181,7 +194,7 @@ export class GitWorktreeManager {
         'GIT_WORKTREE_UNSUPPORTED_REPOSITORY', 'Primary Git metadata identity is inconsistent', 'open',
       );
     }
-    const manager = new GitWorktreeManager(requestedRoot, gitDir, runner);
+    const manager = new GitWorktreeManager(requestedRoot, gitDir, runner, taskRunnerValue);
     await manager.#assertNoTrackedWorkspaceContent();
     return manager;
   }
@@ -198,7 +211,7 @@ export class GitWorktreeManager {
     } catch (error) {
       return Promise.reject(asError(error));
     }
-    if (this.#coordination.quarantinedTasks.has(operationKey(taskId))) {
+    if (isTaskQuarantined(this.#repositoryKey, taskId)) {
       return Promise.reject(taskQuarantined(taskId));
     }
     const key = operationKey(taskId);
@@ -227,7 +240,7 @@ export class GitWorktreeManager {
       taskId = validateTaskId(taskIdValue);
       snapshot = snapshotCaptureOptions(options);
     } catch (error) { return Promise.reject(asError(error)); }
-    if (this.#coordination.quarantinedTasks.has(operationKey(taskId))) {
+    if (isTaskQuarantined(this.#repositoryKey, taskId)) {
       return Promise.reject(taskQuarantined(taskId));
     }
     const key = operationKey(taskId);
@@ -268,14 +281,18 @@ export class GitWorktreeManager {
       snapshot = snapshotBuildTestEvidencePlan(plan);
     } catch (error) { return Promise.reject(asError(error)); }
     let optionsSnapshot: Pick<BuildTestEvidenceCollectorOptions, 'maxOutputBytes' | 'maxPreviewBytes'>;
+    let environmentSnapshots: readonly TaskCommandEnvironmentSnapshot[];
     try {
       optionsSnapshot = snapshotBuildTestEvidenceOptions(options);
+      environmentSnapshots = Object.freeze(snapshot.commands.map((command) =>
+        snapshotTaskCommandEnvironment(command.inheritEnv ?? [], command.env ?? {})));
     } catch (error) { return Promise.reject(asError(error)); }
-    if (this.#coordination.quarantinedTasks.has(operationKey(taskId))) {
+    if (isTaskQuarantined(this.#repositoryKey, taskId)) {
       return Promise.reject(taskQuarantined(taskId));
     }
     const key = operationKey(taskId);
-    const evidenceKeyValue = evidencePlanKey(snapshot, optionsSnapshot);
+    const evidenceKeyValue = evidencePlanKey(snapshot, optionsSnapshot,
+      environmentSnapshots.map((environment) => environment.executionEnvironmentSha256));
     const pending = this.#coordination.operations.get(key);
     if (pending !== undefined) {
       if (pending.kind === 'evidence' && pending.evidenceKey === evidenceKeyValue) {
@@ -284,7 +301,7 @@ export class GitWorktreeManager {
       return Promise.reject(operationBusy(taskId));
     }
     const token = {};
-    const operation = this.#collectEvidence(taskId, snapshot, optionsSnapshot);
+    const operation = this.#collectEvidence(taskId, snapshot, optionsSnapshot, environmentSnapshots);
     const current = operation.finally(() => {
       if (this.#coordination.operations.get(key)?.token === token) this.#coordination.operations.delete(key);
     });
@@ -293,7 +310,8 @@ export class GitWorktreeManager {
   }
 
   async #collectEvidence(taskId: string, plan: BuildTestEvidencePlan,
-    options: Pick<BuildTestEvidenceCollectorOptions, 'maxOutputBytes' | 'maxPreviewBytes'>): Promise<BuildTestEvidence> {
+    options: Pick<BuildTestEvidenceCollectorOptions, 'maxOutputBytes' | 'maxPreviewBytes'>,
+    environmentSnapshots: readonly TaskCommandEnvironmentSnapshot[]): Promise<BuildTestEvidence> {
     const workspace = await this.#inspect(taskId, gitCapturePrefix);
     if (workspace === undefined) throw new GitWorktreeError('GIT_WORKTREE_CONTRACT_VIOLATION', 'Task worktree does not exist', 'evidence', taskId);
     return collectBuildTestEvidence(plan, {
@@ -301,8 +319,10 @@ export class GitWorktreeManager {
       inspect: () => this.#inspect(taskId, gitCapturePrefix),
       worktree: workspace,
       onCleanupAmbiguity: () => {
-        this.#coordination.quarantinedTasks.add(operationKey(taskId));
+        quarantineTask(this.#repositoryKey, taskId);
       },
+      environmentSnapshots,
+      ...(this.#taskRunner === undefined ? {} : { taskRunner: this.#taskRunner }),
       ...options,
     });
   }
@@ -314,7 +334,7 @@ export class GitWorktreeManager {
     } catch (error) {
       return Promise.reject(asError(error));
     }
-    if (this.#coordination.quarantinedTasks.has(operationKey(taskId))) {
+    if (isTaskQuarantined(this.#repositoryKey, taskId)) {
       return Promise.reject(taskQuarantined(taskId));
     }
     const key = operationKey(taskId);
@@ -827,16 +847,46 @@ function isContainedPath(parent: string, child: string): boolean {
 }
 
 function coordinationFor(repositoryRoot: string): RepositoryCoordination {
-  const key = process.platform === 'win32'
-    ? path.normalize(repositoryRoot).toLocaleLowerCase('en-US')
-    : path.normalize(repositoryRoot);
+  const key = canonicalRepositoryKey(repositoryRoot);
   const current = repositoryCoordinators.get(key)?.deref();
   if (current !== undefined) return current;
-  const coordination: RepositoryCoordination = { operations: new Map(), quarantinedTasks: new Set() };
+  const coordination: RepositoryCoordination = { operations: new Map() };
   const ref = new WeakRef(coordination);
   repositoryCoordinators.set(key, ref);
   coordinatorFinalizer.register(coordination, { key, ref });
   return coordination;
+}
+
+function canonicalRepositoryKey(repositoryRoot: string): string {
+  const normalized = path.normalize(repositoryRoot);
+  return process.platform === 'win32' ? normalized.toLocaleLowerCase('en-US') : normalized;
+}
+
+function isTaskQuarantined(repositoryKey: string, taskId: string): boolean {
+  return repositoryQuarantines.get(repositoryKey)?.has(operationKey(taskId)) === true;
+}
+
+function quarantineTask(repositoryKey: string, taskId: string): void {
+  let tasks = repositoryQuarantines.get(repositoryKey);
+  if (tasks === undefined) {
+    tasks = new Set();
+    repositoryQuarantines.set(repositoryKey, tasks);
+  }
+  tasks.add(operationKey(taskId));
+}
+
+/** Test-only seam: models transient coordinator collection without touching durable quarantine. */
+export function releaseTransientRepositoryCoordinationForTesting(repositoryRoot: string): void {
+  repositoryCoordinators.delete(canonicalRepositoryKey(repositoryRoot));
+}
+
+/** Test-only observation seam for process-lifetime quarantine identity. */
+export function quarantineTaskForTesting(repositoryRoot: string, taskId: string): void {
+  quarantineTask(canonicalRepositoryKey(repositoryRoot), validateTaskId(taskId));
+}
+
+export function isTaskQuarantinedForTesting(repositoryRoot: string, taskId: string): boolean {
+  return isTaskQuarantined(canonicalRepositoryKey(repositoryRoot), validateTaskId(taskId));
 }
 
 function findByPath(records: readonly GitWorktreeRecord[], expectedPath: string): GitWorktreeRecord | undefined {

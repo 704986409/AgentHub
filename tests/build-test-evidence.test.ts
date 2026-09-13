@@ -53,6 +53,12 @@ describe('Build/Test evidence plan and unit behavior', () => {
     const changed = snapshotBuildTestEvidencePlan({ commands: [{ ...spec('one'), args: ['-e', 'changed'] }] });
     expect(evidencePlanKey(first, { maxPreviewBytes: 10 })).toBe(evidencePlanKey(same, { maxPreviewBytes: 10 }));
     expect(evidencePlanKey(first, { maxPreviewBytes: 10 })).not.toBe(evidencePlanKey(changed, { maxPreviewBytes: 10 }));
+    const environmentA = 'a'.repeat(64);
+    const environmentB = 'b'.repeat(64);
+    expect(evidencePlanKey(first, { maxPreviewBytes: 10 }, [environmentA]))
+      .toBe(evidencePlanKey(same, { maxPreviewBytes: 10 }, [environmentA]));
+    expect(evidencePlanKey(first, { maxPreviewBytes: 10 }, [environmentA]))
+      .not.toBe(evidencePlanKey(first, { maxPreviewBytes: 10 }, [environmentB]));
   });
 
   it('sanitizes initial capture errors as infrastructure failure', async () => {

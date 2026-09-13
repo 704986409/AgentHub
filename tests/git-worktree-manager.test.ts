@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import { parseWorktreePorcelain, validateTaskId } from '../src/index.js';
+import { isTaskQuarantinedForTesting, quarantineTaskForTesting,
+  releaseTransientRepositoryCoordinationForTesting } from '../src/workspace/GitWorktreeManager.js';
 
 describe('GitWorktreeManager validation', () => {
   it.each(['TASK-123', 'task_abc', 'abc.def', 'A', 'a'.repeat(64)])('accepts safe task ID %s', (taskId) => {
@@ -12,6 +14,18 @@ describe('GitWorktreeManager validation', () => {
     'CON', 'PRN', 'AUX', 'NUL', 'COM1', 'LPT9', 'con.txt', 'NUL.anything', 'a'.repeat(65),
   ])('rejects unsafe task ID %s without normalization', (taskId) => {
     expectErrorCode(() => validateTaskId(taskId), 'GIT_WORKTREE_INVALID_TASK_ID');
+  });
+});
+
+describe('GitWorktreeManager process quarantine identity', () => {
+  it('survives transient coordinator release and uses the canonical repository plus task key', () => {
+    const repository = pathForTest('AgentHub-Quarantine-Repository');
+    const alias = process.platform === 'win32' ? repository.toLocaleUpperCase('en-US') : repository;
+    quarantineTaskForTesting(repository, 'TASK-A');
+    releaseTransientRepositoryCoordinationForTesting(repository);
+    expect(isTaskQuarantinedForTesting(alias, 'TASK-A')).toBe(true);
+    expect(isTaskQuarantinedForTesting(repository, 'TASK-B')).toBe(false);
+    expect(isTaskQuarantinedForTesting(pathForTest('different-repository'), 'TASK-A')).toBe(false);
   });
 });
 
@@ -53,4 +67,8 @@ function expectErrorCode(callback: () => unknown, code: string): void {
   try { callback(); } catch (error) { caught = error; }
   expect(caught).toBeInstanceOf(Error);
   expect(caught).toMatchObject({ code });
+}
+
+function pathForTest(name: string): string {
+  return process.platform === 'win32' ? `C:\\${name}` : `/tmp/${name}`;
 }

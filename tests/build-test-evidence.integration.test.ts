@@ -1,9 +1,12 @@
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { GitCommandRunner, GitWorktreeManager, type BuildTestEvidencePlan } from '../src/index.js';
+import { GitCommandRunner, GitWorktreeManager, TaskCommandRunnerError,
+  type BuildTestEvidencePlan, type TaskCommandRunResult } from '../src/index.js';
+import { releaseTransientRepositoryCoordinationForTesting } from '../src/workspace/GitWorktreeManager.js';
 
 const gitRunner = new GitCommandRunner();
 const roots: string[] = [];
@@ -76,6 +79,32 @@ describe('Build/Test evidence real integration', { timeout: 60_000 }, () => {
     expect(untracked.outcome).toBe('workspace-mutated');
   });
 
+  it.each([
+    ['root', '.gitignore', 'generated-source.ts'],
+    ['nested', 'src/.gitignore', 'src/generated.ts'],
+  ] as const)('detects a self-ignored %s .gitignore and hidden generated source', async (_label, policy, generated) => {
+    const { manager } = await workspaceFixture('agenthub evidence self ignore ');
+    const script = `const fs=require('node:fs');fs.mkdirSync(${JSON.stringify(path.dirname(policy))},{recursive:true});fs.writeFileSync(${JSON.stringify(policy)},${JSON.stringify(`${path.basename(policy)}\n${path.basename(generated)}\n`)});fs.writeFileSync(${JSON.stringify(generated)},'hidden source')`;
+    const evidence = await manager.collectBuildTestEvidence('TASK-A', plan(['self-ignore', 'build', script]));
+    expect(evidence).toMatchObject({ outcome: 'workspace-mutated', build: 'failed', test: 'not-run' });
+    expect(evidence.commands[0]).toMatchObject({ sourceStable: true,
+      sourceVisibilityAfter: { status: 'captured', stable: false } });
+    await expect(manager.captureWorkspaceChanges('TASK-A')).resolves.toMatchObject({ taskId: 'TASK-A' });
+  });
+
+  it('allows normal generated output under a stable tracked ignore policy', async () => {
+    const { manager, workspace } = await workspaceFixture('agenthub evidence stable ignore ');
+    await writeFile(path.join(workspace.worktreePath, '.gitignore'), 'dist/\n', 'utf8');
+    await git(workspace.worktreePath, ['add', '.gitignore']);
+    await git(workspace.worktreePath, ['commit', '-m', 'stable ignore policy']);
+    const evidence = await manager.collectBuildTestEvidence('TASK-A', plan(
+      ['ignored-output', 'build', 'require("node:fs").mkdirSync("dist",{recursive:true});require("node:fs").writeFileSync("dist/output.js","generated")'],
+    ));
+    expect(evidence).toMatchObject({ outcome: 'passed', build: 'passed' });
+    expect(evidence.commands[0]).toMatchObject({ sourceStable: true,
+      sourceVisibilityAfter: { status: 'captured', stable: true } });
+  });
+
   it('detects an info/exclude mutation even when the new source becomes ignored', async () => {
     const { manager, workspace } = await workspaceFixture('agenthub evidence info exclude ');
     const excludePath = await gitPath(workspace.worktreePath, 'info/exclude');
@@ -85,6 +114,7 @@ describe('Build/Test evidence real integration', { timeout: 60_000 }, () => {
     expect(evidence).toMatchObject({ outcome: 'workspace-mutated', build: 'failed' });
     expect(evidence.commands[0]).toMatchObject({ sourceStable: true,
       sourceVisibilityAfter: { status: 'captured', stable: false } });
+    await expect(manager.captureWorkspaceChanges('TASK-A')).resolves.toMatchObject({ taskId: 'TASK-A' });
   });
 
   it('detects effective core.excludesFile content changes without exposing the policy', async () => {
@@ -183,6 +213,91 @@ describe('Build/Test evidence real integration', { timeout: 60_000 }, () => {
     await expect(manager.captureWorkspaceChanges('TASK-A')).resolves.toMatchObject({ taskId: 'TASK-A' });
   });
 
+  it('joins the same effective environment and rejects a changed inherited environment', async () => {
+    const { repo, manager } = await workspaceFixture('agenthub evidence environment join ');
+    const peer = await GitWorktreeManager.open({ repositoryRoot: repo });
+    const previous = process.env.AGENTHUB_TEST_SAFE;
+    const valueA = 'private-environment-value-A';
+    const valueB = 'private-environment-value-B';
+    process.env.AGENTHUB_TEST_SAFE = valueA;
+    try {
+      const envPlan: BuildTestEvidencePlan = { commands: [{
+        ...spec('environment', 'test', 'setTimeout(()=>process.stdout.write(require("node:crypto").createHash("sha256").update(process.env.AGENTHUB_TEST_SAFE ?? "missing").digest("hex")),400)'),
+        inheritEnv: ['AGENTHUB_TEST_SAFE'],
+      }] };
+      const first = manager.collectBuildTestEvidence('TASK-A', envPlan);
+      const joined = peer.collectBuildTestEvidence('TASK-A', envPlan);
+      expect(joined).toBe(first);
+      process.env.AGENTHUB_TEST_SAFE = valueB;
+      await expect(peer.collectBuildTestEvidence('TASK-A', envPlan))
+        .rejects.toMatchObject({ code: 'GIT_WORKTREE_OPERATION_BUSY' });
+      const evidenceA = await first;
+      expect(evidenceA.commands[0]?.stdout.preview).toBe(hash(valueA));
+      const evidenceB = await peer.collectBuildTestEvidence('TASK-A', envPlan);
+      expect(evidenceB.commands[0]?.stdout.preview).toBe(hash(valueB));
+      expect(evidenceB.commands[0]?.executionEnvironmentSha256)
+        .not.toBe(evidenceA.commands[0]?.executionEnvironmentSha256);
+      expect(evidenceB.evidenceSha256).not.toBe(evidenceA.evidenceSha256);
+      expect(JSON.stringify(evidenceB)).not.toContain('AGENTHUB_TEST_SAFE');
+      expect(JSON.stringify(evidenceB)).not.toContain(valueB);
+    } finally {
+      if (previous === undefined) delete process.env.AGENTHUB_TEST_SAFE;
+      else process.env.AGENTHUB_TEST_SAFE = previous;
+    }
+  });
+
+  it('includes changed default-safe PATH in evidence join identity', async () => {
+    const { repo, manager } = await workspaceFixture('agenthub evidence default environment join ');
+    const peer = await GitWorktreeManager.open({ repositoryRoot: repo });
+    const originalPath = process.env.PATH;
+    const stablePlan = plan(['default-environment', 'test', 'setTimeout(()=>process.stdout.write("done"),400)']);
+    const first = manager.collectBuildTestEvidence('TASK-A', stablePlan);
+    try {
+      process.env.PATH = `${originalPath ?? ''}${path.delimiter}agenthub-different-path`;
+      await expect(peer.collectBuildTestEvidence('TASK-A', stablePlan))
+        .rejects.toMatchObject({ code: 'GIT_WORKTREE_OPERATION_BUSY' });
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+    await expect(first).resolves.toMatchObject({ outcome: 'passed' });
+  });
+
+  it('keeps cleanup quarantine durable across transient coordinator replacement and repository reopen', async () => {
+    const repo = await createRepository('agenthub evidence durable quarantine ');
+    const factual = factualCleanupFailure();
+    const manager = await GitWorktreeManager.open({
+      repositoryRoot: repo,
+      taskRunner: { run: () => Promise.reject(new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED', factual)) },
+    });
+    await manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' });
+    await manager.createWorkspace({ taskId: 'TASK-B', baseRef: 'HEAD' });
+    const evidence = await manager.collectBuildTestEvidence('TASK-A', plan(['cleanup', 'test', 'process.exit(0)']));
+    expect(evidence).toMatchObject({ outcome: 'infrastructure-failed', test: 'infrastructure-failed' });
+    expect(evidence.commands[0]).toMatchObject({ cleanupFailed: true, outcome: 'timed-out' });
+    for (const operation of [
+      manager.captureWorkspaceChanges('TASK-A'),
+      manager.removeWorkspace('TASK-A'),
+      manager.collectBuildTestEvidence('TASK-A', plan(['again', 'test', 'process.exit(0)'])),
+      manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' }),
+    ]) await expect(operation).rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+
+    releaseTransientRepositoryCoordinationForTesting(repo);
+    const reopened = await GitWorktreeManager.open({ repositoryRoot: repo });
+    for (const operation of [
+      reopened.captureWorkspaceChanges('TASK-A'),
+      reopened.removeWorkspace('TASK-A'),
+      reopened.collectBuildTestEvidence('TASK-A', plan(['reopened', 'test', 'process.exit(0)'])),
+      reopened.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' }),
+    ]) await expect(operation).rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+    await expect(reopened.captureWorkspaceChanges('TASK-B')).resolves.toMatchObject({ taskId: 'TASK-B' });
+
+    const otherRepo = await createRepository('agenthub evidence quarantine other repo ');
+    const other = await GitWorktreeManager.open({ repositoryRoot: otherRepo });
+    await other.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' });
+    await expect(other.captureWorkspaceChanges('TASK-A')).resolves.toMatchObject({ taskId: 'TASK-A' });
+  });
+
   it('snapshots mutable command and option inputs before asynchronous execution', async () => {
     const { manager } = await workspaceFixture('agenthub evidence snapshot ');
     const args = ['-e', 'process.stdout.write("original")'];
@@ -252,6 +367,14 @@ function plan(...commands: readonly CommandTuple[]): BuildTestEvidencePlan {
 function spec(id: string, phase: 'build' | 'test', script: string) {
   return { id, phase, executable: process.execPath, args: ['-e', script], timeoutMs: 5_000 } as const;
 }
+function factualCleanupFailure(): TaskCommandRunResult {
+  return Object.freeze({
+    outcome: 'timed-out', durationMs: 10, cleanupFailed: true,
+    executionEnvironmentSha256: '2'.repeat(64),
+    stdout: Object.freeze({ byteLength: 3, sha256: '3'.repeat(64), preview: 'ran', previewTruncated: false }),
+    stderr: Object.freeze({ byteLength: 0, sha256: '4'.repeat(64), preview: '', previewTruncated: false }),
+  });
+}
 async function workspaceFixture(prefix: string) {
   const repo = await createRepository(prefix);
   const manager = await GitWorktreeManager.open({ repositoryRoot: repo });
@@ -269,6 +392,7 @@ async function createRepository(prefix: string): Promise<string> {
   return repo;
 }
 function git(cwd: string, args: readonly string[]) { return gitRunner.run(args, { cwd }); }
+function hash(value: string): string { return createHash('sha256').update(value).digest('hex'); }
 async function gitPath(cwd: string, name: string): Promise<string> {
   const result = await gitRunner.run(['rev-parse', '--path-format=absolute', '--git-path', name], { cwd });
   if (result.exitCode !== 0) throw new Error(`Unable to resolve Git path ${name}`);

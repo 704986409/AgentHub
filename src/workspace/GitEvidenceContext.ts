@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, open } from 'node:fs/promises';
+import { lstat, open, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
 import { gitCapturePrefix } from './GitWorkspaceChangeCapture.js';
@@ -25,18 +25,34 @@ const configKeys = ['core.excludesFile', 'core.attributesFile'] as const;
 export async function captureGitEvidenceContext(
   runner: GitCommandRunnerLike,
   workspace: TaskWorkspace,
+  limits: GitEvidenceContextLimits = {},
 ): Promise<GitEvidenceContextSnapshot> {
-  const first = await captureOnce(runner, workspace);
-  const second = await captureOnce(runner, workspace);
+  const resolvedLimits = {
+    maxIgnoreFiles: limits.maxIgnoreFiles ?? maxIgnoreFiles,
+    maxIgnoreFileBytes: limits.maxIgnoreFileBytes ?? maxIgnoreFileBytes,
+    maxIgnoreTotalBytes: limits.maxIgnoreTotalBytes ?? maxIgnoreTotalBytes,
+  };
+  if (Object.values(resolvedLimits).some((value) => !Number.isSafeInteger(value) || value < 1)) {
+    throw new Error('Git evidence limits are invalid');
+  }
+  const first = await captureOnce(runner, workspace, resolvedLimits);
+  const second = await captureOnce(runner, workspace, resolvedLimits);
   if (first.sourceVisibilitySha256 !== second.sourceVisibilitySha256) {
     throw new Error('Git evidence visibility changed while capturing');
   }
   return first;
 }
 
+export interface GitEvidenceContextLimits {
+  readonly maxIgnoreFiles?: number;
+  readonly maxIgnoreFileBytes?: number;
+  readonly maxIgnoreTotalBytes?: number;
+}
+
 async function captureOnce(
   runner: GitCommandRunnerLike,
   workspace: TaskWorkspace,
+  limits: Required<GitEvidenceContextLimits>,
 ): Promise<GitEvidenceContextSnapshot> {
   const cwd = workspace.worktreePath;
   const metadataNames = ['info/exclude', 'info/attributes', 'config', 'config.worktree'];
@@ -61,7 +77,7 @@ async function captureOnce(
       files: await configuredFiles(result.stdout),
     };
   }));
-  const ignorePolicies = await captureIgnorePolicies(runner, cwd);
+  const ignorePolicies = await captureIgnorePolicies(runner, cwd, limits);
 
   return Object.freeze({
     sourceVisibilitySha256: digest(JSON.stringify({ metadata, configured, ignorePolicies })),
@@ -94,11 +110,18 @@ async function captureOnce(
   }
 }
 
-async function captureIgnorePolicies(runner: GitCommandRunnerLike, cwd: string): Promise<readonly unknown[]> {
-  const result = await runGit(runner, ['ls-files', '--cached', '--others', '--ignored', '--exclude-standard', '-z', '--', '*.gitignore', '**/.gitignore'], cwd, [0]);
-  const paths = result.stdout.length === 0 ? [] : result.stdout.split('\0').filter(Boolean);
+async function captureIgnorePolicies(
+  runner: GitCommandRunnerLike, cwd: string, limits: Required<GitEvidenceContextLimits>,
+): Promise<readonly unknown[]> {
+  const pathspec = ['--', '*.gitignore', '**/.gitignore'] as const;
+  const [tracked, selfIgnored] = await Promise.all([
+    runGit(runner, ['ls-files', '--cached', '-z', ...pathspec], cwd, [0]),
+    runGit(runner, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z', ...pathspec], cwd, [0]),
+  ]);
+  const paths = `${tracked.stdout}${selfIgnored.stdout}`.split('\0').filter(Boolean);
   const unique = [...new Set(paths)].sort();
-  if (unique.length > maxIgnoreFiles) throw new Error('Too many Git ignore policy files');
+  if (unique.length > limits.maxIgnoreFiles) throw new Error('Too many Git ignore policy files');
+  const canonicalRoot = await realpath(cwd);
   let total = 0;
   const records: unknown[] = [];
   for (const relative of unique) {
@@ -106,16 +129,39 @@ async function captureIgnorePolicies(runner: GitCommandRunnerLike, cwd: string):
       relative.split('/').some((part) => part === '..' || part === '' || part === '.')) {
       throw new Error('Git ignore policy path is unsafe');
     }
-    const target = path.resolve(cwd, ...relative.split('/'));
-    if (!isContained(cwd, target)) throw new Error('Git ignore policy path escapes worktree');
+    const target = path.resolve(canonicalRoot, ...relative.split('/'));
+    if (!isContained(canonicalRoot, target)) throw new Error('Git ignore policy path escapes worktree');
+    await validateParentChain(canonicalRoot, target);
     const stat = await lstat(target).catch(() => undefined);
     if (stat === undefined) { records.push({ path: digest(relative), state: 'missing' }); continue; }
     if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('Git ignore policy is unsafe');
-    if (stat.size > maxIgnoreFileBytes || total + stat.size > maxIgnoreTotalBytes) throw new Error('Git ignore policy is too large');
+    if (stat.size > limits.maxIgnoreFileBytes || total + stat.size > limits.maxIgnoreTotalBytes) {
+      throw new Error('Git ignore policy is too large');
+    }
     total += stat.size;
-    records.push({ path: digest(relative), file: await fingerprint(target, maxIgnoreFileBytes) });
+    records.push({
+      path: digest(relative),
+      file: await fingerprint(target, limits.maxIgnoreFileBytes, () => validateParentChain(canonicalRoot, target)),
+    });
   }
   return records;
+}
+
+async function validateParentChain(root: string, target: string): Promise<void> {
+  const canonicalRoot = await realpath(root);
+  let cursor = canonicalRoot;
+  const parent = path.dirname(target);
+  const relative = path.relative(canonicalRoot, parent);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error('Git ignore policy parent escapes worktree');
+  }
+  for (const part of relative ? relative.split(path.sep) : []) {
+    cursor = path.join(cursor, part);
+    const stat = await lstat(cursor);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || !samePath(await realpath(cursor), cursor)) {
+      throw new Error('Git ignore policy parent is unsafe');
+    }
+  }
 }
 
 async function runGit(
@@ -137,16 +183,18 @@ function parseOriginPath(origin: string, cwd: string): string {
   return path.isAbsolute(value) ? value : path.resolve(cwd, value);
 }
 
-async function fingerprint(target: string, limit = maxFileBytes): Promise<unknown> {
+async function fingerprint(target: string, limit = maxFileBytes, parentGuard?: () => Promise<void>): Promise<unknown> {
   const privatePath = digest(path.normalize(target));
   try {
     const before = await lstat(target);
+    await parentGuard?.();
     if (before.isSymbolicLink() || !before.isFile() || before.size > limit) {
       throw new Error('Git evidence file is unsafe');
     }
     const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
       const opened = await handle.stat();
+      await parentGuard?.();
       if (opened.isSymbolicLink() || !opened.isFile() || before.size !== opened.size ||
         before.mtimeMs !== opened.mtimeMs || before.ctimeMs !== opened.ctimeMs) {
         throw new Error('Git evidence file changed');
@@ -163,6 +211,7 @@ async function fingerprint(target: string, limit = maxFileBytes): Promise<unknow
       }
       const after = await lstat(target);
       const final = await handle.stat();
+      await parentGuard?.();
       if (after.isSymbolicLink() || !after.isFile() || size !== before.size ||
         !sameStats(before, final) || !sameStats(before, after)) {
         throw new Error('Git evidence file changed');
@@ -183,6 +232,12 @@ async function fingerprint(target: string, limit = maxFileBytes): Promise<unknow
 function isContained(root: string, target: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(target));
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function samePath(a: string, b: string): boolean {
+  const normalize = (value: string): string => path.normalize(value).replace(/[\\/]$/u, '');
+  if (process.platform !== 'win32') return normalize(a) === normalize(b);
+  return normalize(a).toLocaleLowerCase('en-US') === normalize(b).toLocaleLowerCase('en-US');
 }
 
 function sameStats(a: { size: number; mtimeMs: number; ctimeMs: number }, b: { size: number; mtimeMs: number; ctimeMs: number }): boolean {

@@ -33,6 +33,11 @@ export interface TaskCommandRunResult {
   readonly cleanupFailed?: boolean;
 }
 
+export interface TaskCommandEnvironmentSnapshot {
+  readonly environment: Readonly<NodeJS.ProcessEnv>;
+  readonly executionEnvironmentSha256: string;
+}
+
 export interface TaskCommandRunnerOptions {
   readonly worktreePath: string;
   readonly maxOutputBytes?: number;
@@ -77,7 +82,10 @@ export class TaskCommandRunner {
     this.#maxPreviewBytes = boundedPositive(options.maxPreviewBytes ?? defaultMaxPreviewBytes, maxPreviewBytes);
   }
 
-  public async run(spec: TaskCommandRunSpec): Promise<TaskCommandRunResult> {
+  public async run(
+    spec: TaskCommandRunSpec,
+    environmentSnapshot?: TaskCommandEnvironmentSnapshot,
+  ): Promise<TaskCommandRunResult> {
     // Read each caller-owned field exactly once before the first await. Every
     // subsequent validation, timer, and spawn operation uses this snapshot.
     const executableValue = spec.executable;
@@ -104,7 +112,8 @@ export class TaskCommandRunner {
     }
     const inheritEnv: string[] = Array.from(inheritEnvValue as readonly string[]);
     const env = { ...envValue } as Record<string, string>;
-    const { environment, executionEnvironmentSha256 } = buildEnvironment(inheritEnv, env, { ...process.env });
+    const { environment, executionEnvironmentSha256 } = environmentSnapshot ??
+      snapshotTaskCommandEnvironment(inheritEnv, env);
     await this.#validateCwd(cwd);
     const stdout = createAccumulator(this.#maxPreviewBytes);
     const stderr = createAccumulator(this.#maxPreviewBytes);
@@ -350,11 +359,18 @@ async function waitForSettlement(child: ChildProcess): Promise<void> {
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
-function buildEnvironment(inheritEnv: readonly string[], explicit: Readonly<Record<string, string>>,
-  processEnvironment: NodeJS.ProcessEnv): { environment: NodeJS.ProcessEnv; executionEnvironmentSha256: string } {
+export function snapshotTaskCommandEnvironment(
+  inheritEnv: readonly string[],
+  explicit: Readonly<Record<string, string>>,
+  processEnvironment: NodeJS.ProcessEnv = { ...process.env },
+): TaskCommandEnvironmentSnapshot {
+  if (!Array.isArray(inheritEnv) || inheritEnv.length > maxInheritedEnvironment || !isRecord(explicit)) {
+    throw new TaskCommandRunnerError('INVALID_ENV');
+  }
+  const inherited = inheritEnv as readonly unknown[];
   const result: NodeJS.ProcessEnv = {};
   const requested = new Map<string, string>();
-  for (const key of [...defaultSafeEnvironment, ...inheritEnv]) {
+  for (const key of [...defaultSafeEnvironment, ...inherited]) {
     if (typeof key !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) || key.includes('\0')) {
       throw new TaskCommandRunnerError('INVALID_ENV');
     }
@@ -372,7 +388,12 @@ function buildEnvironment(inheritEnv: readonly string[], explicit: Readonly<Reco
       candidate.toLocaleUpperCase('en-US') === key.toLocaleUpperCase('en-US'));
     if (sourceKey !== undefined) {
       const value = processEnvironment[sourceKey];
-      if (value !== undefined) result[key] = value;
+      if (value !== undefined) {
+        if (value.includes('\0') || Buffer.byteLength(value, 'utf8') > maxEnvironmentValueBytes) {
+          throw new TaskCommandRunnerError('INVALID_ENV');
+        }
+        result[sourceKey] = value;
+      }
     }
   }
   if (Object.keys(explicit).length > maxExplicitEnvironment) throw new TaskCommandRunnerError('INVALID_ENV');
@@ -389,13 +410,17 @@ function buildEnvironment(inheritEnv: readonly string[], explicit: Readonly<Reco
     explicitKeys.add(normalized);
     result[key] = value;
   }
-  const pairs = Object.keys(result).sort().map((key) => [key, result[key] ?? null]);
-  return {
-    environment: result,
+  const identityKey = (key: string): string => process.platform === 'win32'
+    ? key.toLocaleUpperCase('en-US')
+    : key;
+  const pairs = Object.keys(result).map((key) => [identityKey(key), result[key] ?? null] as const)
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  return Object.freeze({
+    environment: Object.freeze(result),
     executionEnvironmentSha256: createHash('sha256').update(
       `AgentHub.TaskCommandRunner.execution-environment.v1\0${JSON.stringify(pairs)}`,
     ).digest('hex'),
-  };
+  });
 }
 
 function validateString(value: unknown, code: 'INVALID_COMMAND'): string {

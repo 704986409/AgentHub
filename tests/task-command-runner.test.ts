@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { TaskCommandRunner } from '../src/index.js';
+import { TaskCommandRunner, TaskCommandRunnerError, snapshotTaskCommandEnvironment } from '../src/index.js';
 
 const roots: string[] = [];
 
@@ -108,6 +108,64 @@ describe('TaskCommandRunner', { timeout: 20_000 }, () => {
     }
   });
 
+  it('snapshots inherited environment before asynchronous cwd validation', async () => {
+    const root = await temporaryRoot('agenthub environment snapshot ');
+    const previous = process.env.AGENTHUB_TEST_SAFE;
+    process.env.AGENTHUB_TEST_SAFE = 'A';
+    try {
+      const pending = new TaskCommandRunner({ worktreePath: root }).run({
+        ...command('process.stdout.write(process.env.AGENTHUB_TEST_SAFE ?? "missing")'),
+        inheritEnv: ['AGENTHUB_TEST_SAFE'],
+      });
+      process.env.AGENTHUB_TEST_SAFE = 'B';
+      await expect(pending).resolves.toMatchObject({ outcome: 'passed', stdout: { preview: 'A' } });
+    } finally {
+      if (previous === undefined) delete process.env.AGENTHUB_TEST_SAFE;
+      else process.env.AGENTHUB_TEST_SAFE = previous;
+    }
+  });
+
+  it('canonicalizes environment identity, changes it with values, and exposes only a digest', () => {
+    const a = snapshotTaskCommandEnvironment([], { ALPHA: '1', BETA: '2' }, {});
+    const reordered = snapshotTaskCommandEnvironment([], { BETA: '2', ALPHA: '1' }, {});
+    const changed = snapshotTaskCommandEnvironment([], { ALPHA: 'different', BETA: '2' }, {});
+    expect(a.executionEnvironmentSha256).toBe(reordered.executionEnvironmentSha256);
+    expect(a.executionEnvironmentSha256).not.toBe(changed.executionEnvironmentSha256);
+    const mixedCase = snapshotTaskCommandEnvironment([], { MixedCase: 'x' }, {});
+    const upperCase = snapshotTaskCommandEnvironment([], { MIXEDCASE: 'x' }, {});
+    if (process.platform === 'win32') {
+      expect(mixedCase.executionEnvironmentSha256).toBe(upperCase.executionEnvironmentSha256);
+    } else {
+      expect(mixedCase.executionEnvironmentSha256).not.toBe(upperCase.executionEnvironmentSha256);
+    }
+    expect(JSON.stringify({ executionEnvironmentSha256: changed.executionEnvironmentSha256 }))
+      .not.toContain('different');
+    expect(Object.isFrozen(a.environment)).toBe(true);
+  });
+
+  it('rejects command and environment resource-bound violations including null env', async () => {
+    const root = await temporaryRoot('agenthub runner bounds ');
+    const runner = new TaskCommandRunner({ worktreePath: root });
+    await expect(runner.run({ ...command(''), args: Array.from({ length: 4097 }, () => 'x') }))
+      .rejects.toMatchObject({ code: 'INVALID_COMMAND' });
+    await expect(runner.run({ ...command(''), args: ['x'.repeat(64 * 1024 + 1)] }))
+      .rejects.toMatchObject({ code: 'INVALID_COMMAND' });
+    await expect(runner.run({ ...command(''), inheritEnv: Array.from({ length: 257 }, (_, i) => `SAFE_${String(i)}`) }))
+      .rejects.toMatchObject({ code: 'INVALID_ENV' });
+    const tooManyEnv = Object.fromEntries(Array.from({ length: 257 }, (_, i) => [`SAFE_${String(i)}`, 'x']));
+    await expect(runner.run({ ...command(''), env: tooManyEnv })).rejects.toMatchObject({ code: 'INVALID_ENV' });
+    await expect(runner.run({ ...command(''), env: { SAFE_VALUE: 'x'.repeat(1024 * 1024 + 1) } }))
+      .rejects.toMatchObject({ code: 'INVALID_ENV' });
+    await expect(runner.run({ ...command(''), env: null as unknown as Record<string, string> }))
+      .rejects.toMatchObject({ code: 'INVALID_ENV' });
+    expect(() => snapshotTaskCommandEnvironment(['SAFE_VALUE'], {}, {
+      SAFE_VALUE: 'x'.repeat(1024 * 1024 + 1),
+    })).toThrow(TaskCommandRunnerError);
+    expect(() => snapshotTaskCommandEnvironment(
+      Array.from({ length: 256 }, (_, i) => `SAFE_${String(i)}`), {}, {},
+    )).not.toThrow();
+  });
+
   it('contains cwd and rejects missing, file-like, linked, absolute, parent, and shell-script cwd/executable inputs', async () => {
     const root = await temporaryRoot('agenthub cwd ');
     await mkdir(path.join(root, 'child'));
@@ -134,6 +192,17 @@ describe('TaskCommandRunner', { timeout: 20_000 }, () => {
     const root = await temporaryRoot('agenthub cleanup ');
     const marker = path.join(root, 'orphan-marker.txt');
     const childScript = `setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'orphan'),700)`;
+    const parentScript = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});setInterval(()=>{},1000)`;
+    const result = await new TaskCommandRunner({ worktreePath: root }).run(command(parentScript, 150));
+    expect(result.outcome).toBe('timed-out');
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    await expect(access(marker)).rejects.toBeDefined();
+  });
+
+  it.runIf(process.platform !== 'win32')('kills a SIGTERM-resistant descendant after the root exits first', async () => {
+    const root = await temporaryRoot('agenthub root exits first ');
+    const marker = path.join(root, 'surviving-descendant.txt');
+    const childScript = `process.on('SIGTERM',()=>{});setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'orphan'),700);setInterval(()=>{},1000)`;
     const parentScript = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});setInterval(()=>{},1000)`;
     const result = await new TaskCommandRunner({ worktreePath: root }).run(command(parentScript, 150));
     expect(result.outcome).toBe('timed-out');
