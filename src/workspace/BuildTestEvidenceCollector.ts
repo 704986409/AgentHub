@@ -180,6 +180,148 @@ export function snapshotBuildTestEvidenceOptions(
   });
 }
 
+export function snapshotBuildTestEvidence(value: unknown): BuildTestEvidence {
+  if (!isRecord(value)) throw new TypeError('Invalid BuildTestEvidence');
+  const version = value.version;
+  const taskId = value.taskId;
+  const branchName = value.branchName;
+  const baseCommit = value.baseCommit;
+  const headCommit = value.headCommit;
+  const changeSetSha256 = value.changeSetSha256;
+  const sourceVisibilitySha256 = value.sourceVisibilitySha256;
+  const build = value.build;
+  const test = value.test;
+  const outcome = value.outcome;
+  const rawCommands = value.commands;
+  const evidenceSha256 = value.evidenceSha256;
+  const phaseOutcomes = new Set(['passed', 'failed', 'infrastructure-failed', 'not-run']);
+  const evidenceOutcomes = new Set(['passed', 'failed', 'workspace-mutated', 'infrastructure-failed']);
+  if (version !== 2 || !validEvidenceTaskId(taskId) || !boundedEvidenceString(branchName, 4096, false) ||
+    !validOid(baseCommit) || !validOid(headCommit) || !validSha(changeSetSha256) ||
+    !validSha(sourceVisibilitySha256) || typeof build !== 'string' || !phaseOutcomes.has(build) ||
+    typeof test !== 'string' || !phaseOutcomes.has(test) || typeof outcome !== 'string' ||
+    !evidenceOutcomes.has(outcome) || !Array.isArray(rawCommands) || rawCommands.length > 256 ||
+    !validSha(evidenceSha256)) throw new TypeError('Invalid BuildTestEvidence');
+  const commands = Object.freeze(rawCommands.map(snapshotCommandEvidence));
+  const base: Omit<BuildTestEvidence, 'evidenceSha256'> = {
+    version, taskId, branchName, baseCommit, headCommit, changeSetSha256, sourceVisibilitySha256,
+    build: build as BuildTestEvidence['build'], test: test as BuildTestEvidence['test'],
+    outcome: outcome as BuildTestEvidence['outcome'], commands,
+  };
+  if (sha(canonicalEvidence(base)) !== evidenceSha256) throw new TypeError('Invalid BuildTestEvidence');
+  return deepFreeze({ ...base, evidenceSha256 }) as BuildTestEvidence;
+}
+
+function snapshotCommandEvidence(value: unknown): CommandEvidence {
+  if (!isRecord(value)) throw new TypeError('Invalid BuildTestEvidence');
+  const commandId = value.commandId;
+  const phase = value.phase;
+  const commandSpecSha256 = value.commandSpecSha256;
+  const executableName = value.executableName;
+  const argCount = value.argCount;
+  const cwd = value.cwd;
+  const outcome = value.outcome;
+  const executionEnvironmentSha256 = value.executionEnvironmentSha256;
+  const exitCode = value.exitCode;
+  const signal = value.signal;
+  const durationMs = value.durationMs;
+  const stdout = snapshotCommandStream(value.stdout);
+  const stderr = snapshotCommandStream(value.stderr);
+  const sourceBeforeSha256 = value.sourceBeforeSha256;
+  const sourceVisibilityBeforeSha256 = value.sourceVisibilityBeforeSha256;
+  const sourceAfter = snapshotSourceAfter(value.sourceAfter);
+  const sourceVisibilityAfter = snapshotVisibilityAfter(value.sourceVisibilityAfter);
+  const sourceAfterSha256 = value.sourceAfterSha256;
+  const sourceStable = value.sourceStable;
+  const cleanupFailed = value.cleanupFailed;
+  if (typeof commandId !== 'string' || !/^[A-Za-z0-9._-]{1,64}$/u.test(commandId) ||
+    (phase !== 'build' && phase !== 'test') || !validSha(commandSpecSha256) ||
+    !boundedEvidenceString(executableName, 4096, false) || !safeIntegerBetween(argCount, 0, 4096) ||
+    !boundedEvidenceString(cwd, 4096, false) || !isTaskCommandOutcome(outcome) ||
+    !validSha(executionEnvironmentSha256) ||
+    (exitCode !== undefined && !safeIntegerBetween(exitCode, -2147483648, 2147483647)) ||
+    (signal !== undefined && !boundedEvidenceString(signal, 128, false)) ||
+    !finiteNumberBetween(durationMs, 0, Number.MAX_SAFE_INTEGER) || !validSha(sourceBeforeSha256) ||
+    !validSha(sourceVisibilityBeforeSha256) || typeof sourceStable !== 'boolean' ||
+    (cleanupFailed !== undefined && typeof cleanupFailed !== 'boolean') ||
+    (sourceAfterSha256 !== undefined && !validSha(sourceAfterSha256)) ||
+    (sourceAfter.status === 'captured' && sourceAfterSha256 !== undefined &&
+      sourceAfterSha256 !== sourceAfter.changeSetSha256) ||
+    (sourceAfter.status === 'capture-failed' && sourceAfterSha256 !== undefined)) {
+    throw new TypeError('Invalid BuildTestEvidence');
+  }
+  return deepFreeze({
+    commandId, phase, commandSpecSha256, executableName, argCount, cwd, outcome,
+    executionEnvironmentSha256,
+    ...(exitCode === undefined ? {} : { exitCode }),
+    ...(signal === undefined ? {} : { signal }),
+    durationMs, stdout, stderr, sourceBeforeSha256, sourceVisibilityBeforeSha256,
+    sourceAfter, sourceVisibilityAfter,
+    ...(sourceAfterSha256 === undefined ? {} : { sourceAfterSha256 }),
+    sourceStable,
+    ...(cleanupFailed === undefined ? {} : { cleanupFailed }),
+  }) as CommandEvidence;
+}
+
+function snapshotCommandStream(value: unknown): CommandStreamEvidence {
+  if (!isRecord(value)) throw new TypeError('Invalid BuildTestEvidence');
+  const byteLength = value.byteLength;
+  const sha256 = value.sha256;
+  const preview = value.preview;
+  const previewTruncated = value.previewTruncated;
+  if (!safeIntegerBetween(byteLength, 0, 1024 * 1024 * 1024) || !validSha(sha256) ||
+    !boundedEvidenceString(preview, 1024 * 1024, true) || typeof previewTruncated !== 'boolean') {
+    throw new TypeError('Invalid BuildTestEvidence');
+  }
+  return Object.freeze({ byteLength, sha256, preview, previewTruncated });
+}
+
+function snapshotSourceAfter(value: unknown): SourceAfterEvidence {
+  if (!isRecord(value)) throw new TypeError('Invalid BuildTestEvidence');
+  const status = value.status;
+  if (status === 'capture-failed') return Object.freeze({ status });
+  const changeSetSha256 = value.changeSetSha256;
+  const stable = value.stable;
+  if (status !== 'captured' || !validSha(changeSetSha256) || typeof stable !== 'boolean') {
+    throw new TypeError('Invalid BuildTestEvidence');
+  }
+  return Object.freeze({ status, changeSetSha256, stable });
+}
+
+function snapshotVisibilityAfter(value: unknown): VisibilityAfterEvidence {
+  if (!isRecord(value)) throw new TypeError('Invalid BuildTestEvidence');
+  const status = value.status;
+  if (status === 'capture-failed') return Object.freeze({ status });
+  const sourceVisibilitySha256 = value.sourceVisibilitySha256;
+  const stable = value.stable;
+  if (status !== 'captured' || !validSha(sourceVisibilitySha256) || typeof stable !== 'boolean') {
+    throw new TypeError('Invalid BuildTestEvidence');
+  }
+  return Object.freeze({ status, sourceVisibilitySha256, stable });
+}
+
+function validEvidenceTaskId(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/u.test(value) &&
+    !value.includes('..') && !value.endsWith('.') &&
+    !/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/iu.test(value);
+}
+function validOid(value: unknown): value is string { return typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(value); }
+function validSha(value: unknown): value is string { return typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value); }
+function boundedEvidenceString(value: unknown, maxBytes: number, allowEmpty: boolean): value is string {
+  return typeof value === 'string' && (allowEmpty || value.length > 0) && !value.includes('\0') &&
+    Buffer.byteLength(value, 'utf8') <= maxBytes;
+}
+function safeIntegerBetween(value: unknown, minimum: number, maximum: number): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum && value <= maximum;
+}
+function finiteNumberBetween(value: unknown, minimum: number, maximum: number): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= minimum && value <= maximum;
+}
+function isTaskCommandOutcome(value: unknown): value is TaskCommandOutcome {
+  return value === 'passed' || value === 'failed' || value === 'timed-out' ||
+    value === 'output-limit' || value === 'spawn-failed';
+}
+
 export async function collectBuildTestEvidence(
   planValue: BuildTestEvidencePlan,
   options: BuildTestEvidenceCollectorOptions,

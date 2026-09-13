@@ -11,6 +11,10 @@ import { captureWorkspaceChanges, snapshotCaptureOptions, canonicalChangeState, 
   type CaptureWorkspaceChangesOptions, type GitWorkspaceChangeSnapshot } from './GitWorkspaceChangeCapture.js';
 import { collectBuildTestEvidence, snapshotBuildTestEvidencePlan,
   snapshotBuildTestEvidenceOptions, type BuildTestEvidence, type BuildTestEvidencePlan, type BuildTestEvidenceCollectorOptions } from './BuildTestEvidenceCollector.js';
+import { captureGitEvidenceContext } from './GitEvidenceContext.js';
+import { evaluateMergeGateSnapshot, snapshotMergeGateInputs, type MergeGateDecision, type MergeGatePolicy,
+  type MergeGateInputSnapshot } from './MergeGate.js';
+import type { ReviewEvidence } from './ReviewEvidence.js';
 
 const excludeRule = '/.agenthub/worktrees/';
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
@@ -86,7 +90,7 @@ export interface GitWorktreeRecord {
 interface PendingOperation {
   readonly token: object;
   readonly taskId: string;
-  readonly kind: 'create' | 'remove' | 'capture' | 'evidence';
+  readonly kind: 'create' | 'remove' | 'capture' | 'evidence' | 'merge-gate';
   readonly captureKey?: string;
   readonly baseRef?: string;
   readonly promise: Promise<unknown>;
@@ -303,6 +307,54 @@ export class GitWorktreeManager {
       ...(taskRunner === undefined ? {} : { taskRunner }),
       ...options,
     });
+  }
+
+  public evaluateMergeGate(
+    taskIdValue: string,
+    buildEvidence: BuildTestEvidence,
+    reviewEvidence: ReviewEvidence,
+    policy: MergeGatePolicy = {},
+  ): Promise<MergeGateDecision> {
+    let taskId: string;
+    let input: MergeGateInputSnapshot;
+    try {
+      taskId = validateTaskId(taskIdValue);
+      input = snapshotMergeGateInputs(buildEvidence, reviewEvidence, policy);
+    } catch (error) { return Promise.reject(asError(error)); }
+    if (isTaskQuarantined(this.#repositoryKey, taskId)) {
+      return Promise.reject(taskQuarantined(taskId));
+    }
+    const key = operationKey(taskId);
+    if (this.#coordination.operations.get(key) !== undefined) return Promise.reject(operationBusy(taskId));
+    const token = {};
+    const operation = this.#evaluateMergeGate(taskId, input);
+    const current = operation.finally(() => {
+      if (this.#coordination.operations.get(key)?.token === token) this.#coordination.operations.delete(key);
+    });
+    this.#coordination.operations.set(key, { token, taskId, kind: 'merge-gate', promise: current });
+    return current;
+  }
+
+  async #evaluateMergeGate(taskId: string, input: MergeGateInputSnapshot): Promise<MergeGateDecision> {
+    const workspace = await this.#inspect(taskId, gitCapturePrefix);
+    if (workspace === undefined) {
+      throw new GitWorktreeError(
+        'GIT_WORKTREE_CONTRACT_VIOLATION', 'Task worktree does not exist', 'merge-gate', taskId,
+      );
+    }
+    const current = await captureWorkspaceChanges(
+      this.#runner,
+      () => this.#inspect(taskId, gitCapturePrefix),
+      {
+        includePatchText: false,
+        maxPatchBytes: 1,
+        maxChangedPaths: 4096,
+        maxFingerprintBytes: 64 * 1024 * 1024,
+        maxIgnoredPaths: 4096,
+      },
+    );
+    const context = await captureGitEvidenceContext(this.#runner, workspace);
+    return evaluateMergeGateSnapshot(taskId, current, context, input);
   }
 
   public removeWorkspace(taskIdValue: string): Promise<void> {

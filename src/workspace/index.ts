@@ -13,3 +13,8 @@ export type { CaptureWorkspaceChangesOptions, GitChangeCaptureErrorCode, GitWork
   GitTrackedChange, CanonicalTrackedIdentity, GitPatchCapture, GitChangeLayer, GitStatusEntry,
   GitWorkspaceChangeSnapshot,
 } from './GitWorkspaceChangeCapture.js';
+
+export { ReviewEvidenceError, createReviewEvidence } from './ReviewEvidence.js';
+export type { ReviewVerdict, ReviewFindingSeverity, ReviewFindingInput, ReviewDecisionInput,
+  ReviewFinding, ReviewEvidence } from './ReviewEvidence.js';
+export type { MergeGatePolicy, MergeGateReason, MergeGateDecision } from './MergeGate.js';
