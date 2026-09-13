@@ -136,6 +136,7 @@ function fakeSource(workspace: TaskWorkspace, changeSetSha256: string): GitWorks
 }
 function passedResult() {
   return { outcome: 'passed' as const, exitCode: 0, durationMs: 1,
+    executionEnvironmentSha256: '2'.repeat(64),
     stdout: { byteLength: 0, sha256: '0'.repeat(64), preview: '', previewTruncated: false },
     stderr: { byteLength: 0, sha256: '1'.repeat(64), preview: '', previewTruncated: false } };
 }

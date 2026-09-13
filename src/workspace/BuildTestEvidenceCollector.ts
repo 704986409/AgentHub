@@ -42,6 +42,7 @@ export interface CommandEvidence {
   readonly argCount: number;
   readonly cwd: string;
   readonly outcome: TaskCommandOutcome;
+  readonly executionEnvironmentSha256: string;
   readonly exitCode?: number;
   readonly signal?: string;
   readonly durationMs: number;
@@ -88,6 +89,8 @@ export interface BuildTestEvidenceCollectorOptions {
   readonly taskRunner?: Pick<TaskCommandRunner, 'run'>;
   readonly captureSource?: (runner: GitCommandRunnerLike, inspect: () => Promise<TaskWorkspace | undefined>) => Promise<GitWorkspaceChangeSnapshot | undefined>;
   readonly captureContext?: (runner: GitCommandRunnerLike, workspace: TaskWorkspace) => Promise<GitEvidenceContextSnapshot>;
+  /** Internal manager seam used to permanently quarantine ambiguous cleanup. */
+  readonly onCleanupAmbiguity?: () => void;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -120,12 +123,14 @@ export function snapshotBuildTestEvidencePlan(value: unknown): BuildTestEvidence
     }
     if (rawArgs !== undefined && !Array.isArray(rawArgs)) throw new BuildTestEvidenceError('INVALID_PLAN');
     const args = rawArgs === undefined ? [] : rawArgs.slice();
-    if (!args.every((arg): arg is string => typeof arg === 'string' && arg.length <= 4096 && !/[\0\r\n]/u.test(arg))) {
+    if (args.length > 4096 || !args.every((arg): arg is string => typeof arg === 'string' &&
+      Buffer.byteLength(arg, 'utf8') <= 64 * 1024 && !/[\0\r\n]/u.test(arg))) {
       throw new BuildTestEvidenceError('INVALID_PLAN');
     }
     if (rawInheritEnv !== undefined && !Array.isArray(rawInheritEnv)) throw new BuildTestEvidenceError('INVALID_PLAN');
     const inheritEnv = rawInheritEnv === undefined ? [] : rawInheritEnv.slice();
-    if (!inheritEnv.every((key): key is string => typeof key === 'string' && key.length <= 256 && !/[\0\r\n]/u.test(key))) {
+    if (inheritEnv.length > 256 || !inheritEnv.every((key): key is string => typeof key === 'string' &&
+      key.length <= 256 && !/[\0\r\n]/u.test(key))) {
       throw new BuildTestEvidenceError('INVALID_PLAN');
     }
     if (inheritEnv.some((key) => /(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)/iu.test(key) || /^GIT_/iu.test(key))) {
@@ -133,8 +138,9 @@ export function snapshotBuildTestEvidencePlan(value: unknown): BuildTestEvidence
     }
     if (rawEnv !== undefined && !isRecord(rawEnv)) throw new BuildTestEvidenceError('INVALID_PLAN');
     const env = rawEnv === undefined ? {} : { ...rawEnv };
-    if (Object.entries(env).some(([key, envValue]) =>
+    if (Object.keys(env).length > 256 || Object.entries(env).some(([key, envValue]) =>
       !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) || typeof envValue !== 'string' || /\0/u.test(envValue) ||
+      Buffer.byteLength(envValue, 'utf8') > 1024 * 1024 ||
       /(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)/iu.test(key) || /^GIT_/iu.test(key))) {
       throw new BuildTestEvidenceError('INVALID_PLAN');
     }
@@ -229,6 +235,7 @@ export async function collectBuildTestEvidence(
       if (error instanceof TaskCommandRunnerError && error.result !== undefined) {
         run = error.result;
         cleanupFailed = true;
+        if (error.code === 'PROCESS_CLEANUP_FAILED') options.onCleanupAmbiguity?.();
       } else {
         stopReason = 'infrastructure-failed';
         break;
@@ -257,6 +264,7 @@ export async function collectBuildTestEvidence(
       argCount: (command.args ?? []).length,
       cwd: command.cwd ?? '.',
       outcome: run.outcome,
+      executionEnvironmentSha256: run.executionEnvironmentSha256,
       ...(run.exitCode === undefined ? {} : { exitCode: run.exitCode }),
       ...(run.signal === undefined ? {} : { signal: run.signal }),
       durationMs: run.durationMs,

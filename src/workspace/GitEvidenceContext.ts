@@ -12,6 +12,9 @@ export interface GitEvidenceContextSnapshot {
 }
 
 const maxFileBytes = 16 * 1024 * 1024;
+const maxIgnoreFiles = 4096;
+const maxIgnoreFileBytes = 4 * 1024 * 1024;
+const maxIgnoreTotalBytes = 64 * 1024 * 1024;
 const configKeys = ['core.excludesFile', 'core.attributesFile'] as const;
 
 /**
@@ -58,9 +61,10 @@ async function captureOnce(
       files: await configuredFiles(result.stdout),
     };
   }));
+  const ignorePolicies = await captureIgnorePolicies(runner, cwd);
 
   return Object.freeze({
-    sourceVisibilitySha256: digest(JSON.stringify({ metadata, configured })),
+    sourceVisibilitySha256: digest(JSON.stringify({ metadata, configured, ignorePolicies })),
   });
 
   async function configuredFiles(output: string): Promise<readonly unknown[]> {
@@ -90,6 +94,30 @@ async function captureOnce(
   }
 }
 
+async function captureIgnorePolicies(runner: GitCommandRunnerLike, cwd: string): Promise<readonly unknown[]> {
+  const result = await runGit(runner, ['ls-files', '--cached', '--others', '--ignored', '--exclude-standard', '-z', '--', '*.gitignore', '**/.gitignore'], cwd, [0]);
+  const paths = result.stdout.length === 0 ? [] : result.stdout.split('\0').filter(Boolean);
+  const unique = [...new Set(paths)].sort();
+  if (unique.length > maxIgnoreFiles) throw new Error('Too many Git ignore policy files');
+  let total = 0;
+  const records: unknown[] = [];
+  for (const relative of unique) {
+    if (!relative || relative.includes('\0') || path.posix.isAbsolute(relative) ||
+      relative.split('/').some((part) => part === '..' || part === '' || part === '.')) {
+      throw new Error('Git ignore policy path is unsafe');
+    }
+    const target = path.resolve(cwd, ...relative.split('/'));
+    if (!isContained(cwd, target)) throw new Error('Git ignore policy path escapes worktree');
+    const stat = await lstat(target).catch(() => undefined);
+    if (stat === undefined) { records.push({ path: digest(relative), state: 'missing' }); continue; }
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error('Git ignore policy is unsafe');
+    if (stat.size > maxIgnoreFileBytes || total + stat.size > maxIgnoreTotalBytes) throw new Error('Git ignore policy is too large');
+    total += stat.size;
+    records.push({ path: digest(relative), file: await fingerprint(target, maxIgnoreFileBytes) });
+  }
+  return records;
+}
+
 async function runGit(
   runner: GitCommandRunnerLike,
   args: readonly string[],
@@ -109,11 +137,11 @@ function parseOriginPath(origin: string, cwd: string): string {
   return path.isAbsolute(value) ? value : path.resolve(cwd, value);
 }
 
-async function fingerprint(target: string): Promise<unknown> {
+async function fingerprint(target: string, limit = maxFileBytes): Promise<unknown> {
   const privatePath = digest(path.normalize(target));
   try {
     const before = await lstat(target);
-    if (before.isSymbolicLink() || !before.isFile() || before.size > maxFileBytes) {
+    if (before.isSymbolicLink() || !before.isFile() || before.size > limit) {
       throw new Error('Git evidence file is unsafe');
     }
     const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -130,7 +158,7 @@ async function fingerprint(target: string): Promise<unknown> {
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
         if (bytesRead === 0) break;
         size += bytesRead;
-        if (size > maxFileBytes) throw new Error('Git evidence file is too large');
+        if (size > limit) throw new Error('Git evidence file is too large');
         hash.update(buffer.subarray(0, bytesRead));
       }
       const after = await lstat(target);
@@ -150,6 +178,11 @@ async function fingerprint(target: string): Promise<unknown> {
     }
     throw error;
   }
+}
+
+function isContained(root: string, target: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
 function sameStats(a: { size: number; mtimeMs: number; ctimeMs: number }, b: { size: number; mtimeMs: number; ctimeMs: number }): boolean {

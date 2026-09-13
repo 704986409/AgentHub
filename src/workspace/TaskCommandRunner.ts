@@ -29,6 +29,7 @@ export interface TaskCommandRunResult {
   readonly durationMs: number;
   readonly stdout: CommandStreamEvidence;
   readonly stderr: CommandStreamEvidence;
+  readonly executionEnvironmentSha256: string;
   readonly cleanupFailed?: boolean;
 }
 
@@ -49,6 +50,11 @@ const maxOutputBytes = 1024 * 1024 * 1024;
 const maxPreviewBytes = 1024 * 1024;
 const maxTimeoutMs = 60 * 60 * 1000;
 const cleanupDeadlineMs = 2_000;
+const maxArgs = 4096;
+const maxArgBytes = 64 * 1024;
+const maxInheritedEnvironment = 256;
+const maxExplicitEnvironment = 256;
+const maxEnvironmentValueBytes = 1024 * 1024;
 
 export class TaskCommandRunnerError extends Error {
   public constructor(
@@ -84,20 +90,22 @@ export class TaskCommandRunner {
     if (/\.(?:cmd|bat)$/iu.test(executable)) throw new TaskCommandRunnerError('INVALID_COMMAND');
     if (!Array.isArray(argsValue)) throw new TaskCommandRunnerError('INVALID_COMMAND');
     const args: string[] = Array.from(argsValue as readonly string[]);
-    if (!args.every((arg) => typeof arg === 'string' && !arg.includes('\0'))) {
+    if (args.length > maxArgs || !args.every((arg) => typeof arg === 'string' &&
+      Buffer.byteLength(arg, 'utf8') <= maxArgBytes && !arg.includes('\0'))) {
       throw new TaskCommandRunnerError('INVALID_COMMAND');
     }
     if (!Number.isSafeInteger(timeoutValue) || timeoutValue < 1 || timeoutValue > maxTimeoutMs) {
       throw new TaskCommandRunnerError('INVALID_COMMAND');
     }
     const cwd = cwdValue;
-    if (!Array.isArray(inheritEnvValue) || typeof envValue !== 'object' || Array.isArray(envValue)) {
+    if (!Array.isArray(inheritEnvValue) || inheritEnvValue.length > maxInheritedEnvironment ||
+      !isRecord(envValue)) {
       throw new TaskCommandRunnerError('INVALID_ENV');
     }
     const inheritEnv: string[] = Array.from(inheritEnvValue as readonly string[]);
     const env = { ...envValue } as Record<string, string>;
+    const { environment, executionEnvironmentSha256 } = buildEnvironment(inheritEnv, env, { ...process.env });
     await this.#validateCwd(cwd);
-    const environment = buildEnvironment(inheritEnv, env);
     const stdout = createAccumulator(this.#maxPreviewBytes);
     const stderr = createAccumulator(this.#maxPreviewBytes);
     const started = process.hrtime.bigint();
@@ -115,7 +123,7 @@ export class TaskCommandRunner {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch {
-      return result('spawn-failed', started, stdout, stderr);
+      return result('spawn-failed', started, stdout, stderr, executionEnvironmentSha256);
     }
 
     let outcome: TaskCommandOutcome | undefined;
@@ -141,7 +149,7 @@ export class TaskCommandRunner {
         settled = true;
         clearTimeout(timer);
         const finalOutcome = outcome ?? (code === 0 ? 'passed' : 'failed');
-        const values = { ...resultValues(finalOutcome, started, stdout, stderr),
+        const values = { ...resultValues(finalOutcome, started, stdout, stderr, executionEnvironmentSha256),
           ...(code === null ? {} : { exitCode: code }),
           ...(signal === null ? {} : { signal }), };
         try {
@@ -226,15 +234,18 @@ function createAccumulator(previewBytes: number): Accumulator {
   };
 }
 
-function result(outcome: TaskCommandOutcome, started: bigint, stdout: Accumulator, stderr: Accumulator): TaskCommandRunResult {
-  return { outcome, ...resultValues(outcome, started, stdout, stderr) };
+function result(outcome: TaskCommandOutcome, started: bigint, stdout: Accumulator, stderr: Accumulator,
+  executionEnvironmentSha256: string): TaskCommandRunResult {
+  return { outcome, ...resultValues(outcome, started, stdout, stderr, executionEnvironmentSha256) };
 }
 
-function resultValues(_outcome: TaskCommandOutcome, started: bigint, stdout: Accumulator, stderr: Accumulator) {
+function resultValues(_outcome: TaskCommandOutcome, started: bigint, stdout: Accumulator, stderr: Accumulator,
+  executionEnvironmentSha256: string) {
   return {
     durationMs: Number(process.hrtime.bigint() - started) / 1_000_000,
     stdout: stdout.finish(),
     stderr: stderr.finish(),
+    executionEnvironmentSha256,
   };
 }
 
@@ -244,15 +255,52 @@ async function terminateProcess(child: ChildProcess): Promise<void> {
     await boundedTaskkill(child.pid);
     await waitForSettlement(child);
   } else {
-    let signalled = false;
-    try { process.kill(-child.pid, 'SIGTERM'); signalled = true; } catch { try { child.kill('SIGTERM'); signalled = true; } catch { /* already dead */ } }
+    const pid = child.pid;
+    let signalled = signalProcessGroup(pid, 'SIGTERM');
+    if (!signalled) {
+      try { child.kill('SIGTERM'); signalled = true; } catch { /* already dead */ }
+    }
     if (!signalled && child.exitCode === null) throw new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED');
     await delay(50);
-    if (child.exitCode === null && child.signalCode === null) {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* already dead */ } }
+    // The root may have exited while descendants remain. Always signal the
+    // detached process group; checking the root alone is not sufficient.
+    if (!signalProcessGroup(pid, 'SIGKILL')) {
+      try { child.kill('SIGKILL'); } catch { /* already dead */ }
     }
     await waitForSettlement(child);
+    await ensureProcessGroupGone(pid);
   }
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    throw new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED');
+  }
+}
+
+async function ensureProcessGroupGone(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      process.kill(-pid, 0);
+      await delay(25);
+      try { process.kill(-pid, 'SIGKILL'); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+      throw new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED');
+    }
+  }
+  try { process.kill(-pid, 0); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+    throw new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED');
+  }
+  throw new TaskCommandRunnerError('PROCESS_CLEANUP_FAILED');
 }
 
 async function boundedTaskkill(pid: number): Promise<void> {
@@ -302,7 +350,8 @@ async function waitForSettlement(child: ChildProcess): Promise<void> {
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
-function buildEnvironment(inheritEnv: readonly string[], explicit: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
+function buildEnvironment(inheritEnv: readonly string[], explicit: Readonly<Record<string, string>>,
+  processEnvironment: NodeJS.ProcessEnv): { environment: NodeJS.ProcessEnv; executionEnvironmentSha256: string } {
   const result: NodeJS.ProcessEnv = {};
   const requested = new Map<string, string>();
   for (const key of [...defaultSafeEnvironment, ...inheritEnv]) {
@@ -319,18 +368,20 @@ function buildEnvironment(inheritEnv: readonly string[], explicit: Readonly<Reco
     requested.set(normalized, key);
   }
   for (const key of requested.values()) {
-    const sourceKey = Object.keys(process.env).find((candidate) =>
+    const sourceKey = Object.keys(processEnvironment).find((candidate) =>
       candidate.toLocaleUpperCase('en-US') === key.toLocaleUpperCase('en-US'));
     if (sourceKey !== undefined) {
-      const value = process.env[sourceKey];
+      const value = processEnvironment[sourceKey];
       if (value !== undefined) result[key] = value;
     }
   }
+  if (Object.keys(explicit).length > maxExplicitEnvironment) throw new TaskCommandRunnerError('INVALID_ENV');
   const explicitKeys = new Set<string>();
   for (const [key, value] of Object.entries(explicit)) {
     const normalized = key.toLocaleUpperCase('en-US');
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) || typeof value !== 'string' ||
-      secretKey.test(key) || /^GIT_/i.test(key) || value.includes('\0')) {
+      secretKey.test(key) || /^GIT_/i.test(key) || value.includes('\0') ||
+      Buffer.byteLength(value, 'utf8') > maxEnvironmentValueBytes) {
       throw new TaskCommandRunnerError('INVALID_ENV');
     }
     if (explicitKeys.has(normalized)) throw new TaskCommandRunnerError('INVALID_ENV');
@@ -338,7 +389,13 @@ function buildEnvironment(inheritEnv: readonly string[], explicit: Readonly<Reco
     explicitKeys.add(normalized);
     result[key] = value;
   }
-  return result;
+  const pairs = Object.keys(result).sort().map((key) => [key, result[key] ?? null]);
+  return {
+    environment: result,
+    executionEnvironmentSha256: createHash('sha256').update(
+      `AgentHub.TaskCommandRunner.execution-environment.v1\0${JSON.stringify(pairs)}`,
+    ).digest('hex'),
+  };
 }
 
 function validateString(value: unknown, code: 'INVALID_COMMAND'): string {
@@ -360,4 +417,8 @@ function samePath(a: string, b: string): boolean {
   if (process.platform !== 'win32') return normalize(a) === normalize(b);
   const fold = (value: string) => normalize(value).toLocaleLowerCase('en-US');
   return fold(a) === fold(b);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

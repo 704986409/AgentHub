@@ -33,6 +33,7 @@ export type GitWorktreeErrorCode =
   | 'GIT_WORKTREE_CREATE_FAILED'
   | 'GIT_WORKTREE_DIRTY'
   | 'GIT_WORKTREE_REMOVE_FAILED'
+  | 'GIT_WORKTREE_TASK_QUARANTINED'
   | 'GIT_WORKTREE_CONTRACT_VIOLATION';
 
 export class GitWorktreeError extends Error {
@@ -96,6 +97,7 @@ type VerifiedWorkspace = Omit<TaskWorkspace, 'baseCommit'>;
 
 interface RepositoryCoordination {
   readonly operations: Map<string, PendingOperation>;
+  readonly quarantinedTasks: Set<string>;
   excludePromise?: Promise<void>;
 }
 
@@ -196,6 +198,9 @@ export class GitWorktreeManager {
     } catch (error) {
       return Promise.reject(asError(error));
     }
+    if (this.#coordination.quarantinedTasks.has(operationKey(taskId))) {
+      return Promise.reject(taskQuarantined(taskId));
+    }
     const key = operationKey(taskId);
     const pending = this.#coordination.operations.get(key);
     if (pending !== undefined) {
@@ -222,6 +227,9 @@ export class GitWorktreeManager {
       taskId = validateTaskId(taskIdValue);
       snapshot = snapshotCaptureOptions(options);
     } catch (error) { return Promise.reject(asError(error)); }
+    if (this.#coordination.quarantinedTasks.has(operationKey(taskId))) {
+      return Promise.reject(taskQuarantined(taskId));
+    }
     const key = operationKey(taskId);
     const captureKey = canonicalChangeState(snapshot);
     const pending = this.#coordination.operations.get(key);
@@ -263,6 +271,9 @@ export class GitWorktreeManager {
     try {
       optionsSnapshot = snapshotBuildTestEvidenceOptions(options);
     } catch (error) { return Promise.reject(asError(error)); }
+    if (this.#coordination.quarantinedTasks.has(operationKey(taskId))) {
+      return Promise.reject(taskQuarantined(taskId));
+    }
     const key = operationKey(taskId);
     const evidenceKeyValue = evidencePlanKey(snapshot, optionsSnapshot);
     const pending = this.#coordination.operations.get(key);
@@ -289,6 +300,9 @@ export class GitWorktreeManager {
       runner: this.#runner,
       inspect: () => this.#inspect(taskId, gitCapturePrefix),
       worktree: workspace,
+      onCleanupAmbiguity: () => {
+        this.#coordination.quarantinedTasks.add(operationKey(taskId));
+      },
       ...options,
     });
   }
@@ -299,6 +313,9 @@ export class GitWorktreeManager {
       taskId = validateTaskId(taskIdValue);
     } catch (error) {
       return Promise.reject(asError(error));
+    }
+    if (this.#coordination.quarantinedTasks.has(operationKey(taskId))) {
+      return Promise.reject(taskQuarantined(taskId));
     }
     const key = operationKey(taskId);
     const pending = this.#coordination.operations.get(key);
@@ -815,7 +832,7 @@ function coordinationFor(repositoryRoot: string): RepositoryCoordination {
     : path.normalize(repositoryRoot);
   const current = repositoryCoordinators.get(key)?.deref();
   if (current !== undefined) return current;
-  const coordination: RepositoryCoordination = { operations: new Map() };
+  const coordination: RepositoryCoordination = { operations: new Map(), quarantinedTasks: new Set() };
   const ref = new WeakRef(coordination);
   repositoryCoordinators.set(key, ref);
   coordinatorFinalizer.register(coordination, { key, ref });
@@ -864,6 +881,14 @@ function invalidTaskId(): GitWorktreeError {
 function operationBusy(taskId: string): GitWorktreeError {
   return new GitWorktreeError(
     'GIT_WORKTREE_OPERATION_BUSY', 'Another workspace operation owns this task', 'operation', taskId,
+  );
+}
+
+function taskQuarantined(taskId: string): GitWorktreeError {
+  return new GitWorktreeError(
+    'GIT_WORKTREE_TASK_QUARANTINED',
+    'Task is quarantined after ambiguous process cleanup; manual recovery is required',
+    'quarantine', taskId,
   );
 }
 
