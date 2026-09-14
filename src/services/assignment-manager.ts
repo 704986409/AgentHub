@@ -23,13 +23,13 @@ export class AssignmentManager {
     const task = this.tasks.getTask(input.taskId);
     if (task === null) throw new Error(`Task ${input.taskId} was not found`);
     if (task.assignedAgentId !== null) throw new Error(`Task ${input.taskId} is already assigned`);
-    if (task.status === TaskStatus.CREATED) this.tasks.transitionTask(task.id, TaskStatus.QUEUED);
-    if (this.tasks.getTask(task.id)?.status === TaskStatus.QUEUED) this.tasks.transitionTask(task.id, TaskStatus.ASSIGNED);
     const assignment = this.repository.create({
       ...input,
       profileHash: input.profileHash ?? this.profileHashes(input.agentId),
       status: AssignmentStatus.DISPATCHING,
     });
+    if (task.status === TaskStatus.CREATED) this.tasks.transitionTask(task.id, TaskStatus.QUEUED);
+    if (this.tasks.getTask(task.id)?.status === TaskStatus.QUEUED) this.tasks.transitionTask(task.id, TaskStatus.ASSIGNED);
     this.tasks.updateTask(input.taskId, { assignedAgentId: input.agentId, assignmentId: assignment.id });
     this.eventBus?.publish({
       eventType: DomainEventType.ASSIGNMENT_CREATED,
@@ -39,6 +39,10 @@ export class AssignmentManager {
       payload: assignment,
     });
     return assignment;
+  }
+
+  public getAssignment(id: string): Assignment | null {
+    return this.repository.findById(id);
   }
 
   public acceptAssignment(id: string): Assignment {

@@ -35,6 +35,19 @@ export interface AgentPoolEntrySnapshot {
   readonly specVersion?: string;
   readonly profileHash?: string;
   readonly sessionId?: string;
+  readonly reserved: boolean;
+  readonly reservedTaskId?: string;
+  readonly reservedAssignmentId?: string;
+  readonly reservedSpecVersion?: string;
+  readonly reservedProfileHash?: string;
+}
+
+export interface AgentPoolReservationSnapshot {
+  readonly agentId: string;
+  readonly taskId: string;
+  readonly assignmentId: string;
+  readonly specVersion: string;
+  readonly profileHash: string;
 }
 
 export type AgentPoolErrorCode =
@@ -76,6 +89,7 @@ interface AgentPoolRegistrationSnapshot {
 interface PoolEntry {
   readonly registration: AgentPoolRegistrationSnapshot;
   readonly runtime: AgentRuntime;
+  reservation?: Readonly<AgentRuntimeBinding>;
   pendingStart?: PendingLifecycle;
   pendingShutdown?: PendingLifecycle;
 }
@@ -90,6 +104,7 @@ export class AgentPool {
   readonly #eventBus: EventBus;
   readonly #entries = new Map<string, PoolEntry>();
   readonly #assignmentOwners = new Map<string, string>();
+  readonly #reservationOwners = new Map<string, string>();
   #draining = false;
   #inputSnapshotReserved = false;
   #drainPromise: Promise<void> | undefined;
@@ -145,7 +160,8 @@ export class AgentPool {
     this.#ensureNotDraining();
     if (this.#inputSnapshotReserved) throw operationBusy();
     const entry = this.#requireEntry(agentId);
-    if (entry.runtime.state !== 'IDLE' || entry.runtime.busy || this.#hasAssignmentFor(agentId)) {
+    if (entry.runtime.state !== 'IDLE' || entry.runtime.busy || entry.reservation !== undefined ||
+      this.#hasAssignmentFor(agentId)) {
       throw new AgentPoolError('AGENT_POOL_AGENT_BUSY', `Agent ${agentId} is busy`);
     }
     if (entry.pendingStart !== undefined || entry.pendingShutdown !== undefined) {
@@ -162,6 +178,44 @@ export class AgentPool {
     return Object.freeze([...this.#entries.values()].map((entry) => snapshotEntry(entry)));
   }
 
+  public reserve(
+    agentId: string,
+    binding: AgentRuntimeBinding,
+  ): Readonly<AgentPoolReservationSnapshot> {
+    this.#ensureNotDraining();
+    const entry = this.#requireEntry(agentId);
+    const snapshot = this.#withInputSnapshotReservation(() => snapshotBinding(binding));
+    this.#ensureNotDraining();
+    if (this.#entries.get(agentId) !== entry) {
+      throw new AgentPoolError('AGENT_POOL_AGENT_NOT_FOUND', `Agent ${agentId} is not registered`);
+    }
+    if (entry.reservation !== undefined) {
+      throw new AgentPoolError('AGENT_POOL_AGENT_BUSY', `Agent ${agentId} is reserved`);
+    }
+    this.#ensureAgentCanStart(entry);
+    if (this.#reservationOwners.has(snapshot.assignmentId) || this.#assignmentOwners.has(snapshot.assignmentId)) {
+      throw new AgentPoolError(
+        'AGENT_POOL_ASSIGNMENT_ALREADY_OWNED',
+        `Assignment ${snapshot.assignmentId} is already owned`,
+      );
+    }
+    entry.reservation = snapshot;
+    this.#reservationOwners.set(snapshot.assignmentId, agentId);
+    return Object.freeze({ agentId, ...snapshot });
+  }
+
+  public releaseReservation(agentId: string, assignmentId: string): void {
+    this.#ensureNotDraining();
+    const entry = this.#requireEntry(agentId);
+    const reservation = entry.reservation;
+    if (!isNonBlankString(assignmentId) || reservation?.assignmentId !== assignmentId ||
+      this.#reservationOwners.get(assignmentId) !== agentId) {
+      throw assignmentMismatch(agentId, assignmentId);
+    }
+    delete entry.reservation;
+    this.#reservationOwners.delete(assignmentId);
+  }
+
   public start(agentId: string, binding: AgentRuntimeBinding): Promise<void> {
     try {
       this.#ensureNotDraining();
@@ -173,7 +227,8 @@ export class AgentPool {
       }
       this.#ensureAgentCanStart(entry);
       const currentOwner = this.#assignmentOwners.get(snapshot.assignmentId);
-      if (currentOwner !== undefined) {
+      const reservationOwner = this.#reservationOwners.get(snapshot.assignmentId);
+      if (currentOwner !== undefined || reservationOwner !== undefined) {
         throw new AgentPoolError(
           'AGENT_POOL_ASSIGNMENT_ALREADY_OWNED',
           `Assignment ${snapshot.assignmentId} is already owned`,
@@ -291,12 +346,15 @@ export class AgentPool {
   #ensureAgentCanStart(entry: PoolEntry): void {
     const agentId = entry.registration.agentId;
     const hasAssignment = this.#hasAssignmentFor(agentId);
-    if (entry.runtime.state !== 'IDLE' || entry.runtime.busy) {
+    if (entry.runtime.state !== 'IDLE' || entry.runtime.busy || entry.runtime.active) {
       if (!hasAssignment) throw runtimeContractViolation(agentId);
       throw new AgentPoolError('AGENT_POOL_AGENT_BUSY', `Agent ${agentId} is busy`);
     }
     if (entry.pendingStart !== undefined || entry.pendingShutdown !== undefined) {
       throw operationBusy();
+    }
+    if (entry.reservation !== undefined) {
+      throw new AgentPoolError('AGENT_POOL_AGENT_BUSY', `Agent ${agentId} is reserved`);
     }
     if (entry.runtime.binding !== undefined || hasAssignment) throw runtimeContractViolation(agentId);
   }
@@ -455,6 +513,7 @@ function snapshotBinding(binding: AgentRuntimeBinding): Readonly<AgentRuntimeBin
 
 function snapshotEntry(entry: PoolEntry): Readonly<AgentPoolEntrySnapshot> {
   const binding = entry.runtime.binding;
+  const reservation = entry.reservation;
   const sessionId = entry.runtime.sessionId;
   return Object.freeze({
     agentId: entry.registration.agentId,
@@ -463,6 +522,13 @@ function snapshotEntry(entry: PoolEntry): Readonly<AgentPoolEntrySnapshot> {
     state: entry.runtime.state,
     busy: entry.runtime.busy,
     active: entry.runtime.active,
+    reserved: reservation !== undefined,
+    ...(reservation === undefined ? {} : {
+      reservedTaskId: reservation.taskId,
+      reservedAssignmentId: reservation.assignmentId,
+      reservedSpecVersion: reservation.specVersion,
+      reservedProfileHash: reservation.profileHash,
+    }),
     ...(binding === undefined ? {} : binding),
     ...(sessionId === undefined ? {} : { sessionId }),
   });
