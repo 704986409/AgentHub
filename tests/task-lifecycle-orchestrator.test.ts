@@ -71,7 +71,7 @@ function makeHarness(workerResult: AgentHubWorkerResult) {
   });
   const lifecycle = new TaskLifecycleOrchestrator({ taskManager: tasks, agentRegistry: agents,
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees } as never);
-  return { d, lifecycle, assignments, tasks, pool, worktrees };
+  return { d, lifecycle, assignments, tasks, agents, pool, worktrees };
 }
 
 function sourceSnapshot(): GitWorkspaceChangeSnapshot {
@@ -91,6 +91,20 @@ function evidenceSnapshot(source: GitWorkspaceChangeSnapshot): BuildTestEvidence
 }
 
 describe('TaskLifecycleOrchestrator focused lifecycle outcomes', () => {
+  it('fences concurrent lifecycle mutations for the same task', async () => {
+    const h = makeHarness(completed);
+    let rejectCommit!: (error: Error) => void;
+    h.worktrees.commitTaskWorkspace = vi.fn(() => new Promise<never>((_resolve, reject) => {
+      rejectCommit = reject;
+    }));
+    const first = h.lifecycle.prepareReview({ dispatchResult: h.d, buildTestPlan: plan });
+    await Promise.resolve();
+    await expect(h.lifecycle.prepareReview({ dispatchResult: h.d, buildTestPlan: plan }))
+      .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_TASK_BUSY' });
+    rejectCommit(new Error('controlled commit failure'));
+    await expect(first).rejects.toMatchObject({ code: 'TASK_LIFECYCLE_RECONCILIATION_REQUIRED' });
+  });
+
   it.each([
     ['FAILED', 'failed', 'finalizeFailedAssignment'],
     ['BLOCKED', 'blocked', 'suspendActiveAssignment'],

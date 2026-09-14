@@ -8,7 +8,7 @@ import type { AgentRegistry } from '../services/agent-registry.js';
 import type { AssignmentManager } from '../services/assignment-manager.js';
 import type { TaskManager } from '../services/task-manager.js';
 import {
-  GitTaskCommitError, GitWorktreeManager, createReviewEvidence,
+  GitMergeError, GitTaskCommitError, GitWorktreeManager, createReviewEvidence,
   type BuildTestEvidence, type BuildTestEvidencePlan, type GitWorkspaceChangeSnapshot,
   type MergeGateDecision, type MergeGatePolicy, type ReviewDecisionInput,
   type ReviewEvidence, type TaskCommitResult, type TaskMergeResult,
@@ -21,6 +21,11 @@ import { snapshotAssignmentDispatchResult, snapshotAssignmentTurnResult,
   type AssignmentDispatchResult } from './AssignmentDispatcher.js';
 
 const fences = new WeakMap<AssignmentManager, Set<string>>();
+interface LifecycleReceipt {
+  readonly mergeResult?: TaskMergeResult;
+  readonly result: TaskLifecycleReviewResult;
+}
+const receipts = new WeakMap<AssignmentManager, Map<string, LifecycleReceipt>>();
 const oidPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const shaPattern = /^[0-9a-f]{64}$/u;
 const maxRevisionPromptBytes = 1024 * 1024;
@@ -121,10 +126,17 @@ export class TaskLifecycleOrchestrator {
 
   async #apply(input: ApplySnapshot): Promise<TaskLifecycleReviewResult> {
     const bundle = input.reviewBundle;
-    await this.#requireBundleFresh(bundle);
     let review: ReviewEvidence;
     try { review = createReviewEvidence(bundle.buildTestEvidence, input.decision); }
     catch { throw lifecycleError('TASK_LIFECYCLE_INVALID_REQUEST'); }
+    const receiptKey = lifecycleReceiptKey(bundle, review, input);
+    const receipt = receipts.get(this.#assignments)?.get(receiptKey);
+    if (receipt !== undefined) {
+      try { this.#finalizeCompleted(bundle.assignmentId, receipt.mergeResult); }
+      catch { throw lifecycleError('TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED', receipt.mergeResult); }
+      return receipt.result;
+    }
+    await this.#requireBundleFresh(bundle);
     if (review.verdict === 'BLOCK') {
       await this.#shutdown(bundle); this.#finalizeFailed(bundle.assignmentId);
       return lifecycleResult({ outcome: 'failed' as const, taskId: bundle.taskId, assignmentId: bundle.assignmentId, reviewEvidence: review });
@@ -160,8 +172,16 @@ export class TaskLifecycleOrchestrator {
         finalNoChangeGate.reviewEvidenceSha256 !== noChangeGate.reviewEvidenceSha256) {
         throw lifecycleError('TASK_LIFECYCLE_GATE_DENIED');
       }
-      this.#finalizeCompleted(bundle.assignmentId);
-      return lifecycleResult({ outcome: 'completed-no-change' as const, taskId: bundle.taskId, reviewEvidence: review });
+      const result = lifecycleResult({ outcome: 'completed-no-change' as const, taskId: bundle.taskId, reviewEvidence: review });
+      try { this.#finalizeCompleted(bundle.assignmentId); }
+      catch (error) {
+        if (error instanceof TaskLifecycleError &&
+          error.code === 'TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED') {
+          this.#rememberReceipt(receiptKey, { result });
+        }
+        throw error;
+      }
+      return result;
     }
     if (input.targetBranch === undefined) throw lifecycleError('TASK_LIFECYCLE_INVALID_REQUEST');
     let gate: MergeGateDecision;
@@ -174,10 +194,24 @@ export class TaskLifecycleOrchestrator {
     try { merge = await this.#worktrees.mergeTaskWorkspace({ taskId: bundle.taskId,
       targetBranch: input.targetBranch, buildEvidence: bundle.buildTestEvidence, reviewEvidence: review,
       gateDecision: gate, gatePolicy: input.mergePolicy }); }
-    catch { throw lifecycleError('TASK_LIFECYCLE_MERGE_FAILED'); }
-    this.#finalizeCompleted(bundle.assignmentId, merge);
-    return lifecycleResult({ outcome: 'completed' as const, taskId: bundle.taskId,
+    catch (error) {
+      if (error instanceof GitMergeError &&
+        (error.code === 'GIT_MERGE_CLEANUP_FAILED' || error.code === 'GIT_MERGE_CONTRACT_VIOLATION')) {
+        throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED');
+      }
+      throw lifecycleError('TASK_LIFECYCLE_MERGE_FAILED');
+    }
+    const result = lifecycleResult({ outcome: 'completed' as const, taskId: bundle.taskId,
       reviewEvidence: review, mergeGate: gate, mergeResult: merge });
+    try { this.#finalizeCompleted(bundle.assignmentId, merge); }
+    catch (error) {
+      if (error instanceof TaskLifecycleError &&
+        error.code === 'TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED') {
+        this.#rememberReceipt(receiptKey, { mergeResult: merge, result });
+      }
+      throw error;
+    }
+    return result;
   }
 
   async #revise(bundle: TaskReviewBundle, review: ReviewEvidence, input: ApplySnapshot): Promise<TaskLifecycleReviewResult> {
@@ -189,7 +223,13 @@ export class TaskLifecycleOrchestrator {
     await this.#requireExecution(bundleToDispatch(bundle), TaskStatus.IMPLEMENTING);
     let raw: AgentProviderTurnResult;
     try { raw = await this.#pool.runTurn(bundle.agentId, bundle.assignmentId, { prompt, protocol: 'worker-result' }); }
-    catch { throw lifecycleError('TASK_LIFECYCLE_REVISION_FAILED'); }
+    catch {
+      try {
+        await this.#shutdown(bundle);
+        this.#suspend(bundle.assignmentId, TaskStatus.BLOCKED);
+      } catch { throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED'); }
+      throw lifecycleError('TASK_LIFECYCLE_REVISION_FAILED');
+    }
     let turn: AgentProviderTurnResult;
     try { turn = snapshotAssignmentTurnResult(raw, 'worker-result', bundle.providerId); }
     catch {
@@ -351,11 +391,17 @@ export class TaskLifecycleOrchestrator {
     for (let attempt = 0; attempt < 3; attempt++) {
       try { this.#assignments.finalizeCompletedAssignment(assignmentId); } catch { /* retry exact partial state */ }
       const assignment = this.#assignments.getAssignment(assignmentId);
+      const task = assignment === null ? null : this.#tasks.getTask(assignment.taskId);
       if (assignment !== null && assignment.status === AssignmentStatus.COMPLETED &&
-        this.#tasks.getTask(assignment.taskId)?.status === TaskStatus.COMPLETED &&
+        task?.status === TaskStatus.COMPLETED && task.assignedAgentId === null && task.assignmentId === null &&
         this.#agents.getAgent(assignment.agentId)?.status === AgentStatus.IDLE) return;
     }
     throw lifecycleError('TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED', merge);
+  }
+  #rememberReceipt(key: string, receipt: LifecycleReceipt): void {
+    const byKey = receipts.get(this.#assignments) ?? new Map<string, LifecycleReceipt>();
+    byKey.set(key, receipt);
+    receipts.set(this.#assignments, byKey);
   }
   #withFence<T>(taskId: string, operation: () => Promise<T>): Promise<T> {
     const active = fences.get(this.#assignments) ?? new Set<string>();
@@ -717,6 +763,17 @@ function revisionPrompt(review: ReviewEvidence, task: Task): string {
 }
 function lifecycleResult<T extends Record<string, unknown>>(value: T): T & LifecycleBase {
   return deepFreeze({ ...value, lifecycleSha256: digest('AgentHub.TaskLifecycleResult.v1', lifecycleIdentity(value)) });
+}
+function lifecycleReceiptKey(bundle: TaskReviewBundle, review: ReviewEvidence, input: ApplySnapshot): string {
+  return digest('AgentHub.TaskLifecycleReceipt.v1', {
+    taskId: bundle.taskId,
+    assignmentId: bundle.assignmentId,
+    reviewBundleSha256: bundle.reviewBundleSha256,
+    reviewEvidenceSha256: review.reviewEvidenceSha256,
+    targetBranch: input.targetBranch ?? null,
+    mergePolicy: input.mergePolicy,
+    allowNoChangeCompletion: input.allowNoChangeCompletion,
+  });
 }
 function lifecycleIdentity(value: Record<string, unknown>): unknown {
   const result: Record<string, unknown> = {};

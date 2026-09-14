@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   AgentPool,
@@ -24,6 +24,7 @@ import {
   SqliteTaskRepository,
   TaskComplexity,
   TaskLifecycleOrchestrator,
+  TaskStatus,
   TaskManager,
   TaskRisk,
   TaskStateMachine,
@@ -215,9 +216,25 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
         .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_INVALID_REVIEW_BUNDLE' });
       expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'OWNED', busy: true });
 
+      const mergeSpy = vi.spyOn(h.worktrees, 'mergeTaskWorkspace');
+      const finalize = h.assignments.finalizeCompletedAssignment.bind(h.assignments);
+      let completionAvailable = false;
+      vi.spyOn(h.assignments, 'finalizeCompletedAssignment').mockImplementation((id) => {
+        if (!completionAvailable) {
+          h.tasks.transitionTask('task-a', TaskStatus.COMPLETED);
+          throw new Error('completion persistence partially failed');
+        }
+        return finalize(id);
+      });
+      await expect(h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
+        decision: accept, buildTestPlan: passingPlan, targetBranch: 'main' }))
+        .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED' });
+      expect(mergeSpy).toHaveBeenCalledTimes(1);
+      completionAvailable = true;
       const completed = await h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
         decision: accept, buildTestPlan: passingPlan, targetBranch: 'main' });
       expect(completed.outcome).toBe('completed');
+      expect(mergeSpy).toHaveBeenCalledTimes(1);
       expect(h.tasks.getTask('task-a')).toMatchObject({ status: 'COMPLETED', assignedAgentId: null, assignmentId: null });
       expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('COMPLETED');
       expect(h.agents.getAgent('agent-a')?.status).toBe('IDLE');
@@ -253,6 +270,27 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
     } finally { await h.cleanup(); }
   });
 
+  it('closes a failed revision turn without allowing the stale review to run again', async () => {
+    const h = await harness([{ outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'first\n' } }]);
+    try {
+      const prepared = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan });
+      if (prepared.outcome !== 'review-ready') throw new Error('expected review bundle');
+      await expect(h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
+        decision: revise, buildTestPlan: passingPlan }))
+        .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_REVISION_FAILED' });
+      expect(h.provider.createCalls).toBe(1);
+      expect(h.provider.session).toMatchObject({ runCalls: 2, startCalls: 1, shutdownCalls: 1 });
+      expect(h.tasks.getTask('task-a')).toMatchObject({ status: 'BLOCKED', assignedAgentId: null, assignmentId: null });
+      expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('RELEASED');
+      expect(h.agents.getAgent('agent-a')?.status).toBe('IDLE');
+      expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'IDLE', busy: false, active: false });
+      await expect(h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
+        decision: revise, buildTestPlan: passingPlan }))
+        .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_STALE_EXECUTION' });
+      expect(h.provider.session?.runCalls).toBe(2);
+    } finally { await h.cleanup(); }
+  });
+
   it('retains immutable BLOCK review evidence and binds it into lifecycle identity', async () => {
     const h = await harness([{ outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'actual\n' } }]);
     try {
@@ -272,15 +310,31 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
     } finally { await h.cleanup(); }
   });
 
-  it('completes no-change only after a successful post-shutdown final gate', async () => {
+  it('replays no-change completion without repeating the final gate after partial persistence', async () => {
     const h = await harness([{ outcome: 'COMPLETED' }]);
     try {
       const prepared = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan });
       if (prepared.outcome !== 'review-ready') throw new Error('expected review bundle');
       expect(prepared.reviewBundle.taskCommit.outcome).toBe('no-changes');
-      const completed = await h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle, decision: accept,
-        buildTestPlan: passingPlan, allowNoChangeCompletion: true });
+      const gateSpy = vi.spyOn(h.worktrees, 'evaluateMergeGate');
+      const finalize = h.assignments.finalizeCompletedAssignment.bind(h.assignments);
+      let completionAvailable = false;
+      vi.spyOn(h.assignments, 'finalizeCompletedAssignment').mockImplementation((id) => {
+        if (!completionAvailable) {
+          h.tasks.transitionTask('task-a', TaskStatus.COMPLETED);
+          throw new Error('no-change completion persistence partially failed');
+        }
+        return finalize(id);
+      });
+      const request = { reviewBundle: prepared.reviewBundle, decision: accept,
+        buildTestPlan: passingPlan, allowNoChangeCompletion: true };
+      await expect(h.lifecycle.applyReview(request))
+        .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED' });
+      expect(gateSpy).toHaveBeenCalledTimes(2);
+      completionAvailable = true;
+      const completed = await h.lifecycle.applyReview(request);
       expect(completed.outcome).toBe('completed-no-change');
+      expect(gateSpy).toHaveBeenCalledTimes(2);
       expect(h.tasks.getTask('task-a')).toMatchObject({ status: 'COMPLETED', assignedAgentId: null, assignmentId: null });
       expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('COMPLETED');
       expect(h.agents.getAgent('agent-a')?.status).toBe('IDLE');
