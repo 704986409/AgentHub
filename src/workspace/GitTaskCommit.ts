@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto';
+import { lstat, mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import type { GitCommandRunnerLike } from './GitCommandRunner.js';
 import { canonicalChangeState, type GitWorkspaceChangeSnapshot } from './GitWorkspaceChangeCapture.js';
@@ -45,9 +48,6 @@ const gitPrefix = Object.freeze([
   '-c', 'rerere.enabled=false', '-c', 'rerere.autoupdate=false',
 ]);
 
-const disabledHooks = (repositoryRoot: string): readonly string[] => Object.freeze([
-  '-c', `core.hooksPath=${repositoryRoot}/.git/agenthub-disabled-hooks`,
-]);
 
 /** Performs a source-authoritative, hook-free commit in one task worktree. */
 export async function performTaskCommit(
@@ -69,43 +69,74 @@ export async function performTaskCommit(
     return makeResult(workspace, before.headCommit, before.headCommit, outcome);
   }
   await rejectExecutableFilters(runner, workspace, before);
+  let hooksPath: string;
+  try { hooksPath = await createTrustedHooksPath(workspace.repositoryRoot); }
+  catch { throw new GitTaskCommitError('GIT_TASK_COMMIT_FAILED'); }
   try {
-    await run(runner, [...gitPrefix, ...disabledHooks(workspace.repositoryRoot), 'add', '--all', '--', '.'], workspace.worktreePath);
-    await run(runner, [...gitPrefix, ...disabledHooks(workspace.repositoryRoot),
-      '-c', 'core.editor=true', 'commit', '--no-verify', '--no-gpg-sign', '--no-edit',
-      '-m', options.commitMessage ?? `AgentHub task ${workspace.taskId}`], workspace.worktreePath);
-  } catch {
+    const disabledHooks = ['-c', `core.hooksPath=${hooksPath}`] as const;
     try {
-      const currentWorkspace = await options.inspect();
-      const current = await options.capture();
-      if (currentWorkspace === undefined || currentWorkspace.taskId !== workspace.taskId ||
-        currentWorkspace.branchName !== workspace.branchName || currentWorkspace.baseCommit !== workspace.baseCommit ||
-        currentWorkspace.headCommit !== workspace.headCommit || current.taskId !== workspace.taskId ||
-        current.branchName !== workspace.branchName || current.baseCommit !== workspace.baseCommit ||
-        current.headCommit !== currentWorkspace.headCommit ||
-        current.hasConflicts || current.conflicts.length > 0) notifyAmbiguous(options.onAmbiguousFailure);
-    } catch { notifyAmbiguous(options.onAmbiguousFailure); }
-    throw new GitTaskCommitError('GIT_TASK_COMMIT_FAILED');
+      await run(runner, [...gitPrefix, ...disabledHooks, 'add', '--all', '--', '.'], workspace.worktreePath);
+      await run(runner, [...gitPrefix, ...disabledHooks,
+        '-c', 'core.editor=true', 'commit', '--no-verify', '--no-gpg-sign', '--no-edit',
+        '-m', options.commitMessage ?? `AgentHub task ${workspace.taskId}`], workspace.worktreePath);
+    } catch {
+      try {
+        const currentWorkspace = await options.inspect();
+        const current = await options.capture();
+        if (currentWorkspace === undefined || currentWorkspace.taskId !== workspace.taskId ||
+          currentWorkspace.branchName !== workspace.branchName || currentWorkspace.baseCommit !== workspace.baseCommit ||
+          currentWorkspace.headCommit !== workspace.headCommit || current.taskId !== workspace.taskId ||
+          current.branchName !== workspace.branchName || current.baseCommit !== workspace.baseCommit ||
+          current.headCommit !== currentWorkspace.headCommit ||
+          current.hasConflicts || current.conflicts.length > 0) notifyAmbiguous(options.onAmbiguousFailure);
+      } catch { notifyAmbiguous(options.onAmbiguousFailure); }
+      throw new GitTaskCommitError('GIT_TASK_COMMIT_FAILED');
+    }
+    try {
+      const afterWorkspace = await options.inspect();
+      if (afterWorkspace === undefined || afterWorkspace.taskId !== workspace.taskId ||
+        afterWorkspace.branchName !== `agenthub/${workspace.taskId}` ||
+        afterWorkspace.baseCommit !== workspace.baseCommit || afterWorkspace.headCommit === before.headCommit) {
+        throw new GitTaskCommitError('GIT_TASK_COMMIT_POSTCONDITION_FAILED');
+      }
+      const after = await options.capture();
+      if (after.taskId !== workspace.taskId || after.branchName !== workspace.branchName ||
+        after.baseCommit !== workspace.baseCommit || after.headCommit !== afterWorkspace.headCommit ||
+        after.hasConflicts || after.conflicts.length > 0 || after.staged.changes.length > 0 ||
+        after.unstaged.changes.length > 0 || after.untracked.length > 0) {
+        throw new GitTaskCommitError('GIT_TASK_COMMIT_POSTCONDITION_FAILED');
+      }
+      return makeResult(workspace, before.headCommit, after.headCommit, 'committed');
+    } catch {
+      notifyAmbiguous(options.onAmbiguousFailure);
+      throw new GitTaskCommitError('GIT_TASK_COMMIT_POSTCONDITION_FAILED');
+    }
+  } finally {
+    await rm(hooksPath, { recursive: true, force: true, maxRetries: 3 }).catch(() => undefined);
   }
+}
+
+async function createTrustedHooksPath(repositoryRoot: string): Promise<string> {
+  const created = await mkdtemp(path.join(tmpdir(), 'agenthub-hooks-'));
   try {
-    const afterWorkspace = await options.inspect();
-    if (afterWorkspace === undefined || afterWorkspace.taskId !== workspace.taskId ||
-      afterWorkspace.branchName !== `agenthub/${workspace.taskId}` ||
-      afterWorkspace.baseCommit !== workspace.baseCommit || afterWorkspace.headCommit === before.headCommit) {
-      throw new GitTaskCommitError('GIT_TASK_COMMIT_POSTCONDITION_FAILED');
+    const [stat, canonical, canonicalRepositoryRoot, entries] = await Promise.all([
+      lstat(created), realpath(created),
+      realpath(repositoryRoot).catch(() => path.resolve(repositoryRoot)), readdir(created),
+    ]);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || entries.length !== 0 ||
+      isContained(canonicalRepositoryRoot, canonical)) {
+      throw new Error('Untrusted hooks authority');
     }
-    const after = await options.capture();
-    if (after.taskId !== workspace.taskId || after.branchName !== workspace.branchName ||
-      after.baseCommit !== workspace.baseCommit || after.headCommit !== afterWorkspace.headCommit ||
-      after.hasConflicts || after.conflicts.length > 0 || after.staged.changes.length > 0 ||
-      after.unstaged.changes.length > 0 || after.untracked.length > 0) {
-      throw new GitTaskCommitError('GIT_TASK_COMMIT_POSTCONDITION_FAILED');
-    }
-    return makeResult(workspace, before.headCommit, after.headCommit, 'committed');
-  } catch {
-    notifyAmbiguous(options.onAmbiguousFailure);
-    throw new GitTaskCommitError('GIT_TASK_COMMIT_POSTCONDITION_FAILED');
+    return canonical;
+  } catch (error) {
+    await rm(created, { recursive: true, force: true, maxRetries: 3 }).catch(() => undefined);
+    throw error;
   }
+}
+
+function isContained(root: string, target: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 async function rejectExecutableFilters(

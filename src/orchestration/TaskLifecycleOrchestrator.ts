@@ -8,7 +8,7 @@ import type { AgentRegistry } from '../services/agent-registry.js';
 import type { AssignmentManager } from '../services/assignment-manager.js';
 import type { TaskManager } from '../services/task-manager.js';
 import {
-  BuildTestEvidenceError, GitTaskCommitError, GitWorktreeManager, createReviewEvidence,
+  GitTaskCommitError, GitWorktreeManager, createReviewEvidence,
   type BuildTestEvidence, type BuildTestEvidencePlan, type GitWorkspaceChangeSnapshot,
   type MergeGateDecision, type MergeGatePolicy, type ReviewDecisionInput,
   type ReviewEvidence, type TaskCommitResult, type TaskMergeResult,
@@ -68,8 +68,9 @@ export interface TaskReviewBundle {
 }
 interface LifecycleBase { readonly lifecycleSha256: string }
 export type TaskLifecyclePreparationResult =
-  | (LifecycleBase & { readonly outcome: 'review-ready'; readonly reviewBundle: TaskReviewBundle })
-  | (LifecycleBase & { readonly outcome: 'blocked' | 'waiting-input' | 'failed'; readonly taskId: string; readonly assignmentId: string });
+  | (LifecycleBase & { readonly outcome: 'review-ready'; readonly reviewBundle: TaskReviewBundle; readonly reviewEvidence?: ReviewEvidence })
+  | (LifecycleBase & { readonly outcome: 'blocked' | 'waiting-input'; readonly taskId: string; readonly assignmentId: string })
+  | (LifecycleBase & { readonly outcome: 'failed'; readonly taskId: string; readonly assignmentId: string; readonly reviewEvidence?: ReviewEvidence });
 export type TaskLifecycleReviewResult =
   | TaskLifecyclePreparationResult
   | (LifecycleBase & { readonly outcome: 'merge-denied'; readonly taskId: string; readonly reviewEvidence: ReviewEvidence; readonly mergeGate: MergeGateDecision })
@@ -126,7 +127,7 @@ export class TaskLifecycleOrchestrator {
     catch { throw lifecycleError('TASK_LIFECYCLE_INVALID_REQUEST'); }
     if (review.verdict === 'BLOCK') {
       await this.#shutdown(bundle); this.#finalizeFailed(bundle.assignmentId);
-      return lifecycleResult({ outcome: 'failed' as const, taskId: bundle.taskId, assignmentId: bundle.assignmentId });
+      return lifecycleResult({ outcome: 'failed' as const, taskId: bundle.taskId, assignmentId: bundle.assignmentId, reviewEvidence: review });
     }
     if (review.verdict === 'REQUEST_REVISION') return this.#revise(bundle, review, input);
     if (bundle.taskCommit.outcome === 'no-changes') {
@@ -145,6 +146,20 @@ export class TaskLifecycleOrchestrator {
         throw lifecycleError('TASK_LIFECYCLE_GATE_DENIED');
       }
       await this.#requireBundleFresh(bundle); await this.#shutdown(bundle);
+      let finalNoChangeGate: MergeGateDecision;
+      try {
+        finalNoChangeGate = await this.#worktrees.evaluateMergeGate(
+          bundle.taskId, bundle.buildTestEvidence, review, input.mergePolicy,
+        );
+      } catch { throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED'); }
+      if (finalNoChangeGate.eligible || finalNoChangeGate.reasons.length !== 1 ||
+        finalNoChangeGate.reasons[0] !== 'NO_COMMITTED_CHANGES' ||
+        finalNoChangeGate.changeSetSha256 !== noChangeGate.changeSetSha256 ||
+        finalNoChangeGate.sourceVisibilitySha256 !== noChangeGate.sourceVisibilitySha256 ||
+        finalNoChangeGate.buildTestEvidenceSha256 !== noChangeGate.buildTestEvidenceSha256 ||
+        finalNoChangeGate.reviewEvidenceSha256 !== noChangeGate.reviewEvidenceSha256) {
+        throw lifecycleError('TASK_LIFECYCLE_GATE_DENIED');
+      }
       this.#finalizeCompleted(bundle.assignmentId);
       return lifecycleResult({ outcome: 'completed-no-change' as const, taskId: bundle.taskId, reviewEvidence: review });
     }
@@ -181,8 +196,11 @@ export class TaskLifecycleOrchestrator {
       turn = { protocol: 'worker-result', protocolValid: false, providerId: bundle.providerId,
         failure: { kind: 'schema_invalid', message: 'invalid revision result' } };
     }
-    return this.#handleTurn({ dispatch: bundleToDispatch(bundle), turnResult: turn,
+    const revised = await this.#handleTurn({ dispatch: bundleToDispatch(bundle), turnResult: turn,
       buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions });
+    return revised.outcome === 'review-ready'
+      ? lifecycleResult({ outcome: 'review-ready' as const, reviewEvidence: review, reviewBundle: revised.reviewBundle })
+      : revised;
   }
 
   async #handleTurn(input: Omit<ReviewPreparationInput, 'workerResult'> &
@@ -220,22 +238,25 @@ export class TaskLifecycleOrchestrator {
     let evidence: BuildTestEvidence;
     try { evidence = await this.#worktrees.collectBuildTestEvidence(input.dispatch.taskId,
       input.buildTestPlan, input.evidenceOptions); }
-    catch (error) {
-      if (error instanceof BuildTestEvidenceError) throw lifecycleError('TASK_LIFECYCLE_EVIDENCE_FAILED');
-      throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED');
-    }
+    catch { return this.#blockEvidenceIntegrity(input.dispatch); }
     if (evidence.outcome === 'workspace-mutated' || evidence.outcome === 'infrastructure-failed') {
-      throw lifecycleError('TASK_LIFECYCLE_EVIDENCE_FAILED');
+      return this.#blockEvidenceIntegrity(input.dispatch);
     }
     let source: GitWorkspaceChangeSnapshot;
     try { source = await this.#captureReviewSource(input.dispatch.taskId); }
-    catch { throw lifecycleError('TASK_LIFECYCLE_STALE_SOURCE'); }
+    catch { return this.#blockEvidenceIntegrity(input.dispatch); }
     if (!sourceMatchesEvidence(source, evidence) || source.headCommit !== commit.headAfter || !cleanSource(source)) {
-      throw lifecycleError('TASK_LIFECYCLE_STALE_SOURCE');
+      return this.#blockEvidenceIntegrity(input.dispatch);
     }
     const bundle = makeReviewBundle(input.dispatch, commit, evidence, source, input.workerResult);
     this.#transition(input.dispatch.taskId, TaskStatus.REVIEWING);
     return lifecycleResult({ outcome: 'review-ready' as const, reviewBundle: bundle });
+  }
+
+  async #blockEvidenceIntegrity(dispatch: Readonly<AssignmentDispatchResult>): Promise<TaskLifecyclePreparationResult> {
+    await this.#shutdown(dispatch);
+    this.#suspend(dispatch.assignmentId, TaskStatus.BLOCKED);
+    return lifecycleResult({ outcome: 'blocked' as const, taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
   }
 
   async #requireBundleFresh(bundle: TaskReviewBundle): Promise<void> {

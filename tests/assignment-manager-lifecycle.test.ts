@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   AgentProfileManager, AgentRegistry, AgentStatus, AssignmentManager, Database,
   SqliteAgentRepository, SqliteAssignmentRepository, SqliteProjectRepository, SqliteTaskRepository,
-  TaskComplexity, TaskManager, TaskRisk, TaskStateMachine, TaskStatus,
+  AssignmentStatus, TaskComplexity, TaskManager, TaskRisk, TaskStateMachine, TaskStatus,
 } from '../src/index.js';
 
 const roots: string[] = [];
@@ -56,6 +56,59 @@ describe('AssignmentManager lifecycle convergence', () => {
     expect(h.assignments.finalizeCompletedAssignment(h.assignment.id).status).toBe('COMPLETED');
     expect(h.tasks.getTask(h.task.id)).toMatchObject({ status: 'COMPLETED', assignedAgentId: null, assignmentId: null });
     expect(h.agents.getAgent(h.agent.id)?.status).toBe(AgentStatus.IDLE);
+    h.database.close();
+  });
+
+  it.each([
+    ['suspend', AssignmentStatus.RELEASED],
+    ['fail', AssignmentStatus.STALE],
+    ['complete', AssignmentStatus.COMPLETED],
+  ] as const)('rejects non-active %s convergence when the task has not reached its target', (operation, oldStatus) => {
+    const h = active();
+    h.database.connection.prepare('UPDATE assignments SET status = ? WHERE id = ?').run(oldStatus, h.assignment.id);
+    const beforeTask = h.tasks.getTask(h.task.id);
+    const beforeAgent = h.agents.getAgent(h.agent.id);
+    const invoke = () => operation === 'complete'
+      ? h.assignments.finalizeCompletedAssignment(h.assignment.id)
+      : operation === 'fail'
+        ? h.assignments.finalizeFailedAssignment(h.assignment.id)
+        : h.assignments.suspendActiveAssignment(h.assignment.id, TaskStatus.BLOCKED);
+    expect(invoke).toThrow(/contradictory assignment pointers/u);
+    expect(h.assignments.getAssignment(h.assignment.id)?.status).toBe(oldStatus);
+    expect(h.tasks.getTask(h.task.id)).toEqual(beforeTask);
+    expect(h.agents.getAgent(h.agent.id)).toEqual(beforeAgent);
+    h.database.close();
+  });
+  it.each([
+    ['suspend', AssignmentStatus.RELEASED],
+    ['fail', AssignmentStatus.RELEASED],
+    ['complete', AssignmentStatus.COMPLETED],
+  ] as const)('rejects stale %s convergence before mutating a newer assignment lineage', (operation, oldStatus) => {
+    const h = active();
+    const newerAgent = h.agents.createAgent({ projectId: h.agent.projectId, name: 'New Worker', provider: 'fake',
+      model: 'm', position: 'Developer' });
+    const newerId = `${h.assignment.id}-new`;
+    const now = new Date().toISOString();
+    h.database.connection.prepare('UPDATE assignments SET status = ? WHERE id = ?').run(oldStatus, h.assignment.id);
+    h.database.connection.prepare(`INSERT INTO assignments
+      (id, task_id, agent_id, spec_version, profile_hash, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(newerId, h.task.id, newerAgent.id, '1.0.0', 'new-profile',
+      AssignmentStatus.ACTIVE, now, now);
+    h.tasks.updateTask(h.task.id, { assignedAgentId: newerAgent.id, assignmentId: newerId });
+    h.agents.updateAgent(newerAgent.id, { status: AgentStatus.BUSY });
+    const beforeTask = h.tasks.getTask(h.task.id);
+    const beforeNewer = h.assignments.getAssignment(newerId);
+    const beforeAgent = h.agents.getAgent(newerAgent.id);
+    const invoke = () => operation === 'complete'
+      ? h.assignments.finalizeCompletedAssignment(h.assignment.id)
+      : operation === 'fail'
+        ? h.assignments.finalizeFailedAssignment(h.assignment.id)
+        : h.assignments.suspendActiveAssignment(h.assignment.id, TaskStatus.BLOCKED);
+    expect(invoke).toThrow(/contradictory assignment pointers/u);
+    expect(h.assignments.getAssignment(h.assignment.id)?.status).toBe(oldStatus);
+    expect(h.tasks.getTask(h.task.id)).toEqual(beforeTask);
+    expect(h.assignments.getAssignment(newerId)).toEqual(beforeNewer);
+    expect(h.agents.getAgent(newerAgent.id)).toEqual(beforeAgent);
     h.database.close();
   });
 });

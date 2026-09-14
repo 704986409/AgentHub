@@ -148,6 +148,7 @@ export class AssignmentManager {
     }
     const task = this.tasks.getTask(assignment.taskId);
     if (task === null) throw new Error(`Task ${assignment.taskId} was not found`);
+    this.assertLifecycleLineage(task, assignment, target);
     if (task.status !== target) {
       try { this.tasks.transitionTask(task.id, target); }
       catch (error) {
@@ -171,6 +172,7 @@ export class AssignmentManager {
     }
     const task = this.tasks.getTask(assignment.taskId);
     if (task === null) throw new Error(`Task ${assignment.taskId} was not found`);
+    this.assertLifecycleLineage(task, assignment, TaskStatus.FAILED);
     if (task.status !== TaskStatus.FAILED) {
       try { this.tasks.transitionTask(task.id, TaskStatus.FAILED); }
       catch (error) { if (this.tasks.getTask(task.id)?.status !== TaskStatus.FAILED) throw error; }
@@ -192,6 +194,7 @@ export class AssignmentManager {
     }
     const task = this.tasks.getTask(assignment.taskId);
     if (task === null) throw new Error(`Task ${assignment.taskId} was not found`);
+    this.assertLifecycleLineage(task, assignment, TaskStatus.COMPLETED);
     if (task.status !== TaskStatus.COMPLETED) {
       try { this.tasks.transitionTask(task.id, TaskStatus.COMPLETED); }
       catch (error) { if (this.tasks.getTask(task.id)?.status !== TaskStatus.COMPLETED) throw error; }
@@ -214,6 +217,16 @@ export class AssignmentManager {
       });
     }
     return result;
+  }
+
+  private assertLifecycleLineage(task: { readonly id: string; readonly status: TaskStatus;
+    readonly assignedAgentId: string | null; readonly assignmentId: string | null },
+  assignment: Assignment, target: TaskStatus): void {
+    const exact = task.assignedAgentId === assignment.agentId && task.assignmentId === assignment.id;
+    const cleared = task.assignedAgentId === null && task.assignmentId === null;
+    const active = assignment.status === AssignmentStatus.ACTIVE && exact;
+    const idempotent = assignment.status !== AssignmentStatus.ACTIVE && task.status === target && (exact || cleared);
+    if (!active && !idempotent) throw new Error(`Task ${task.id} has contradictory assignment pointers`);
   }
 
   private changeStatus(id: string, status: AssignmentStatus): Assignment {

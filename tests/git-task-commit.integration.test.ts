@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -39,19 +39,28 @@ describe('Git task commit integration', { timeout: 20_000 }, () => {
     expect(source.unstaged.changes).toHaveLength(0);
   });
 
-  it('does not create an empty commit and does not execute repository hooks', async () => {
+  it('does not create an empty commit and isolates every repository or configured hook authority', async () => {
     const root = await repo();
     const manager = await GitWorktreeManager.open({ repositoryRoot: root });
     const clean = await manager.createWorkspace({ taskId: 'CLEAN', baseRef: 'HEAD' });
     expect(await manager.commitTaskWorkspace('CLEAN')).toMatchObject({ outcome: 'no-changes', headBefore: clean.baseCommit });
 
     const workspace = await manager.createWorkspace({ taskId: 'HOOK', baseRef: 'HEAD' });
-    const sentinel = path.join(root, 'hook-ran.txt');
-    const hooks = path.join(root, '.git', 'hooks');
-    await writeFile(path.join(hooks, 'pre-commit'), `#!/bin/sh\necho ran > "${sentinel.replaceAll('\\', '/')}"\n`);
+    const sentinels = ['repository-hook.txt', 'predictable-hook.txt', 'configured-hook.txt'].map((name) => path.join(root, name));
+    const hookRoots = [path.join(root, '.git', 'hooks'), path.join(root, '.git', 'agenthub-disabled-hooks'),
+      path.join(root, 'attacker-hooks')];
+    for (let index = 0; index < hookRoots.length; index += 1) {
+      const hookRoot = hookRoots[index];
+      const sentinel = sentinels[index];
+      if (hookRoot === undefined || sentinel === undefined) throw new Error('invalid hook fixture');
+      await mkdir(hookRoot, { recursive: true });
+      await writeFile(path.join(hookRoot, 'prepare-commit-msg'),
+        `#!/bin/sh\necho ran > "${sentinel.replaceAll('\\', '/')}"\n`);
+    }
+    await git(root, ['config', 'core.hooksPath', hookRoots[2] ?? '']);
     await writeFile(path.join(workspace.worktreePath, 'change.txt'), 'change\n');
     await expect(manager.commitTaskWorkspace('HOOK')).resolves.toMatchObject({ outcome: 'committed' });
-    await expect(import('node:fs/promises').then(({ access }) => access(sentinel))).rejects.toBeDefined();
+    for (const sentinel of sentinels) await expect(access(sentinel)).rejects.toBeDefined();
   });
 
   it('blocks an executable clean filter affecting changed source', async () => {

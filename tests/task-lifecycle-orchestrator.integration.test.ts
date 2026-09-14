@@ -1,7 +1,8 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
@@ -138,6 +139,10 @@ const revise: ReviewDecisionInput = {
   reviewId: 'review-revise', reviewerId: 'human', verdict: 'REQUEST_REVISION', summary: 'revise once',
   findings: [{ code: 'FIX_1', severity: 'error', message: 'Update the implementation', path: 'actual.txt' }],
 };
+const block: ReviewDecisionInput = {
+  reviewId: 'review-block', reviewerId: 'human', verdict: 'BLOCK', summary: 'blocked by review',
+  findings: [{ code: 'BLOCK_1', severity: 'blocker', message: 'Do not merge', path: 'actual.txt' }],
+};
 
 async function harness(scripts: TurnScript[]) {
   const directory = mkdtempSync(join(tmpdir(), 'agenthub-lifecycle-'));
@@ -234,6 +239,8 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
         decision: revise, buildTestPlan: passingPlan });
       expect(second.outcome).toBe('review-ready');
       if (second.outcome !== 'review-ready') throw new Error('expected revised review bundle');
+      expect(second.reviewEvidence).toMatchObject({ verdict: 'REQUEST_REVISION', reviewId: revise.reviewId });
+      expect(Object.isFrozen(second.reviewEvidence)).toBe(true);
       expect(second.reviewBundle.assignmentId).toBe(first.reviewBundle.assignmentId);
       expect(second.reviewBundle.taskCommit.headAfter).not.toBe(first.reviewBundle.taskCommit.headAfter);
       expect(h.provider.createCalls).toBe(1);
@@ -246,6 +253,70 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
     } finally { await h.cleanup(); }
   });
 
+  it('retains immutable BLOCK review evidence and binds it into lifecycle identity', async () => {
+    const h = await harness([{ outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'actual\n' } }]);
+    try {
+      const prepared = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan });
+      if (prepared.outcome !== 'review-ready') throw new Error('expected review bundle');
+      const failed = await h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
+        decision: block, buildTestPlan: passingPlan });
+      expect(failed.outcome).toBe('failed');
+      if (failed.outcome !== 'failed' || failed.reviewEvidence === undefined) throw new Error('expected BLOCK evidence');
+      expect(failed.reviewEvidence).toMatchObject({ verdict: 'BLOCK', reviewId: block.reviewId });
+      expect(Object.isFrozen(failed.reviewEvidence)).toBe(true);
+      expect(failed.lifecycleSha256).toBe(lifecycleDigest({ outcome: 'failed', taskId: 'task-a',
+        assignmentId: h.dispatch.assignmentId, reviewEvidenceSha256: failed.reviewEvidence.reviewEvidenceSha256 }));
+      expect(h.tasks.getTask('task-a')).toMatchObject({ status: 'FAILED', assignedAgentId: null, assignmentId: null });
+      expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('RELEASED');
+      expect(h.agents.getAgent('agent-a')?.status).toBe('IDLE');
+    } finally { await h.cleanup(); }
+  });
+
+  it('completes no-change only after a successful post-shutdown final gate', async () => {
+    const h = await harness([{ outcome: 'COMPLETED' }]);
+    try {
+      const prepared = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan });
+      if (prepared.outcome !== 'review-ready') throw new Error('expected review bundle');
+      expect(prepared.reviewBundle.taskCommit.outcome).toBe('no-changes');
+      const completed = await h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle, decision: accept,
+        buildTestPlan: passingPlan, allowNoChangeCompletion: true });
+      expect(completed.outcome).toBe('completed-no-change');
+      expect(h.tasks.getTask('task-a')).toMatchObject({ status: 'COMPLETED', assignedAgentId: null, assignmentId: null });
+      expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('COMPLETED');
+      expect(h.agents.getAgent('agent-a')?.status).toBe('IDLE');
+      expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'IDLE', busy: false, active: false });
+    } finally { await h.cleanup(); }
+  });
+  it.each(['source', 'visibility'] as const)(
+    'revalidates no-change %s identity after shutdown before completion', async (drift) => {
+      const h = await harness([{ outcome: 'COMPLETED' }]);
+      try {
+        const prepared = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan });
+        if (prepared.outcome !== 'review-ready') throw new Error('expected review bundle');
+        expect(prepared.reviewBundle.taskCommit.outcome).toBe('no-changes');
+        const workspace = await h.worktrees.inspectWorkspace('task-a');
+        if (workspace === undefined) throw new Error('expected workspace');
+        const originalShutdown = h.pool.shutdown.bind(h.pool);
+        h.pool.shutdown = async (agentId: string, assignmentId: string) => {
+          await originalShutdown(agentId, assignmentId);
+          if (drift === 'source') writeFileSync(join(workspace.worktreePath, 'shutdown-source.txt'), 'drift\n');
+          else {
+            const exclude = execFileSync('git', ['rev-parse', '--git-path', 'info/exclude'], {
+              cwd: workspace.worktreePath, encoding: 'utf8',
+            }).trim();
+            const excludePath = isAbsolute(exclude) ? exclude : resolve(workspace.worktreePath, exclude);
+            writeFileSync(excludePath, 'shutdown-visibility.txt\n');
+          }
+        };
+        await expect(h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle, decision: accept,
+          buildTestPlan: passingPlan, allowNoChangeCompletion: true }))
+          .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_GATE_DENIED' });
+        expect(h.tasks.getTask('task-a')?.status).toBe('REVIEWING');
+        expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('ACTIVE');
+        expect(h.agents.getAgent('agent-a')?.status).toBe('BUSY');
+      } finally { await h.cleanup(); }
+    },
+  );
   it('converges NEEDS_INPUT without evidence and clears all scheduling ownership', async () => {
     const h = await harness([{ outcome: 'NEEDS_INPUT' }]);
     try {
@@ -258,6 +329,36 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
     } finally { await h.cleanup(); }
   });
 
+  it('preserves evidence-created source without committing it and rejects the old dispatch retry', async () => {
+    const h = await harness([{ outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'actual\n' } }]);
+    try {
+      const workspace = await h.worktrees.inspectWorkspace('task-a');
+      if (workspace === undefined) throw new Error('expected workspace');
+      const mutatingPlan: BuildTestEvidencePlan = { commands: [{
+        id: 'mutating-test', phase: 'test', executable: process.execPath,
+        args: ['-e', "require('node:fs').writeFileSync('evidence-created.txt','forensic source\\n')"],
+        cwd: '.', timeoutMs: 5_000, inheritEnv: [], env: {},
+      }] };
+      const first = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: mutatingPlan });
+      expect(first.outcome).toBe('blocked');
+      expect(h.tasks.getTask('task-a')).toMatchObject({ status: 'BLOCKED', assignedAgentId: null, assignmentId: null });
+      expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('RELEASED');
+      expect(h.agents.getAgent('agent-a')?.status).toBe('IDLE');
+      expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'IDLE', busy: false, active: false });
+      expect(readFileSync(join(workspace.worktreePath, 'evidence-created.txt'), 'utf8')).toBe('forensic source\n');
+      const committedFiles = execFileSync('git', ['show', '--pretty=', '--name-only', 'HEAD'], {
+        cwd: workspace.worktreePath, encoding: 'utf8',
+      }).split(/\r?\n/u).filter(Boolean);
+      expect(committedFiles).toContain('actual.txt');
+      expect(committedFiles).not.toContain('evidence-created.txt');
+      await expect(h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan }))
+        .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_STALE_EXECUTION' });
+      const committedAfterRetry = execFileSync('git', ['show', '--pretty=', '--name-only', 'HEAD'], {
+        cwd: workspace.worktreePath, encoding: 'utf8',
+      }).split(/\r?\n/u).filter(Boolean);
+      expect(committedAfterRetry).not.toContain('evidence-created.txt');
+    } finally { await h.cleanup(); }
+  });
   it('captures failed stable evidence but refuses ACCEPT at the merge gate', async () => {
     const h = await harness([{ outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'actual\n' } }]);
     try {
@@ -272,3 +373,16 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
     } finally { await h.cleanup(); }
   });
 });
+
+function lifecycleDigest(identity: unknown): string {
+  return createHash('sha256').update(`AgentHub.TaskLifecycleResult.v1\0${canonical(identity)}`).digest('hex');
+}
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}

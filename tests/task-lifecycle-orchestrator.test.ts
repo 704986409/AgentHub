@@ -7,7 +7,9 @@ import {
   TaskStatus,
   type AgentHubWorkerResult,
   type AssignmentDispatchResult,
+  type BuildTestEvidence,
   type BuildTestEvidencePlan,
+  type GitWorkspaceChangeSnapshot,
 } from '../src/index.js';
 
 const oid = 'a'.repeat(40);
@@ -65,10 +67,27 @@ function makeHarness(workerResult: AgentHubWorkerResult) {
   const worktrees = Object.assign(Object.create(GitWorktreeManager.prototype) as GitWorktreeManager, {
     inspectWorkspace: vi.fn(() => Promise.resolve({ taskId: d.taskId, repositoryRoot: 'C:/repo', worktreePath: 'C:/repo/wt',
       branchName: d.workspace.branchName, baseCommit: d.workspace.baseCommit, headCommit: d.workspace.headCommit })),
+    commitTaskWorkspace: vi.fn(), collectBuildTestEvidence: vi.fn(), captureWorkspaceChanges: vi.fn(),
   });
   const lifecycle = new TaskLifecycleOrchestrator({ taskManager: tasks, agentRegistry: agents,
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees } as never);
   return { d, lifecycle, assignments, tasks, pool, worktrees };
+}
+
+function sourceSnapshot(): GitWorkspaceChangeSnapshot {
+  const patch = { status: 'empty' as const, byteLength: 0 as const,
+    sha256: createHash('sha256').update('').digest('hex') };
+  return { taskId: 'TASK', repositoryRoot: 'C:/repo', worktreePath: 'C:/repo/wt', branchName: 'agenthub/TASK',
+    baseCommit: oid, headCommit: oid, committed: { changes: [], patch }, staged: { changes: [], patch },
+    unstaged: { changes: [], patch }, workingFiles: [], untracked: [], conflicts: [],
+    ignored: { present: false, count: 0, paths: [], truncated: false }, changedPaths: [], hasConflicts: false,
+    changeSetSha256: sha };
+}
+
+function evidenceSnapshot(source: GitWorkspaceChangeSnapshot): BuildTestEvidence {
+  return { version: 2, taskId: source.taskId, branchName: source.branchName,
+    baseCommit: source.baseCommit, headCommit: source.headCommit, changeSetSha256: source.changeSetSha256,
+    sourceVisibilitySha256: sha, build: 'not-run', test: 'passed', outcome: 'passed', commands: [], evidenceSha256: sha };
 }
 
 describe('TaskLifecycleOrchestrator focused lifecycle outcomes', () => {
@@ -92,5 +111,46 @@ describe('TaskLifecycleOrchestrator focused lifecycle outcomes', () => {
       .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_INVALID_DISPATCH_RESULT' });
     expect(h.pool.shutdown.mock.calls).toHaveLength(0);
     expect(h.worktrees.inspectWorkspace.mock.calls).toHaveLength(0);
+  });
+
+  it.each([
+    ['collector throw', () => Promise.reject(new Error('private infrastructure detail')), false],
+    ['workspace-mutated', () => Promise.resolve({ ...evidenceSnapshot(sourceSnapshot()), outcome: 'workspace-mutated' }), false],
+    ['infrastructure-failed', () => Promise.resolve({ ...evidenceSnapshot(sourceSnapshot()), outcome: 'infrastructure-failed' }), false],
+    ['source capture failure', () => Promise.resolve(evidenceSnapshot(sourceSnapshot())), true],
+  ] as const)('closes %s and rejects retry before another commit', async (_name, collect, captureFails) => {
+    const h = makeHarness(completed);
+    h.worktrees.commitTaskWorkspace = vi.fn().mockResolvedValue({ version: 1, taskId: h.d.taskId,
+      branchName: h.d.workspace.branchName, baseCommit: oid, headBefore: oid, headAfter: oid,
+      outcome: 'no-changes', taskCommitSha256: sha });
+    h.worktrees.collectBuildTestEvidence = vi.fn().mockImplementation(collect);
+    h.worktrees.captureWorkspaceChanges = captureFails
+      ? vi.fn().mockRejectedValue(new Error('private capture detail'))
+      : vi.fn().mockResolvedValue(sourceSnapshot());
+    const first = await h.lifecycle.prepareReview({ dispatchResult: h.d, buildTestPlan: plan });
+    expect(first.outcome).toBe('blocked');
+    expect(h.pool.shutdown).toHaveBeenCalledTimes(1);
+    expect(h.assignments.suspendActiveAssignment).toHaveBeenCalledWith(h.d.assignmentId, TaskStatus.BLOCKED);
+    await expect(h.lifecycle.prepareReview({ dispatchResult: h.d, buildTestPlan: plan }))
+      .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_STALE_EXECUTION' });
+    expect((h.worktrees.commitTaskWorkspace as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+  });
+
+  it.each([
+    ['evidence/source mismatch', { changeSetSha256: 'c'.repeat(64) }],
+    ['dirty source', { untracked: [{ path: 'unexpected.txt', kind: 'regular', size: 1, sha256: sha }] }],
+    ['head drift', { headCommit: 'c'.repeat(40) }],
+  ] as const)('closes %s before REVIEWING', async (_name, override) => {
+    const h = makeHarness(completed);
+    const source = sourceSnapshot();
+    h.worktrees.commitTaskWorkspace = vi.fn().mockResolvedValue({ version: 1, taskId: h.d.taskId,
+      branchName: h.d.workspace.branchName, baseCommit: oid, headBefore: oid, headAfter: oid,
+      outcome: 'no-changes', taskCommitSha256: sha });
+    h.worktrees.collectBuildTestEvidence = vi.fn().mockResolvedValue(evidenceSnapshot(source));
+    h.worktrees.captureWorkspaceChanges = vi.fn().mockResolvedValue({ ...source, ...override });
+    await expect(h.lifecycle.prepareReview({ dispatchResult: h.d, buildTestPlan: plan }))
+      .resolves.toMatchObject({ outcome: 'blocked' });
+    expect(h.tasks.transitionTask).not.toHaveBeenCalled();
+    expect(h.assignments.suspendActiveAssignment).toHaveBeenCalledWith(h.d.assignmentId, TaskStatus.BLOCKED);
   });
 });
