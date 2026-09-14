@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isAbsolute } from 'node:path';
 
 import { AgentStatus, AssignmentStatus, TaskStatus, type Agent, type Assignment, type Task } from '../core/types.js';
 import { AgentHubWorkerResultSchema, validateAgentHubWorkerResultSemantics } from '../protocol/AgentHubWorkerResult.js';
@@ -14,16 +15,18 @@ import {
 import type { AgentRegistry } from '../services/agent-registry.js';
 import type { AssignmentManager } from '../services/assignment-manager.js';
 import type { TaskManager } from '../services/task-manager.js';
-import type { CreatedTaskWorkspace, GitWorktreeManager } from '../workspace/GitWorktreeManager.js';
+import { GitWorktreeManager, type CreatedTaskWorkspace } from '../workspace/GitWorktreeManager.js';
 import {
   snapshotAgentScheduleReservation,
   type AgentScheduleReservation,
 } from './AgentScheduler.js';
+import { assignmentDispatcherTestAuthority } from './internal/AssignmentDispatcherTestAuthority.js';
 
 const encoder = new TextEncoder();
 const maxBaseRefBytes = 1024;
 const maxPromptBytes = 1024 * 1024;
 const maxTimeoutMs = 60 * 60 * 1000;
+const gitObjectIdPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const dispatchFences = new WeakMap<AssignmentManager, Set<string>>();
 
 export interface AssignmentDispatchRequest {
@@ -53,6 +56,7 @@ export interface AssignmentDispatchResult {
   readonly providerId: string;
   readonly assignmentId: string;
   readonly reservationSha256: string;
+  readonly executionProfileSha256: string;
   readonly workspace: AssignmentDispatchWorkspace;
   readonly assignmentStatus: 'ACTIVE';
   readonly taskStatus: 'IMPLEMENTING';
@@ -68,6 +72,7 @@ export type AssignmentDispatcherErrorCode =
   | 'AGENT_DISPATCH_STALE_PROFILE'
   | 'AGENT_DISPATCH_RESERVATION_MISMATCH'
   | 'AGENT_DISPATCH_WORKSPACE_FAILED'
+  | 'AGENT_DISPATCH_WORKSPACE_STALE'
   | 'AGENT_DISPATCH_ACCEPT_FAILED'
   | 'AGENT_DISPATCH_RUNTIME_START_FAILED'
   | 'AGENT_DISPATCH_ACTIVATION_FAILED'
@@ -88,7 +93,18 @@ export interface AssignmentDispatcherOptions {
   readonly agentRegistry: AgentRegistry;
   readonly assignmentManager: AssignmentManager;
   readonly agentPool: AgentPool;
-  readonly worktreeManager: Pick<GitWorktreeManager, 'createWorkspace'>;
+  readonly worktreeManager: GitWorktreeManager;
+}
+
+interface WorkspaceAuthority {
+  readonly repositoryRoot: string;
+  createWorkspace(request: { readonly taskId: string; readonly baseRef: string }): Promise<CreatedTaskWorkspace>;
+}
+
+interface PreparedTaskWorkspace extends AssignmentDispatchWorkspace {
+  readonly taskId: string;
+  readonly repositoryRoot: string;
+  readonly worktreePath: string;
 }
 
 export class AssignmentDispatcher {
@@ -96,15 +112,23 @@ export class AssignmentDispatcher {
   readonly #agentRegistry: AgentRegistry;
   readonly #assignmentManager: AssignmentManager;
   readonly #agentPool: AgentPool;
-  readonly #worktreeManager: Pick<GitWorktreeManager, 'createWorkspace'>;
+  readonly #worktreeManager: WorkspaceAuthority;
 
-  public constructor(options: AssignmentDispatcherOptions) {
+  public constructor(
+    options: AssignmentDispatcherOptions,
+    testAuthority?: typeof assignmentDispatcherTestAuthority,
+  ) {
     if (!isRecord(options)) throw dispatchError('AGENT_DISPATCH_INVALID_REQUEST');
+    const worktreeManager = options.worktreeManager;
+    if (!(worktreeManager instanceof GitWorktreeManager) &&
+      testAuthority !== assignmentDispatcherTestAuthority) {
+      throw dispatchError('AGENT_DISPATCH_INVALID_REQUEST');
+    }
     this.#taskManager = options.taskManager;
     this.#agentRegistry = options.agentRegistry;
     this.#assignmentManager = options.assignmentManager;
     this.#agentPool = options.agentPool;
-    this.#worktreeManager = options.worktreeManager;
+    this.#worktreeManager = worktreeManager;
   }
 
   public dispatch(request: AssignmentDispatchRequest): Promise<Readonly<AssignmentDispatchResult>> {
@@ -128,12 +152,12 @@ export class AssignmentDispatcher {
     const reservation = request.reservation;
     const initial = this.#requireReservedState(reservation);
 
-    let workspace: Readonly<AssignmentDispatchWorkspace>;
+    let preparedWorkspace: Readonly<PreparedTaskWorkspace>;
     try {
-      workspace = snapshotWorkspace(await this.#worktreeManager.createWorkspace({
+      preparedWorkspace = snapshotWorkspace(await this.#worktreeManager.createWorkspace({
         taskId: reservation.taskId,
         baseRef: request.baseRef,
-      }));
+      }), reservation.taskId, this.#worktreeManager.repositoryRoot);
     } catch {
       throw dispatchError('AGENT_DISPATCH_WORKSPACE_FAILED');
     }
@@ -154,9 +178,27 @@ export class AssignmentDispatcher {
       throw dispatchError('AGENT_DISPATCH_RECONCILIATION_REQUIRED');
     }
 
+    let revalidatedWorkspace: Readonly<PreparedTaskWorkspace>;
+    try {
+      revalidatedWorkspace = snapshotWorkspace(await this.#worktreeManager.createWorkspace({
+        taskId: reservation.taskId,
+        baseRef: preparedWorkspace.baseCommit,
+      }), reservation.taskId, this.#worktreeManager.repositoryRoot);
+      if (!sameWorkspaceIdentity(preparedWorkspace, revalidatedWorkspace)) {
+        throw dispatchError('AGENT_DISPATCH_WORKSPACE_STALE');
+      }
+    } catch (error) {
+      if (error instanceof AssignmentDispatcherError && error.code === 'AGENT_DISPATCH_WORKSPACE_STALE') throw error;
+      throw dispatchError('AGENT_DISPATCH_WORKSPACE_STALE');
+    }
+
+    this.#requirePreStartContinuity(reservation, initial.agent, initial.executionProfileSha256);
+
     const binding = bindingOf(reservation);
     try {
-      await this.#agentPool.startReserved(reservation.agentId, binding);
+      await this.#agentPool.startReserved(reservation.agentId, binding, {
+        workspacePath: revalidatedWorkspace.worktreePath,
+      });
     } catch {
       const pool = this.#safePoolSnapshot(reservation.agentId);
       if (isExactReservedPool(pool, reservation, initial.agent)) {
@@ -166,6 +208,11 @@ export class AssignmentDispatcher {
     }
     if (!isExactOwnedPool(this.#safePoolSnapshot(reservation.agentId), reservation, initial.agent)) {
       throw dispatchError('AGENT_DISPATCH_RUNTIME_RECONCILIATION_REQUIRED');
+    }
+
+    if (!this.#hasPreActivationContinuity(reservation, initial.agent, initial.executionProfileSha256)) {
+      await this.#shutdownStaleRuntime(reservation, initial.agent);
+      throw dispatchError('AGENT_DISPATCH_STALE_PROFILE');
     }
 
     let activationThrew = false;
@@ -189,6 +236,9 @@ export class AssignmentDispatcher {
         throw dispatchError('AGENT_DISPATCH_ACTIVATION_FAILED');
       }
       throw dispatchError('AGENT_DISPATCH_RECONCILIATION_REQUIRED');
+    }
+    if (!this.#matchesExecutionProfile(reservation.agentId, initial.executionProfileSha256)) {
+      throw dispatchError('AGENT_DISPATCH_STALE_PROFILE');
     }
 
     let providerResult: AgentProviderTurnResult;
@@ -214,7 +264,8 @@ export class AssignmentDispatcher {
       providerId: reservation.providerId,
       assignmentId: reservation.assignmentId,
       reservationSha256: reservation.reservationSha256,
-      workspace,
+      executionProfileSha256: initial.executionProfileSha256,
+      workspace: publicWorkspace(preparedWorkspace),
       assignmentStatus: 'ACTIVE' as const,
       taskStatus: 'IMPLEMENTING' as const,
       turnResult,
@@ -231,6 +282,7 @@ export class AssignmentDispatcher {
     readonly assignment: Assignment;
     readonly task: Task;
     readonly agent: Agent;
+    readonly executionProfileSha256: string;
   } {
     let assignment: Assignment | null;
     let task: Task | null;
@@ -258,7 +310,72 @@ export class AssignmentDispatcher {
     if (!isExactReservedPool(pool, reservation, agent)) {
       throw dispatchError('AGENT_DISPATCH_RESERVATION_MISMATCH');
     }
-    return { assignment, task, agent };
+    let executionProfileSha256: string;
+    try {
+      executionProfileSha256 = this.#agentRegistry.calculateExecutionProfileHash(agent.id);
+    } catch {
+      throw dispatchError('AGENT_DISPATCH_STALE_PROFILE');
+    }
+    return { assignment, task, agent, executionProfileSha256 };
+  }
+
+  #requirePreStartContinuity(
+    reservation: Readonly<AgentScheduleReservation>,
+    initialAgent: Agent,
+    executionProfileSha256: string,
+  ): void {
+    let assignment: Assignment | null;
+    let task: Task | null;
+    let agent: Agent | null;
+    try {
+      assignment = this.#assignmentManager.getAssignment(reservation.assignmentId);
+      task = this.#taskManager.getTask(reservation.taskId);
+      agent = this.#agentRegistry.getAgent(reservation.agentId);
+    } catch {
+      throw dispatchError('AGENT_DISPATCH_RECONCILIATION_REQUIRED');
+    }
+    if (!isExactAssignment(assignment, reservation, AssignmentStatus.ACCEPTED) ||
+      !isExactAssignedTask(task, reservation) || agent === null ||
+      agent.id !== initialAgent.id || agent.status !== AgentStatus.IDLE || !agent.enabled ||
+      agent.provider !== reservation.providerId ||
+      !isExactReservedPool(this.#safePoolSnapshot(reservation.agentId, true), reservation, agent)) {
+      throw dispatchError('AGENT_DISPATCH_RECONCILIATION_REQUIRED');
+    }
+    if (!this.#matchesExecutionProfile(reservation.agentId, executionProfileSha256)) {
+      throw dispatchError('AGENT_DISPATCH_STALE_PROFILE');
+    }
+  }
+
+  #hasPreActivationContinuity(
+    reservation: Readonly<AgentScheduleReservation>,
+    initialAgent: Agent,
+    executionProfileSha256: string,
+  ): boolean {
+    const state = this.#readActivationState(reservation);
+    return isExactPreActivation(state, reservation, initialAgent) &&
+      this.#matchesExecutionProfile(reservation.agentId, executionProfileSha256);
+  }
+
+  #matchesExecutionProfile(agentId: string, expected: string): boolean {
+    try {
+      return this.#agentRegistry.calculateExecutionProfileHash(agentId) === expected;
+    } catch {
+      return false;
+    }
+  }
+
+  async #shutdownStaleRuntime(
+    reservation: Readonly<AgentScheduleReservation>,
+    initialAgent: Agent,
+  ): Promise<void> {
+    try {
+      await this.#agentPool.shutdown(reservation.agentId, reservation.assignmentId);
+      if (!isCleanUnreservedPool(this.#safePoolSnapshot(reservation.agentId), initialAgent)) {
+        throw new Error('runtime remained owned');
+      }
+    } catch {
+      throw dispatchError('AGENT_DISPATCH_RUNTIME_RECONCILIATION_REQUIRED');
+    }
   }
 
   #readActivationState(reservation: Readonly<AgentScheduleReservation>): ActivationState {
@@ -343,16 +460,45 @@ function snapshotDispatchRequest(request: AssignmentDispatchRequest): Readonly<A
   }
 }
 
-function snapshotWorkspace(value: CreatedTaskWorkspace): Readonly<AssignmentDispatchWorkspace> {
-  if (!isRecord(value) || !isNonBlankString(value.branchName) || !isNonBlankString(value.baseCommit) ||
-    !isNonBlankString(value.headCommit) || typeof value.created !== 'boolean') {
+function snapshotWorkspace(
+  value: CreatedTaskWorkspace,
+  taskId: string,
+  repositoryRoot: string,
+): Readonly<PreparedTaskWorkspace> {
+  if (!isRecord(value) || value.taskId !== taskId || value.repositoryRoot !== repositoryRoot ||
+    !isAbsolute(value.worktreePath) || value.worktreePath === repositoryRoot ||
+    value.branchName !== `agenthub/${taskId}` ||
+    typeof value.baseCommit !== 'string' || !gitObjectIdPattern.test(value.baseCommit) ||
+    typeof value.headCommit !== 'string' || !gitObjectIdPattern.test(value.headCommit) ||
+    typeof value.created !== 'boolean') {
     throw new TypeError('invalid workspace result');
   }
   return deepFreeze({
+    taskId,
+    repositoryRoot,
+    worktreePath: value.worktreePath,
     branchName: value.branchName,
     baseCommit: value.baseCommit,
     headCommit: value.headCommit,
     created: value.created,
+  });
+}
+
+function sameWorkspaceIdentity(
+  first: Readonly<PreparedTaskWorkspace>,
+  second: Readonly<PreparedTaskWorkspace>,
+): boolean {
+  return first.taskId === second.taskId && first.repositoryRoot === second.repositoryRoot &&
+    first.worktreePath === second.worktreePath && first.branchName === second.branchName &&
+    first.baseCommit === second.baseCommit && first.headCommit === second.headCommit;
+}
+
+function publicWorkspace(workspace: Readonly<PreparedTaskWorkspace>): Readonly<AssignmentDispatchWorkspace> {
+  return deepFreeze({
+    branchName: workspace.branchName,
+    baseCommit: workspace.baseCommit,
+    headCommit: workspace.headCommit,
+    created: workspace.created,
   });
 }
 
@@ -552,6 +698,7 @@ function dispatchErrorMessage(code: AssignmentDispatcherErrorCode): string {
     AGENT_DISPATCH_STALE_PROFILE: 'Agent profile no longer matches the reservation',
     AGENT_DISPATCH_RESERVATION_MISMATCH: 'Agent pool reservation does not match',
     AGENT_DISPATCH_WORKSPACE_FAILED: 'Task workspace could not be prepared',
+    AGENT_DISPATCH_WORKSPACE_STALE: 'Task workspace identity changed before runtime start',
     AGENT_DISPATCH_ACCEPT_FAILED: 'Assignment acceptance failed before commit',
     AGENT_DISPATCH_RUNTIME_START_FAILED: 'Reserved runtime failed to start cleanly',
     AGENT_DISPATCH_ACTIVATION_FAILED: 'Assignment activation failed before commit',

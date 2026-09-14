@@ -48,7 +48,10 @@ export class ClaudeAgentProvider implements AgentProvider {
   }
 
   public createSession(options: AgentProviderSessionCreateOptions): AgentProviderSession {
-    const transportOptions = validateClaudeConfig(options.config);
+    const configuredTransportOptions = validateClaudeConfig(options.config);
+    const transportOptions = options.workspacePath === undefined
+      ? configuredTransportOptions
+      : { ...(configuredTransportOptions ?? {}), cwd: options.workspacePath };
     const worker = this.#createWorkerSession({
       eventBus: options.eventBus,
       context: Object.freeze({ ...options.context, provider: CLAUDE_AGENT_PROVIDER_ID }),

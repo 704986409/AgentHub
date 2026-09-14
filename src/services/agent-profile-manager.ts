@@ -54,6 +54,27 @@ export class AgentProfileManager {
     return createHash('sha256').update(`${JSON.stringify(config)}\n${content}`).digest('hex');
   }
 
+  public calculateExecutionProfileHash(agent: Agent): string {
+    const config = {
+      id: agent.id,
+      projectId: agent.projectId,
+      name: agent.name,
+      provider: agent.provider,
+      model: agent.model,
+      position: agent.position,
+      allowedComplexities: agent.allowedComplexities,
+      allowedRiskLevels: agent.allowedRiskLevels,
+      capabilities: agent.capabilities,
+      specialties: agent.specialties,
+      authority: agent.authority,
+      enabled: agent.enabled,
+    };
+    const content = this.readProfile(agent.id);
+    return createHash('sha256')
+      .update(`AgentHub.ExecutionProfile.v1\0${canonicalJson(config)}\n${content}`)
+      .digest('hex');
+  }
+
   public userRules(agentId: string): string {
     const content = this.readProfile(agentId);
     const marker = '## 用户自定义规则\n';
@@ -78,4 +99,14 @@ export class AgentProfileManager {
       `## 用户自定义规则\n\n${userRules.trim()}\n`
     );
   }
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).filter((key) => record[key] !== undefined).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }

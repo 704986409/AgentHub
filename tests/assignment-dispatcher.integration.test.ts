@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -28,6 +28,7 @@ import {
   type AgentProvider,
   type AgentProviderCapabilities,
   type AgentProviderSession,
+  type AgentProviderSessionCreateOptions,
   type AgentProviderTurnResult,
 } from '../src/index.js';
 
@@ -73,7 +74,9 @@ class IntegrationProvider implements AgentProvider {
   public readonly capabilities = capabilities;
   public readonly session = new IntegrationSession();
   public createError: Error | undefined;
-  public createSession(): AgentProviderSession {
+  public readonly createOptions: AgentProviderSessionCreateOptions[] = [];
+  public createSession(options: AgentProviderSessionCreateOptions): AgentProviderSession {
+    this.createOptions.push(options);
     if (this.createError !== undefined) throw this.createError;
     return this.session;
   }
@@ -93,6 +96,10 @@ describe('AssignmentDispatcher integration', () => {
       });
       expect(h.provider.session.runCalls).toBe(1);
       expect(h.provider.session.startCalls).toBe(1);
+      expect(h.provider.createOptions[0]?.workspacePath).toBe(
+        join(h.repositoryRoot, '.agenthub', 'worktrees', 'task-a'),
+      );
+      expect(h.provider.createOptions[0]?.workspacePath).not.toBe(realpathSync(h.repositoryRoot));
       expect(h.assignments.getAssignment(reservation.assignmentId)).toMatchObject({ status: 'ACTIVE' });
       expect(h.tasks.getTask('task-a')).toMatchObject({ status: 'IMPLEMENTING' });
       expect(h.agents.getAgent('agent-a')).toMatchObject({ status: 'BUSY' });
@@ -179,7 +186,7 @@ async function integrationHarness() {
     taskManager: tasks, agentRegistry: agents, assignmentManager: assignments, agentPool: pool, worktreeManager,
   });
   return {
-    baseCommit, agents, tasks, assignments, provider, pool, worktreeManager, dispatcher,
+    baseCommit, repositoryRoot: worktreeManager.repositoryRoot, agents, tasks, assignments, provider, pool, worktreeManager, dispatcher,
     reserve() {
       const result = scheduler.scheduleTask({ taskId: 'task-a' });
       if (result.outcome !== 'reserved') throw new Error('expected a reservation');

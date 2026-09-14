@@ -33,6 +33,10 @@ export interface AgentRuntimeBinding {
   readonly profileHash: string;
 }
 
+export interface AgentRuntimeStartContext {
+  readonly workspacePath?: string;
+}
+
 interface AgentRuntimeTurnSnapshot {
   readonly prompt: string;
   readonly protocol: AgentOutputProtocol;
@@ -119,7 +123,7 @@ export class AgentRuntime {
     return this.#sessionId;
   }
 
-  public start(binding: AgentRuntimeBinding): Promise<void> {
+  public start(binding: AgentRuntimeBinding, context?: AgentRuntimeStartContext): Promise<void> {
     if (this.#state === 'STARTING' || this.#state === 'STOPPING') {
       return Promise.reject(lifecycleBusy(this.#state));
     }
@@ -134,8 +138,10 @@ export class AgentRuntime {
     this.#state = 'STARTING';
 
     let snapshot: Readonly<AgentRuntimeBinding>;
+    let startContext: Readonly<AgentRuntimeStartContext>;
     try {
       snapshot = snapshotBinding(binding);
+      startContext = snapshotStartContext(context);
     } catch (error) {
       const state = this.#currentState();
       if (state !== 'STARTING') return Promise.reject(lifecycleErrorForState(state));
@@ -177,6 +183,7 @@ export class AgentRuntime {
           assignmentId: snapshot.assignmentId,
         },
         ...(this.#providerConfig === undefined ? {} : { config: this.#providerConfig }),
+        ...(startContext.workspacePath === undefined ? {} : { workspacePath: startContext.workspacePath }),
       });
     } catch (error) {
       const state = this.#currentState();
@@ -520,6 +527,18 @@ function snapshotBinding(binding: AgentRuntimeBinding): Readonly<AgentRuntimeBin
     throw invalidBinding();
   }
   return Object.freeze({ taskId, assignmentId, specVersion, profileHash });
+}
+
+function snapshotStartContext(context: AgentRuntimeStartContext | undefined): Readonly<AgentRuntimeStartContext> {
+  if (context === undefined) return Object.freeze({});
+  if (!isRecord(context)) {
+    throw new AgentRuntimeError('AGENT_RUNTIME_INVALID_CONFIG', 'Agent runtime start context is invalid');
+  }
+  const workspacePath = context.workspacePath;
+  if (workspacePath !== undefined && typeof workspacePath !== 'string') {
+    throw new AgentRuntimeError('AGENT_RUNTIME_INVALID_CONFIG', 'Agent runtime workspace path is invalid');
+  }
+  return Object.freeze(workspacePath === undefined ? {} : { workspacePath });
 }
 
 function invalidBinding(): AgentRuntimeError {

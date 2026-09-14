@@ -28,11 +28,14 @@ import {
   type AgentProvider,
   type AgentProviderCapabilities,
   type AgentProviderSession,
+  type AgentProviderSessionCreateOptions,
   type AgentProviderTurnRequest,
   type AgentProviderTurnResult,
   type AgentScheduleReservation,
   type CreatedTaskWorkspace,
 } from '../src/index.js';
+import { createAssignmentDispatcherForTest } from
+  '../src/orchestration/internal/AssignmentDispatcherTestHarness.js';
 
 const capabilities: AgentProviderCapabilities = Object.freeze({
   outputProtocols: Object.freeze(['worker-result'] as const),
@@ -79,24 +82,42 @@ class Provider implements AgentProvider {
   public readonly capabilities = capabilities;
   public readonly session = new Session();
   public createError: Error | undefined;
-  public createSession(): AgentProviderSession {
+  public readonly createOptions: AgentProviderSessionCreateOptions[] = [];
+  public onCreate: (() => void) | undefined;
+  public createSession(options: AgentProviderSessionCreateOptions): AgentProviderSession {
+    this.createOptions.push(options);
+    this.onCreate?.();
     if (this.createError !== undefined) throw this.createError;
     return this.session;
   }
 }
 
 class WorkspaceStub {
+  public readonly repositoryRoot: string;
   public calls = 0;
+  public readonly baseRefs: string[] = [];
   public error: Error | undefined;
   public barrier: Promise<void> | undefined;
   public created = true;
-  public async createWorkspace(): Promise<CreatedTaskWorkspace> {
+  public secondWorktreePath: string | undefined;
+  public invalidCommit = false;
+  public constructor(repositoryRoot: string) {
+    this.repositoryRoot = repositoryRoot;
+  }
+  public async createWorkspace(request: { readonly baseRef: string }): Promise<CreatedTaskWorkspace> {
     this.calls += 1;
+    this.baseRefs.push(request.baseRef);
     if (this.barrier !== undefined) await this.barrier;
     if (this.error !== undefined) throw this.error;
+    const defaultPath = join(this.repositoryRoot, '.agenthub', 'worktrees', 'task-a');
     return {
-      taskId: 'task-a', repositoryRoot: 'ignored', worktreePath: 'ignored',
-      branchName: 'agenthub/task-a', baseCommit: 'a'.repeat(40), headCommit: 'a'.repeat(40),
+      taskId: 'task-a', repositoryRoot: this.repositoryRoot,
+      worktreePath: this.calls === 2 && this.secondWorktreePath !== undefined
+        ? this.secondWorktreePath
+        : defaultPath,
+      branchName: 'agenthub/task-a',
+      baseCommit: this.invalidCommit ? 'not-an-object-id' : 'a'.repeat(40),
+      headCommit: 'a'.repeat(40),
       created: this.created,
     };
   }
@@ -108,6 +129,16 @@ afterEach(() => {
 });
 
 describe('AssignmentDispatcher', () => {
+  it('blocks structural workspace doubles at the public trust boundary', () => {
+    const h = harness();
+    expect(() => new AssignmentDispatcher({
+      taskManager: h.tasks,
+      agentRegistry: h.agents,
+      assignmentManager: h.assignments,
+      agentPool: h.pool,
+      worktreeManager: h.workspace as never,
+    })).toThrow('Assignment dispatch request is invalid');
+  });
   it('validates the digest, snapshots getters once, and rejects bounded input before effects', async () => {
     const h = harness();
     const reservation = h.reserve();
@@ -166,10 +197,16 @@ describe('AssignmentDispatcher', () => {
       turnResult: { protocol: 'worker-result', protocolValid: true },
     });
     expect(result.dispatchSha256).toMatch(/^[0-9a-f]{64}$/u);
+    expect(result.workspace).not.toHaveProperty('worktreePath');
+    expect(JSON.stringify(result)).not.toContain(h.directory);
     expectDeepFrozen(result);
-    expect(h.workspace.calls).toBe(1);
+    expect(h.workspace.calls).toBe(2);
     expect(h.provider.session.startCalls).toBe(1);
     expect(h.provider.session.runCalls).toBe(1);
+    expect(h.provider.createOptions[0]?.workspacePath).toBe(
+      join(h.directory, '.agenthub', 'worktrees', 'task-a'),
+    );
+    expect(h.workspace.baseRefs).toEqual(['HEAD', 'a'.repeat(40)]);
     expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'OWNED', reserved: false });
     expect(h.agents.getAgent('agent-a')).toMatchObject({ status: AgentStatus.BUSY });
   });
@@ -211,6 +248,15 @@ describe('AssignmentDispatcher', () => {
     expect(staleTask.workspace.calls).toBe(0);
   });
 
+  it('rejects malformed trusted workspace identity before acceptance', async () => {
+    const h = harness();
+    h.workspace.invalidCommit = true;
+    await expect(h.dispatcher.dispatch(request(h.reserve()))).rejects.toMatchObject({
+      code: 'AGENT_DISPATCH_WORKSPACE_FAILED',
+    });
+    expect(h.provider.createOptions).toHaveLength(0);
+    expect(h.provider.session.runCalls).toBe(0);
+  });
   it('leaves reservation and persistent lifecycle untouched when workspace creation fails', async () => {
     const h = harness();
     const reservation = h.reserve();
@@ -223,6 +269,59 @@ describe('AssignmentDispatcher', () => {
     expect(h.agents.getAgent('agent-a')).toMatchObject({ status: 'IDLE' });
     expect(h.pool.getSnapshot('agent-a')).toMatchObject({ reserved: true, state: 'IDLE' });
     expect(h.provider.session.startCalls).toBe(0);
+  });
+
+  it('blocks workspace identity drift after acceptance before provider startup', async () => {
+    const h = harness();
+    h.workspace.secondWorktreePath = join(h.directory, '.agenthub', 'worktrees', 'other');
+    const reservation = h.reserve();
+    await expect(h.dispatcher.dispatch(request(reservation))).rejects.toMatchObject({
+      code: 'AGENT_DISPATCH_WORKSPACE_STALE',
+    });
+    expect(h.workspace.baseRefs).toEqual(['HEAD', 'a'.repeat(40)]);
+    expect(h.provider.createOptions).toHaveLength(0);
+    expect(h.provider.session.runCalls).toBe(0);
+  });
+
+  it('blocks execution-profile drift during acceptance', async () => {
+    const h = harness();
+    h.bus.subscribe((event) => {
+      if (event.eventType === 'AssignmentAccepted') {
+        h.agents.updateAgent('agent-a', { position: 'Changed during acceptance' });
+      }
+    });
+    await expect(h.dispatcher.dispatch(request(h.reserve()))).rejects.toMatchObject({
+      code: 'AGENT_DISPATCH_STALE_PROFILE',
+    });
+    expect(h.provider.createOptions).toHaveLength(0);
+    expect(h.provider.session.runCalls).toBe(0);
+  });
+
+  it('shuts down and blocks activation when profile drifts during provider startup', async () => {
+    const h = harness();
+    h.provider.onCreate = () => h.agents.updateAgent('agent-a', { model: 'changed-model' });
+    const reservation = h.reserve();
+    await expect(h.dispatcher.dispatch(request(reservation))).rejects.toMatchObject({
+      code: 'AGENT_DISPATCH_STALE_PROFILE',
+    });
+    expect(h.assignments.getAssignment(reservation.assignmentId)).toMatchObject({ status: 'ACCEPTED' });
+    expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'IDLE', reserved: false });
+    expect(h.provider.session.shutdownCalls).toBe(1);
+    expect(h.provider.session.runCalls).toBe(0);
+  });
+
+  it('blocks the first turn when profile drifts during activation events', async () => {
+    const h = harness();
+    h.bus.subscribe((event) => {
+      if (event.eventType === 'TaskStatusChanged' && event.newStatus === TaskStatus.IMPLEMENTING) {
+        h.agents.updateAgent('agent-a', { capabilities: ['changed-during-activation'] });
+      }
+    });
+    await expect(h.dispatcher.dispatch(request(h.reserve()))).rejects.toMatchObject({
+      code: 'AGENT_DISPATCH_STALE_PROFILE',
+    });
+    expect(h.provider.session.runCalls).toBe(0);
+    expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'OWNED' });
   });
 
   it('reconciles committed acceptance notification failure and continues', async () => {
@@ -365,7 +464,7 @@ describe('AssignmentDispatcher', () => {
     });
     release();
     await first;
-    expect(h.workspace.calls).toBe(1);
+    expect(h.workspace.calls).toBe(2);
     expect(h.provider.session.runCalls).toBe(1);
   });
 });
@@ -404,8 +503,8 @@ function harness() {
   const scheduler = new AgentScheduler({
     taskManager: tasks, agentRegistry: agents, providerFactory: factory, agentPool: pool, assignmentManager: assignments,
   });
-  const workspace = new WorkspaceStub();
-  const dispatcher = new AssignmentDispatcher({
+  const workspace = new WorkspaceStub(directory);
+  const dispatcher = createAssignmentDispatcherForTest({
     taskManager: tasks, agentRegistry: agents, assignmentManager: assignments,
     agentPool: pool, worktreeManager: workspace,
   });

@@ -85,7 +85,10 @@ export class CodexAgentProvider implements AgentProvider {
 
   public createSession(options: AgentProviderSessionCreateOptions): AgentProviderSession {
     const config = validateCodexConfig(options.config);
-    const useCase = this.#createUseCase(config.providerOptions, config.turnOptions);
+    const providerOptions = options.workspacePath === undefined
+      ? config.providerOptions
+      : { ...config.providerOptions, cwd: options.workspacePath };
+    const useCase = this.#createUseCase(providerOptions, config.turnOptions);
     return new CodexAgentProviderSession(
       useCase,
       options.eventBus,

@@ -74,4 +74,10 @@ export class AgentRegistry {
     if (agent === null) throw new Error(`Agent ${id} was not found`);
     return this.profiles.calculateProfileHash(agent);
   }
+
+  public calculateExecutionProfileHash(id: string): string {
+    const agent = this.repository.findById(id);
+    if (agent === null) throw new Error(`Agent ${id} was not found`);
+    return this.profiles.calculateExecutionProfileHash(agent);
+  }
 }

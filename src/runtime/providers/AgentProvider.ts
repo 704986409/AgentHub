@@ -23,12 +23,15 @@ export interface AgentProviderSessionCreateOptions {
   readonly eventBus: EventBus;
   readonly context: AgentRuntimeContext;
   readonly config?: Readonly<Record<string, unknown>>;
+  /** Assignment-scoped authoritative working directory for task execution. */
+  readonly workspacePath?: string;
 }
 
 export interface CreateAgentProviderSessionRequest {
   readonly eventBus: EventBus;
   readonly context: AgentProviderRuntimeContext;
   readonly config?: Readonly<Record<string, unknown>>;
+  readonly workspacePath?: string;
 }
 
 export interface AgentProviderTurnRequest {

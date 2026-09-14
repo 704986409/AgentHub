@@ -2,6 +2,7 @@ import type { EventBus } from '../events/event-bus.js';
 import {
   AgentRuntime,
   type AgentRuntimeBinding,
+  type AgentRuntimeStartContext,
   type AgentRuntimeState,
 } from './AgentRuntime.js';
 import type {
@@ -262,11 +263,18 @@ export class AgentPool {
   }
 
   /** Atomically promotes an exact scheduler reservation into runtime ownership. */
-  public startReserved(agentId: string, binding: AgentRuntimeBinding): Promise<void> {
+  public startReserved(
+    agentId: string,
+    binding: AgentRuntimeBinding,
+    context?: AgentRuntimeStartContext,
+  ): Promise<void> {
     try {
       this.#ensureNotDraining();
       const entry = this.#requireEntry(agentId);
-      const snapshot = this.#withInputSnapshotReservation(() => snapshotBinding(binding));
+      const [snapshot, startContext] = this.#withInputSnapshotReservation(() => [
+        snapshotBinding(binding),
+        snapshotStartContext(context),
+      ] as const);
       this.#ensureNotDraining();
       if (this.#entries.get(agentId) !== entry) {
         throw new AgentPoolError('AGENT_POOL_AGENT_NOT_FOUND', `Agent ${agentId} is not registered`);
@@ -289,7 +297,7 @@ export class AgentPool {
 
       let starting: Promise<void>;
       try {
-        starting = entry.runtime.start(snapshot);
+        starting = entry.runtime.start(snapshot, startContext);
       } catch (error) {
         this.#reconcileReservedStartFailure(entry, reservation);
         throw error;
@@ -573,6 +581,14 @@ function snapshotBinding(binding: AgentRuntimeBinding): Readonly<AgentRuntimeBin
   if (!isNonBlankString(taskId) || !isNonBlankString(assignmentId) ||
     !isNonBlankString(specVersion) || !isNonBlankString(profileHash)) throw invalidBinding();
   return Object.freeze({ taskId, assignmentId, specVersion, profileHash });
+}
+
+function snapshotStartContext(context: AgentRuntimeStartContext | undefined): Readonly<AgentRuntimeStartContext> {
+  if (context === undefined) return Object.freeze({});
+  if (!isRecord(context)) throw invalidBinding();
+  const workspacePath = context.workspacePath;
+  if (workspacePath !== undefined && typeof workspacePath !== 'string') throw invalidBinding();
+  return Object.freeze(workspacePath === undefined ? {} : { workspacePath });
 }
 
 function snapshotEntry(entry: PoolEntry): Readonly<AgentPoolEntrySnapshot> {

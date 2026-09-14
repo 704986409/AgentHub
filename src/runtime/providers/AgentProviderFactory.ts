@@ -1,3 +1,5 @@
+import { isAbsolute } from 'node:path';
+
 import {
   AgentProviderError,
   agentOutputProtocols,
@@ -19,6 +21,8 @@ interface RegisteredProvider {
 }
 
 const providerIdPattern = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const encoder = new TextEncoder();
+const maxWorkspacePathBytes = 32 * 1024;
 
 /**
  * Instance-local provider construction registry. Provider selection is explicit and
@@ -77,17 +81,30 @@ export class AgentProviderFactory {
     const eventBus = request.eventBus;
     const rawContext = request.context;
     const rawConfig = request.config;
+    const rawWorkspacePath = request.workspacePath;
     if (!isRecord(rawContext)) throw contractViolation('Agent provider session request is invalid');
     const context = Object.freeze({ ...rawContext, provider: registered.descriptor.id });
     const config = rawConfig === undefined ? undefined : snapshotConfig(rawConfig);
+    const workspacePath = rawWorkspacePath === undefined
+      ? undefined
+      : snapshotWorkspacePath(rawWorkspacePath);
     const session = registered.createSession({
       eventBus,
       context,
       ...(config === undefined ? {} : { config }),
+      ...(workspacePath === undefined ? {} : { workspacePath }),
     });
     validateSession(session, registered.descriptor);
     return session;
   }
+}
+
+function snapshotWorkspacePath(value: unknown): string {
+  if (typeof value !== 'string' || value.trim().length === 0 || value.includes('\0') ||
+    !isAbsolute(value) || encoder.encode(value).byteLength > maxWorkspacePathBytes) {
+    throw contractViolation('Agent provider workspace path is invalid');
+  }
+  return value;
 }
 
 function validateProviderId(providerId: unknown): asserts providerId is AgentProviderId {
