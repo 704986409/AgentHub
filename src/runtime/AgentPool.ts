@@ -261,6 +261,58 @@ export class AgentPool {
     }
   }
 
+  /** Atomically promotes an exact scheduler reservation into runtime ownership. */
+  public startReserved(agentId: string, binding: AgentRuntimeBinding): Promise<void> {
+    try {
+      this.#ensureNotDraining();
+      const entry = this.#requireEntry(agentId);
+      const snapshot = this.#withInputSnapshotReservation(() => snapshotBinding(binding));
+      this.#ensureNotDraining();
+      if (this.#entries.get(agentId) !== entry) {
+        throw new AgentPoolError('AGENT_POOL_AGENT_NOT_FOUND', `Agent ${agentId} is not registered`);
+      }
+      if (entry.pendingStart !== undefined || entry.pendingShutdown !== undefined) throw operationBusy();
+      const reservation = entry.reservation;
+      if (reservation === undefined || !sameBinding(reservation, snapshot) ||
+        this.#reservationOwners.get(snapshot.assignmentId) !== agentId) {
+        throw assignmentMismatch(agentId, snapshot.assignmentId);
+      }
+      if (!isRuntimeAuthoritativelyClean(entry.runtime) || this.#hasAssignmentFor(agentId) ||
+        this.#assignmentOwners.has(snapshot.assignmentId)) {
+        throw runtimeContractViolation(agentId);
+      }
+
+      // Acquire before releasing the reservation so there is never an unowned interval.
+      this.#assignmentOwners.set(snapshot.assignmentId, agentId);
+      delete entry.reservation;
+      this.#reservationOwners.delete(snapshot.assignmentId);
+
+      let starting: Promise<void>;
+      try {
+        starting = entry.runtime.start(snapshot);
+      } catch (error) {
+        this.#reconcileReservedStartFailure(entry, reservation);
+        throw error;
+      }
+      const token = {};
+      const current = (async () => {
+        try {
+          await starting;
+          this.#validateStartedEntry(entry, snapshot);
+        } catch (error) {
+          this.#reconcileReservedStartFailure(entry, reservation);
+          throw error;
+        } finally {
+          if (entry.pendingStart?.token === token) delete entry.pendingStart;
+        }
+      })();
+      entry.pendingStart = { token, promise: current };
+      return current;
+    } catch (error) {
+      return rejectPreserving(error);
+    }
+  }
+
   public runTurn(
     agentId: string,
     assignmentId: string,
@@ -374,6 +426,18 @@ export class AgentPool {
     if (isRuntimeClean(entry.runtime)) {
       this.#deleteOwnerIfExact(assignmentId, entry.registration.agentId);
     }
+  }
+
+  #reconcileReservedStartFailure(
+    entry: PoolEntry,
+    reservation: Readonly<AgentRuntimeBinding>,
+  ): void {
+    if (!isRuntimeAuthoritativelyClean(entry.runtime)) return;
+    if (entry.reservation !== undefined || this.#reservationOwners.has(reservation.assignmentId) ||
+      this.#assignmentOwners.get(reservation.assignmentId) !== entry.registration.agentId) return;
+    entry.reservation = reservation;
+    this.#reservationOwners.set(reservation.assignmentId, entry.registration.agentId);
+    this.#deleteOwnerIfExact(reservation.assignmentId, entry.registration.agentId);
   }
 
   #beginShutdown(entry: PoolEntry, assignmentId?: string): Promise<void> {
@@ -536,6 +600,18 @@ function snapshotEntry(entry: PoolEntry): Readonly<AgentPoolEntrySnapshot> {
 
 function isRuntimeClean(runtime: AgentRuntime): boolean {
   return runtime.state === 'IDLE' && !runtime.busy && runtime.binding === undefined;
+}
+
+function isRuntimeAuthoritativelyClean(runtime: AgentRuntime): boolean {
+  return isRuntimeClean(runtime) && !runtime.active && runtime.sessionId === undefined;
+}
+
+function sameBinding(
+  left: Readonly<AgentRuntimeBinding>,
+  right: Readonly<AgentRuntimeBinding>,
+): boolean {
+  return left.taskId === right.taskId && left.assignmentId === right.assignmentId &&
+    left.specVersion === right.specVersion && left.profileHash === right.profileHash;
 }
 
 function pendingReconciliations(entry: PoolEntry): Promise<void>[] {

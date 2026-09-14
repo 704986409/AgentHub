@@ -11,6 +11,7 @@ import {
   AgentRegistry,
   AgentScheduler,
   AgentSchedulerError,
+  snapshotAgentScheduleReservation,
   AgentAuthority,
   AgentStatus,
   AssignmentManager,
@@ -603,6 +604,19 @@ describe('AgentScheduler', () => {
     expect(first.reservationSha256).toMatch(/^[a-f0-9]{64}$/u);
     expectDeepFrozen(first);
     expect(() => (first.unavailable as unknown as { reason: string }[]).push({ reason: 'changed' })).toThrow();
+  });
+
+  it('authenticates an exact reservation snapshot and rejects tampering', () => {
+    const agent = createAgent({ id: 'agent-a' });
+    register(agent);
+    const result = scheduler.scheduleTask({ taskId: createTask('reservation-auth').id });
+    if (result.outcome !== 'reserved') throw new Error('expected reservation');
+
+    const snapshot = snapshotAgentScheduleReservation({ ...result });
+    expect(snapshot).toEqual(result);
+    expectDeepFrozen(snapshot);
+    expect(snapshotAgentScheduleReservation({ ...result, agentId: 'agent-tampered' })).toBeNull();
+    expect(snapshotAgentScheduleReservation({ ...result, extra: true })).toBeNull();
   });
 
   function createScheduler(): AgentScheduler {

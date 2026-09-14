@@ -16,6 +16,8 @@ const defaultSpecVersion = '1.0.0';
 const maxTaskIdBytes = 256;
 const maxSpecVersionBytes = 128;
 const maxRequiredOutputProtocols = 32;
+const maxReservationIdentifierBytes = 256;
+const sha256Pattern = /^[0-9a-f]{64}$/u;
 const encoder = new TextEncoder();
 const taskFences = new WeakMap<AssignmentManager, Set<string>>();
 
@@ -77,6 +79,58 @@ export interface AgentScheduleUnavailable {
 }
 
 export type AgentScheduleResult = AgentScheduleReservation | AgentScheduleUnavailable;
+
+/** Snapshots and authenticates the scheduler-owned reservation handoff value. */
+export function snapshotAgentScheduleReservation(
+  value: unknown,
+): Readonly<AgentScheduleReservation> | null {
+  try {
+    if (!isRecord(value)) return null;
+    const version: unknown = value.version;
+    const outcome: unknown = value.outcome;
+    const taskId: unknown = value.taskId;
+    const projectId: unknown = value.projectId;
+    const routePlanSha256: unknown = value.routePlanSha256;
+    const candidateRank: unknown = value.candidateRank;
+    const agentId: unknown = value.agentId;
+    const providerId: unknown = value.providerId;
+    const assignmentId: unknown = value.assignmentId;
+    const specVersion: unknown = value.specVersion;
+    const profileHash: unknown = value.profileHash;
+    const reservationSha256: unknown = value.reservationSha256;
+    const expectedKeys = [
+      'version', 'outcome', 'taskId', 'projectId', 'routePlanSha256', 'candidateRank',
+      'agentId', 'providerId', 'assignmentId', 'specVersion', 'profileHash', 'reservationSha256',
+    ];
+    if (Object.keys(value).length !== expectedKeys.length ||
+      expectedKeys.some((key) => !Object.prototype.hasOwnProperty.call(value, key)) ||
+      version !== 1 || outcome !== 'reserved' || !validTaskId(taskId) ||
+      !validReservationIdentifier(projectId) || !validReservationIdentifier(agentId) ||
+      !validReservationIdentifier(providerId) || !validReservationIdentifier(assignmentId) ||
+      !validSpecVersion(specVersion) || !isSha256(routePlanSha256) || !isSha256(profileHash) ||
+      !isSha256(reservationSha256) || typeof candidateRank !== 'number' ||
+      !Number.isSafeInteger(candidateRank) || candidateRank <= 0) {
+      return null;
+    }
+    const identity = {
+      version: 1 as const,
+      outcome: 'reserved' as const,
+      taskId,
+      projectId,
+      routePlanSha256,
+      candidateRank,
+      agentId,
+      providerId,
+      assignmentId,
+      specVersion,
+      profileHash,
+    };
+    if (reservationDigest(identity) !== reservationSha256) return null;
+    return deepFreeze({ ...identity, reservationSha256 });
+  } catch {
+    return null;
+  }
+}
 
 export type AgentSchedulerErrorCode =
   | 'AGENT_SCHEDULER_INVALID_REQUEST'
@@ -363,6 +417,15 @@ function validTaskId(value: unknown): value is string {
 function validSpecVersion(value: unknown): value is string {
   return isNonBlankString(value) && !/[\0\r\n]/u.test(value) &&
     encoder.encode(value).byteLength <= maxSpecVersionBytes;
+}
+
+function validReservationIdentifier(value: unknown): value is string {
+  return isNonBlankString(value) && !/[\0\r\n]/u.test(value) &&
+    encoder.encode(value).byteLength <= maxReservationIdentifierBytes;
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === 'string' && sha256Pattern.test(value);
 }
 
 function requireScheduleable(task: Task): void {
