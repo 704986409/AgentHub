@@ -13,6 +13,10 @@ import {
 } from './TaskRouter.js';
 
 const defaultSpecVersion = '1.0.0';
+const maxTaskIdBytes = 256;
+const maxSpecVersionBytes = 128;
+const maxRequiredOutputProtocols = 32;
+const encoder = new TextEncoder();
 const taskFences = new WeakMap<AssignmentManager, Set<string>>();
 
 export interface AgentSchedulerOptions {
@@ -27,6 +31,12 @@ export interface AgentScheduleRequest {
   readonly taskId: string;
   readonly requirements?: TaskRoutingRequirements;
   readonly specVersion?: string;
+}
+
+interface AgentScheduleRequestSnapshot {
+  readonly taskId: string;
+  readonly requirements?: TaskRoutingRequirements;
+  readonly specVersion: string;
 }
 
 export type AgentScheduleUnavailableReason =
@@ -116,8 +126,7 @@ export class AgentScheduler {
     }
   }
 
-  #schedule(request: Readonly<Required<Pick<AgentScheduleRequest, 'taskId' | 'specVersion'>> &
-  Pick<AgentScheduleRequest, 'requirements'>>): Readonly<AgentScheduleResult> {
+  #schedule(request: Readonly<AgentScheduleRequestSnapshot>): Readonly<AgentScheduleResult> {
     const task = this.#taskManager.getTask(request.taskId);
     if (task === null) throw schedulerError('AGENT_SCHEDULER_TASK_NOT_FOUND');
     requireScheduleable(task);
@@ -297,21 +306,63 @@ export class AgentScheduler {
   }
 }
 
-function snapshotRequest(request: AgentScheduleRequest): Readonly<Required<Pick<AgentScheduleRequest, 'taskId' | 'specVersion'>> &
-Pick<AgentScheduleRequest, 'requirements'>> {
-  if (!isRecord(request) || !isNonBlankString(request.taskId) ||
-    (request.specVersion !== undefined && !isNonBlankString(request.specVersion))) {
+function snapshotRequest(request: AgentScheduleRequest): Readonly<AgentScheduleRequestSnapshot> {
+  try {
+    if (!isRecord(request)) throw new TypeError('invalid request');
+    const taskId: unknown = request.taskId;
+    const specVersionValue: unknown = request.specVersion;
+    const requirementsValue: unknown = request.requirements;
+
+    if (!validTaskId(taskId)) throw new TypeError('invalid task ID');
+    const specVersion = specVersionValue === undefined ? defaultSpecVersion : specVersionValue;
+    if (!validSpecVersion(specVersion)) throw new TypeError('invalid spec version');
+
+    let requirements: TaskRoutingRequirements | undefined;
+    if (requirementsValue !== undefined) {
+      if (!isRecord(requirementsValue)) throw new TypeError('invalid requirements');
+      const minimumAuthority = requirementsValue.minimumAuthority;
+      const protocolsValue = requirementsValue.requiredOutputProtocols;
+      if (minimumAuthority !== undefined && typeof minimumAuthority !== 'string') {
+        throw new TypeError('invalid minimum authority');
+      }
+      const requiredOutputProtocols = protocolsValue === undefined
+        ? undefined
+        : snapshotProtocolArray(protocolsValue);
+      requirements = deepFreeze({
+        ...(minimumAuthority === undefined ? {} : { minimumAuthority }),
+        ...(requiredOutputProtocols === undefined ? {} : { requiredOutputProtocols }),
+      } as TaskRoutingRequirements);
+    }
+    return deepFreeze({
+      taskId,
+      specVersion,
+      ...(requirements === undefined ? {} : { requirements }),
+    });
+  } catch {
     throw schedulerError('AGENT_SCHEDULER_INVALID_REQUEST');
   }
-  const requirements = request.requirements;
-  if (requirements !== undefined && !isRecord(requirements)) {
-    throw schedulerError('AGENT_SCHEDULER_INVALID_REQUEST');
+}
+
+function snapshotProtocolArray(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) throw new TypeError('invalid required output protocols');
+  const length = value.length;
+  if (length > maxRequiredOutputProtocols) throw new TypeError('invalid required output protocols');
+  const protocols: string[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const protocol: unknown = value[index];
+    if (typeof protocol !== 'string') throw new TypeError('invalid required output protocol');
+    protocols.push(protocol);
   }
-  return Object.freeze({
-    taskId: request.taskId,
-    specVersion: request.specVersion ?? defaultSpecVersion,
-    ...(requirements === undefined ? {} : { requirements }),
-  });
+  return Object.freeze(protocols);
+}
+
+function validTaskId(value: unknown): value is string {
+  return isNonBlankString(value) && !value.includes('\0') && encoder.encode(value).byteLength <= maxTaskIdBytes;
+}
+
+function validSpecVersion(value: unknown): value is string {
+  return isNonBlankString(value) && !/[\0\r\n]/u.test(value) &&
+    encoder.encode(value).byteLength <= maxSpecVersionBytes;
 }
 
 function requireScheduleable(task: Task): void {

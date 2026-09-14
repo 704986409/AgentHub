@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   AgentPool,
@@ -11,6 +11,7 @@ import {
   AgentRegistry,
   AgentScheduler,
   AgentSchedulerError,
+  AgentAuthority,
   AgentStatus,
   AssignmentManager,
   Database,
@@ -22,6 +23,7 @@ import {
   TaskComplexity,
   TaskManager,
   TaskRisk,
+  TaskRouter,
   TaskStateMachine,
   TaskStatus,
   type Agent,
@@ -29,6 +31,7 @@ import {
   type AgentProviderCapabilities,
   type AgentProviderSession,
   type AgentScheduleResult,
+  type AgentScheduleRequest,
   type CreateAssignmentInput,
 } from '../src/index.js';
 
@@ -125,6 +128,230 @@ describe('AgentScheduler', () => {
     const result = scheduler.scheduleTask({ taskId: task.id });
     expect(result).toMatchObject({ outcome: 'reserved', agentId: agent.id, candidateRank: 1 });
     expect(result.routePlanSha256).not.toBe(resultBeforeAgent.routePlanSha256);
+  });
+
+  it('reads every request and requirements field once and uses one identity throughout scheduling', () => {
+    const agent = createAgent({ id: 'agent-a' });
+    register(agent);
+    const taskA = createTask('task-a');
+    const taskB = createTask('task-b');
+    const reads = {
+      taskId: 0,
+      specVersion: 0,
+      requirements: 0,
+      minimumAuthority: 0,
+      requiredOutputProtocols: 0,
+    };
+    const requirements = {
+      get minimumAuthority() {
+        reads.minimumAuthority += 1;
+        if (reads.minimumAuthority > 1) throw new Error('minimumAuthority reread');
+        return AgentAuthority.STANDARD;
+      },
+      get requiredOutputProtocols() {
+        reads.requiredOutputProtocols += 1;
+        if (reads.requiredOutputProtocols > 1) throw new Error('protocols reread');
+        return ['worker-result'] as const;
+      },
+    };
+    const request = {
+      get taskId() {
+        reads.taskId += 1;
+        if (reads.taskId > 1) throw new Error('taskId reread');
+        return taskA.id;
+      },
+      get specVersion() {
+        reads.specVersion += 1;
+        if (reads.specVersion > 1) throw new Error('specVersion reread');
+        return '2.4.6';
+      },
+      get requirements() {
+        reads.requirements += 1;
+        if (reads.requirements > 1) throw new Error('requirements reread');
+        return requirements;
+      },
+    } as AgentScheduleRequest;
+
+    const result = scheduler.scheduleTask(request);
+    if (result.outcome !== 'reserved') throw new Error('expected reservation');
+    expect(reads).toEqual({
+      taskId: 1,
+      specVersion: 1,
+      requirements: 1,
+      minimumAuthority: 1,
+      requiredOutputProtocols: 1,
+    });
+    expect(result.taskId).toBe(taskA.id);
+    expect(result.specVersion).toBe('2.4.6');
+    expect(pool.getSnapshot(agent.id)).toMatchObject({
+      reservedTaskId: taskA.id,
+      reservedSpecVersion: '2.4.6',
+    });
+    expect(assignments.getAssignment(result.assignmentId)).toMatchObject({
+      taskId: taskA.id,
+      specVersion: '2.4.6',
+    });
+    expect(tasks.getTask(taskA.id)?.status).toBe(TaskStatus.ASSIGNED);
+    expect(tasks.getTask(taskB.id)?.status).toBe(TaskStatus.CREATED);
+  });
+
+  it('detaches requirements and protocol arrays before the first service call', () => {
+    const agent = createAgent({ id: 'agent-a' });
+    register(agent);
+    const task = createTask('detached');
+    const protocols: ('worker-result' | 'manager-directive')[] = ['worker-result'];
+    const requirements = {
+      minimumAuthority: AgentAuthority.READ_ONLY,
+      requiredOutputProtocols: protocols,
+    };
+    const originalList = providerFactory.list.bind(providerFactory);
+    Object.defineProperty(providerFactory, 'list', { value: () => {
+      requirements.minimumAuthority = AgentAuthority.ADMIN;
+      protocols.splice(0, protocols.length, 'manager-directive');
+      return originalList();
+    }});
+
+    const result = scheduler.scheduleTask({ taskId: task.id, requirements });
+
+    expect(result).toMatchObject({ outcome: 'reserved', agentId: agent.id });
+    expect(requirements.minimumAuthority).toBe(AgentAuthority.ADMIN);
+    expect(protocols).toEqual(['manager-directive']);
+  });
+
+  it('passes a deeply frozen owned requirements snapshot to TaskRouter', () => {
+    const agent = createAgent({ id: 'agent-a' });
+    register(agent);
+    const task = createTask('frozen');
+    const originalRoute = TaskRouter.prototype.route.bind(new TaskRouter());
+    let requirementsFrozen = false;
+    let protocolsFrozen = false;
+    const spy = vi.spyOn(TaskRouter.prototype, 'route').mockImplementation((request) => {
+      requirementsFrozen = Object.isFrozen(request.requirements);
+      protocolsFrozen = Object.isFrozen(request.requirements?.requiredOutputProtocols);
+      return originalRoute(request);
+    });
+    try {
+      expect(scheduler.scheduleTask({
+        taskId: task.id,
+        requirements: { requiredOutputProtocols: ['worker-result'] },
+      }).outcome).toBe('reserved');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(requirementsFrozen).toBe(true);
+    expect(protocolsFrozen).toBe(true);
+  });
+
+  it('normalizes throwing request getters before any service side effect', () => {
+    const agent = createAgent({ id: 'agent-a' });
+    register(agent);
+    const task = createTask('getter-failure');
+    const requests = [
+      Object.defineProperty({}, 'taskId', { get: () => { throw new Error('task getter secret'); } }),
+      Object.defineProperty({ taskId: task.id }, 'specVersion', { get: () => { throw new Error('spec getter secret'); } }),
+      Object.defineProperty({ taskId: task.id }, 'requirements', { get: () => { throw new Error('requirements getter secret'); } }),
+      { taskId: task.id, requirements: Object.defineProperty({}, 'minimumAuthority', {
+        get: () => { throw new Error('authority getter secret'); },
+      }) },
+      { taskId: task.id, requirements: Object.defineProperty({}, 'requiredOutputProtocols', {
+        get: () => { throw new Error('protocol getter secret'); },
+      }) },
+    ];
+
+    for (const request of requests) {
+      expectSchedulerError(
+        () => scheduler.scheduleTask(request as AgentScheduleRequest),
+        'AGENT_SCHEDULER_INVALID_REQUEST',
+      );
+    }
+    expect(pool.getSnapshot(agent.id).reserved).toBe(false);
+    expect(assignments.getAssignment('missing')).toBeNull();
+    expect(assignmentRepository.list()).toHaveLength(0);
+    expect(tasks.getTask(task.id)).toMatchObject({ status: TaskStatus.CREATED, assignedAgentId: null, assignmentId: null });
+    expect(provider.createCalls).toBe(0);
+  });
+
+  it.each([
+    '',
+    '   ',
+    'task\0id',
+    'a'.repeat(257),
+    '界'.repeat(86),
+  ])('rejects an invalid or oversized taskId without side effects %#', (taskId) => {
+    expectSchedulerError(() => scheduler.scheduleTask({ taskId }), 'AGENT_SCHEDULER_INVALID_REQUEST');
+    expect(assignmentRepository.list()).toHaveLength(0);
+  });
+
+  it('enforces specVersion safety and uses the exact default', () => {
+    const agent = createAgent({ id: 'agent-a' });
+    register(agent);
+    const task = createTask('spec-version');
+    for (const specVersion of ['', '  ', '1.0\0x', '1.0\r2', '1.0\n2', 'a'.repeat(129), '界'.repeat(43)]) {
+      expectSchedulerError(
+        () => scheduler.scheduleTask({ taskId: task.id, specVersion }),
+        'AGENT_SCHEDULER_INVALID_REQUEST',
+      );
+    }
+    const result = scheduler.scheduleTask({ taskId: task.id });
+    if (result.outcome !== 'reserved') throw new Error('expected reservation');
+    expect(result.specVersion).toBe('1.0.0');
+    expect(pool.getSnapshot(agent.id).reservedSpecVersion).toBe('1.0.0');
+    expect(assignments.getAssignment(result.assignmentId)?.specVersion).toBe('1.0.0');
+  });
+
+  it('rejects an oversized protocol array before routing or reservation', () => {
+    const agent = createAgent({ id: 'agent-a' });
+    register(agent);
+    const task = createTask('protocol-bound');
+    const requiredOutputProtocols = Array.from({ length: 33 }, () => 'worker-result' as const);
+
+    expectSchedulerError(
+      () => scheduler.scheduleTask({ taskId: task.id, requirements: { requiredOutputProtocols } }),
+      'AGENT_SCHEDULER_INVALID_REQUEST',
+    );
+    expect(pool.getSnapshot(agent.id).reserved).toBe(false);
+    expect(assignmentRepository.list()).toHaveLength(0);
+    expect(tasks.getTask(task.id)?.status).toBe(TaskStatus.CREATED);
+  });
+
+  it('copies protocol indices without invoking a caller-owned custom iterator', () => {
+    const agent = createAgent({ id: 'agent-a' });
+    register(agent);
+    const task = createTask('custom-iterator');
+    const requiredOutputProtocols = ['worker-result'];
+    let iteratorReads = 0;
+    Object.defineProperty(requiredOutputProtocols, Symbol.iterator, {
+      value: function* () {
+        iteratorReads += 1;
+        for (let index = 0; index < 33; index += 1) yield 'manager-directive';
+      },
+    });
+
+    expect(scheduler.scheduleTask({
+      taskId: task.id,
+      requirements: { requiredOutputProtocols: requiredOutputProtocols as ['worker-result'] },
+    })).toMatchObject({ outcome: 'reserved', agentId: agent.id });
+    expect(iteratorReads).toBe(0);
+  });
+
+  it('rejects non-primitive requirement values before any service call', () => {
+    const agent = createAgent({ id: 'agent-a' });
+    register(agent);
+    const task = createTask('non-primitive');
+    const requests = [
+      { taskId: task.id, requirements: { minimumAuthority: { value: 'STANDARD' } } },
+      { taskId: task.id, requirements: { requiredOutputProtocols: [{ value: 'worker-result' }] } },
+    ];
+
+    for (const request of requests) {
+      expectSchedulerError(
+        () => scheduler.scheduleTask(request as unknown as AgentScheduleRequest),
+        'AGENT_SCHEDULER_INVALID_REQUEST',
+      );
+    }
+    expect(pool.getSnapshot(agent.id).reserved).toBe(false);
+    expect(assignmentRepository.list()).toHaveLength(0);
+    expect(tasks.getTask(task.id)?.status).toBe(TaskStatus.CREATED);
   });
 
   it('requires live registry IDLE state and reports BUSY and OFFLINE deterministically', () => {
