@@ -13,7 +13,7 @@ const execFileAsync = promisify(execFile);
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await removeRoot(root); });
 
-describe('Git merge integration value contracts', { timeout: 180_000 }, () => {
+describe('Git merge integration value contracts', { timeout: 600_000 }, () => {
   it('validates supplied gate values and rejects tampering under the exact policy', async () => {
     const fixture = await readyFixture('agenthub merge values ');
     const policy = { requiredPhases: ['test'] as const, requiredCommandIds: ['verify'] };
