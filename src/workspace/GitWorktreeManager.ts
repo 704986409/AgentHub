@@ -17,6 +17,7 @@ import { evaluateMergeGateSnapshot, snapshotMergeGateInputs, type MergeGateDecis
 import type { ReviewEvidence } from './ReviewEvidence.js';
 import { GitMergeError, performEvidenceGatedMerge, snapshotMergeTaskRequest,
   type GitMergeHooks, type MergeTaskRequest, type TaskMergeResult } from './GitMergeIntegration.js';
+import { performTaskCommit, type TaskCommitResult } from './GitTaskCommit.js';
 
 const excludeRule = '/.agenthub/worktrees/';
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
@@ -92,7 +93,7 @@ export interface GitWorktreeRecord {
 interface PendingOperation {
   readonly token: object;
   readonly taskId: string;
-  readonly kind: 'create' | 'remove' | 'capture' | 'evidence' | 'merge-gate' | 'merge';
+  readonly kind: 'create' | 'remove' | 'capture' | 'commit' | 'evidence' | 'merge-gate' | 'merge';
   readonly captureKey?: string;
   readonly baseRef?: string;
   readonly promise: Promise<unknown>;
@@ -266,6 +267,36 @@ export class GitWorktreeManager {
     } catch (error) {
       return Promise.reject(asError(error));
     }
+  }
+
+  public commitTaskWorkspace(taskIdValue: string): Promise<TaskCommitResult> {
+    let taskId: string;
+    try { taskId = validateTaskId(taskIdValue); } catch (error) { return Promise.reject(asError(error)); }
+    if (isTaskQuarantined(this.#repositoryKey, taskId)) return Promise.reject(taskQuarantined(taskId));
+    const key = operationKey(taskId);
+    if (this.#coordination.operations.get(key) !== undefined) return Promise.reject(operationBusy(taskId));
+    const token = {};
+    const operation = (async () => {
+      const workspace = await this.#inspect(taskId, gitCapturePrefix);
+      if (workspace === undefined) throw new GitWorktreeError('GIT_WORKTREE_CONTRACT_VIOLATION', 'Task worktree does not exist', 'commit', taskId);
+      return performTaskCommit(this.#runner, workspace, {
+        capture: () => this.#captureTrustedForCommit(taskId),
+        inspect: () => this.#inspect(taskId, gitCapturePrefix),
+        onAmbiguousFailure: () => { quarantineTask(this.#repositoryKey, taskId); },
+      });
+    })();
+    const current = operation.finally(() => {
+      if (this.#coordination.operations.get(key)?.token === token) this.#coordination.operations.delete(key);
+    });
+    this.#coordination.operations.set(key, { token, taskId, kind: 'commit', promise: current });
+    return current;
+  }
+
+  async #captureTrustedForCommit(taskId: string): Promise<GitWorkspaceChangeSnapshot> {
+    return captureWorkspaceChanges(this.#runner, () => this.#inspect(taskId, gitCapturePrefix), {
+      includePatchText: false, maxPatchBytes: 1, maxChangedPaths: 4096,
+      maxFingerprintBytes: 64 * 1024 * 1024, maxIgnoredPaths: 4096,
+    });
   }
 
   public collectBuildTestEvidence(

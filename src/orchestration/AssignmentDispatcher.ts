@@ -64,6 +64,66 @@ export interface AssignmentDispatchResult {
   readonly dispatchSha256: string;
 }
 
+/**
+ * Value-validates the dispatcher hand-off.  This is deliberately separate from
+ * dispatch(): lifecycle code may receive the value from a queue, RPC boundary,
+ * or a persisted test fixture rather than from the dispatcher itself.
+ */
+export function snapshotAssignmentDispatchResult(value: unknown): Readonly<AssignmentDispatchResult> {
+  try {
+    if (!isRecord(value)) throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
+    const keys = ['version', 'taskId', 'projectId', 'agentId', 'providerId', 'assignmentId',
+      'reservationSha256', 'executionProfileSha256', 'workspace', 'assignmentStatus', 'taskStatus',
+      'turnResult', 'dispatchSha256'];
+    if (Object.keys(value).length !== keys.length || keys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) {
+      throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
+    }
+    const strings = ['taskId', 'projectId', 'agentId', 'providerId', 'assignmentId',
+      'reservationSha256', 'executionProfileSha256'] as const;
+    if (value.version !== 1 || value.assignmentStatus !== 'ACTIVE' || value.taskStatus !== 'IMPLEMENTING' ||
+      strings.some((key) => !isNonBlankString(value[key]) || (key.endsWith('Sha256') && !/^[0-9a-f]{64}$/u.test(value[key])))) {
+      throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
+    }
+    if (!isRecord(value.workspace)) throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
+    const workspace = value.workspace;
+    const workspaceKeys = ['branchName', 'baseCommit', 'headCommit', 'created'];
+    if (Object.keys(workspace).length !== workspaceKeys.length ||
+      workspaceKeys.some((key) => !Object.prototype.hasOwnProperty.call(workspace, key)) ||
+      !isNonBlankString(workspace.branchName) || !gitObjectIdPattern.test(workspace.baseCommit as string) ||
+      !gitObjectIdPattern.test(workspace.headCommit as string) || typeof workspace.created !== 'boolean') {
+      throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
+    }
+    if (!isRecord(value.turnResult) || !agentOutputProtocols.includes(value.turnResult.protocol as AgentOutputProtocol)) {
+      throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
+    }
+    const turnResult = snapshotTurnResult(value.turnResult as unknown as AgentProviderTurnResult,
+      value.turnResult.protocol as AgentOutputProtocol, value.providerId as string);
+    const identity = {
+      version: 1 as const,
+      taskId: value.taskId as string,
+      projectId: value.projectId as string,
+      agentId: value.agentId as string,
+      providerId: value.providerId as string,
+      assignmentId: value.assignmentId as string,
+      reservationSha256: value.reservationSha256 as string,
+      executionProfileSha256: value.executionProfileSha256 as string,
+      workspace: deepFreeze({ branchName: workspace.branchName, baseCommit: workspace.baseCommit as string,
+        headCommit: workspace.headCommit as string, created: workspace.created }),
+      assignmentStatus: 'ACTIVE' as const,
+      taskStatus: 'IMPLEMENTING' as const,
+      turnResult,
+    };
+    const digestInput = { ...identity, turnProtocol: turnResult.protocol, turnResult: turnResultForDigest(turnResult) };
+    if (dispatchDigest(digestInput) !== value.dispatchSha256) {
+      throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
+    }
+    return deepFreeze({ ...identity, dispatchSha256: value.dispatchSha256 });
+  } catch (error) {
+    if (error instanceof AssignmentDispatcherError) throw error;
+    throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
+  }
+}
+
 export type AssignmentDispatcherErrorCode =
   | 'AGENT_DISPATCH_INVALID_REQUEST'
   | 'AGENT_DISPATCH_TASK_BUSY'
@@ -502,6 +562,17 @@ function publicWorkspace(workspace: Readonly<PreparedTaskWorkspace>): Readonly<A
   });
 }
 
+export function snapshotAssignmentTurnResult(
+  value: unknown,
+  protocol: AgentOutputProtocol,
+  providerId: string,
+): AgentProviderTurnResult {
+  if (!agentOutputProtocols.includes(protocol) || !isNonBlankString(providerId)) {
+    throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
+  }
+  return snapshotTurnResult(value as AgentProviderTurnResult, protocol, providerId);
+}
+
 function snapshotTurnResult(
   value: AgentProviderTurnResult,
   protocol: AgentOutputProtocol,
@@ -511,6 +582,16 @@ function snapshotTurnResult(
     (value.sessionId !== undefined && !isNonBlankString(value.sessionId)) ||
     (value.durationMs !== undefined && (typeof value.durationMs !== 'number' ||
       !Number.isFinite(value.durationMs) || value.durationMs < 0))) {
+    throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
+  }
+  const metadataKeys = ['providerId', 'sessionId', 'durationMs'];
+  const variantKeys = protocol === 'worker-result'
+    ? (value.protocolValid === true ? ['protocol', 'protocolValid', 'workerResult'] : ['protocol', 'protocolValid', 'failure'])
+    : (value.directiveStatus === 'invalid'
+      ? ['protocol', 'directiveStatus', 'directive', 'failure']
+      : ['protocol', 'directiveStatus', 'directive']);
+  const allowedKeys = new Set([...metadataKeys, ...variantKeys]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
     throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
   }
   const metadata = {
@@ -556,8 +637,9 @@ const managerFailureKinds = new Set([
 ]);
 
 function snapshotFailure(value: unknown, kinds: ReadonlySet<string>): { readonly kind: never; readonly message: string } {
-  if (!isRecord(value) || typeof value.kind !== 'string' || !kinds.has(value.kind) ||
-    typeof value.message !== 'string') {
+  if (!isRecord(value) || Object.keys(value).length !== 2 ||
+    !Object.prototype.hasOwnProperty.call(value, 'kind') || !Object.prototype.hasOwnProperty.call(value, 'message') ||
+    typeof value.kind !== 'string' || !kinds.has(value.kind) || typeof value.message !== 'string') {
     throw dispatchError('AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION');
   }
   return deepFreeze({ kind: value.kind as never, message: value.message });

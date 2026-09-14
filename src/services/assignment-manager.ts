@@ -140,6 +140,82 @@ export class AssignmentManager {
     return result;
   }
 
+  /** Idempotent lifecycle convergence used after a worker has stopped. */
+  public suspendActiveAssignment(id: string, target: TaskStatus.BLOCKED | TaskStatus.WAITING_INPUT): Assignment {
+    const assignment = this.requireAssignment(id);
+    if (![AssignmentStatus.ACTIVE, AssignmentStatus.RELEASED, AssignmentStatus.STALE].includes(assignment.status)) {
+      throw new Error(`Assignment ${id} has contradictory lifecycle status`);
+    }
+    const task = this.tasks.getTask(assignment.taskId);
+    if (task === null) throw new Error(`Task ${assignment.taskId} was not found`);
+    if (task.status !== target) {
+      try { this.tasks.transitionTask(task.id, target); }
+      catch (error) {
+        if (this.tasks.getTask(task.id)?.status !== target) throw error;
+      }
+    }
+    const current = this.repository.findById(id);
+    if (current === null) throw new Error(`Assignment ${id} was not found`);
+    const result = current.status === AssignmentStatus.RELEASED || current.status === AssignmentStatus.STALE
+      ? current : this.repository.update(id, { status: AssignmentStatus.RELEASED });
+    this.releaseAgentConverged(assignment.agentId);
+    this.clearTaskAssignment(assignment.taskId, assignment.agentId, assignment.id);
+    return result;
+  }
+
+  /** Idempotently converges a failed assignment and clears its scheduling pointers. */
+  public finalizeFailedAssignment(id: string): Assignment {
+    const assignment = this.requireAssignment(id);
+    if (![AssignmentStatus.ACTIVE, AssignmentStatus.RELEASED, AssignmentStatus.STALE].includes(assignment.status)) {
+      throw new Error(`Assignment ${id} has contradictory lifecycle status`);
+    }
+    const task = this.tasks.getTask(assignment.taskId);
+    if (task === null) throw new Error(`Task ${assignment.taskId} was not found`);
+    if (task.status !== TaskStatus.FAILED) {
+      try { this.tasks.transitionTask(task.id, TaskStatus.FAILED); }
+      catch (error) { if (this.tasks.getTask(task.id)?.status !== TaskStatus.FAILED) throw error; }
+    }
+    const current = this.repository.findById(id);
+    if (current === null) throw new Error(`Assignment ${id} was not found`);
+    const result = current.status === AssignmentStatus.RELEASED || current.status === AssignmentStatus.STALE
+      ? current : this.repository.update(id, { status: AssignmentStatus.RELEASED });
+    this.releaseAgentConverged(assignment.agentId);
+    this.clearTaskAssignment(assignment.taskId, assignment.agentId, assignment.id);
+    return result;
+  }
+
+  /** Idempotently converges the task, assignment, agent, and task pointers after merge. */
+  public finalizeCompletedAssignment(id: string): Assignment {
+    const assignment = this.requireAssignment(id);
+    if (![AssignmentStatus.ACTIVE, AssignmentStatus.COMPLETED].includes(assignment.status)) {
+      throw new Error(`Assignment ${id} has contradictory lifecycle status`);
+    }
+    const task = this.tasks.getTask(assignment.taskId);
+    if (task === null) throw new Error(`Task ${assignment.taskId} was not found`);
+    if (task.status !== TaskStatus.COMPLETED) {
+      try { this.tasks.transitionTask(task.id, TaskStatus.COMPLETED); }
+      catch (error) { if (this.tasks.getTask(task.id)?.status !== TaskStatus.COMPLETED) throw error; }
+    }
+    const current = this.repository.findById(id);
+    if (current === null) throw new Error(`Assignment ${id} was not found`);
+    const shouldPublish = current.status !== AssignmentStatus.COMPLETED;
+    const result = shouldPublish
+      ? this.repository.update(id, { status: AssignmentStatus.COMPLETED }) : current;
+    this.releaseAgentConverged(assignment.agentId);
+    this.clearTaskAssignment(assignment.taskId, assignment.agentId, assignment.id);
+    if (shouldPublish) {
+      this.eventBus?.publish({
+        eventType: DomainEventType.ASSIGNMENT_COMPLETED,
+        assignmentId: result.id,
+        taskId: result.taskId,
+        agentId: result.agentId,
+        oldStatus: AssignmentStatus.ACTIVE,
+        newStatus: result.status,
+      });
+    }
+    return result;
+  }
+
   private changeStatus(id: string, status: AssignmentStatus): Assignment {
     const assignment = this.requireAssignment(id);
     if (status === AssignmentStatus.ACCEPTED && assignment.status !== AssignmentStatus.DISPATCHING) {
@@ -151,6 +227,22 @@ export class AssignmentManager {
   private releaseAgent(agentId: string): void {
     const agent = this.agents.getAgent(agentId);
     if (agent?.status === AgentStatus.BUSY) this.agents.updateAgent(agentId, { status: AgentStatus.IDLE });
+  }
+
+  private releaseAgentConverged(agentId: string): void {
+    const agent = this.agents.getAgent(agentId);
+    if (agent?.status !== AgentStatus.BUSY) return;
+    try { this.agents.updateAgent(agentId, { status: AgentStatus.IDLE }); }
+    catch (error) { if (this.agents.getAgent(agentId)?.status !== AgentStatus.IDLE) throw error; }
+  }
+
+  private clearTaskAssignment(taskId: string, agentId: string, assignmentId: string): void {
+    const task = this.tasks.getTask(taskId);
+    if (task === null || (task.assignedAgentId === null && task.assignmentId === null)) return;
+    if (task.assignedAgentId !== agentId || task.assignmentId !== assignmentId) {
+      throw new Error(`Task ${taskId} has contradictory assignment pointers`);
+    }
+    this.tasks.updateTask(taskId, { assignedAgentId: null, assignmentId: null });
   }
 
   private requireAssignment(id: string): Assignment {

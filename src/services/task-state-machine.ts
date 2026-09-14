@@ -8,7 +8,7 @@ const transitions: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
   [TaskStatus.IMPLEMENTING]: [TaskStatus.REVIEWING, TaskStatus.COMPLETED, TaskStatus.QUEUED, TaskStatus.WAITING_INPUT, TaskStatus.WAITING_APPROVAL, TaskStatus.WAITING_DEPENDENCY, TaskStatus.PAUSED, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.CANCELLED],
   [TaskStatus.REVIEWING]: [TaskStatus.COMPLETED, TaskStatus.REVISION_REQUIRED, TaskStatus.FAILED, TaskStatus.CANCELLED],
   [TaskStatus.REVISION_REQUIRED]: [TaskStatus.IMPLEMENTING, TaskStatus.CANCELLED],
-  [TaskStatus.WAITING_INPUT]: [TaskStatus.IMPLEMENTING, TaskStatus.CANCELLED],
+  [TaskStatus.WAITING_INPUT]: [TaskStatus.QUEUED, TaskStatus.IMPLEMENTING, TaskStatus.CANCELLED],
   [TaskStatus.WAITING_APPROVAL]: [TaskStatus.IMPLEMENTING, TaskStatus.COMPLETED, TaskStatus.CANCELLED],
   [TaskStatus.WAITING_DEPENDENCY]: [TaskStatus.QUEUED, TaskStatus.IMPLEMENTING, TaskStatus.CANCELLED],
   [TaskStatus.PAUSED]: [TaskStatus.QUEUED, TaskStatus.CANCELLED],

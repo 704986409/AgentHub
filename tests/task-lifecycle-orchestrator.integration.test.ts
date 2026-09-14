@@ -1,0 +1,274 @@
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { describe, expect, it } from 'vitest';
+
+import {
+  AgentPool,
+  AgentProfileManager,
+  AgentProviderFactory,
+  AgentRegistry,
+  AgentScheduler,
+  AgentStatus,
+  AssignmentDispatcher,
+  AssignmentManager,
+  Database,
+  EventBus,
+  GitWorktreeManager,
+  SqliteAgentRepository,
+  SqliteAssignmentRepository,
+  SqliteProjectRepository,
+  SqliteTaskRepository,
+  TaskComplexity,
+  TaskLifecycleOrchestrator,
+  TaskManager,
+  TaskRisk,
+  TaskStateMachine,
+  type AgentHubWorkerOutcome,
+  type AgentProvider,
+  type AgentProviderCapabilities,
+  type AgentProviderSession,
+  type AgentProviderSessionCreateOptions,
+  type AgentProviderTurnRequest,
+  type AgentProviderTurnResult,
+  type BuildTestEvidencePlan,
+  type ReviewDecisionInput,
+} from '../src/index.js';
+
+const capabilities: AgentProviderCapabilities = Object.freeze({
+  outputProtocols: Object.freeze(['worker-result'] as const),
+  sessionContinuation: true,
+});
+
+interface TurnScript {
+  readonly outcome: AgentHubWorkerOutcome;
+  readonly write?: { readonly path: string; readonly content: string };
+}
+
+class LifecycleSession implements AgentProviderSession {
+  public readonly providerId = 'fake';
+  public readonly capabilities = capabilities;
+  public readonly sessionId = 'lifecycle-session';
+  public started = false;
+  public active = false;
+  public startCalls = 0;
+  public runCalls = 0;
+  public shutdownCalls = 0;
+  public readonly prompts: string[] = [];
+
+  public constructor(private readonly workspacePath: string, private readonly scripts: TurnScript[]) {}
+
+  public start(): Promise<void> {
+    this.startCalls += 1;
+    this.started = true;
+    return Promise.resolve();
+  }
+
+  public runTurn(request: AgentProviderTurnRequest): Promise<AgentProviderTurnResult> {
+    const script = this.scripts[this.runCalls];
+    this.runCalls += 1;
+    this.prompts.push(request.prompt);
+    if (script === undefined) return Promise.reject(new Error('unexpected turn'));
+    if (script.write !== undefined) writeFileSync(join(this.workspacePath, script.write.path), script.write.content, 'utf8');
+    return Promise.resolve({
+      providerId: this.providerId,
+      sessionId: this.sessionId,
+      protocol: 'worker-result',
+      protocolValid: true,
+      workerResult: worker(script.outcome),
+    });
+  }
+
+  public shutdown(): Promise<void> {
+    this.shutdownCalls += 1;
+    this.started = false;
+    this.active = false;
+    return Promise.resolve();
+  }
+}
+
+class LifecycleProvider implements AgentProvider {
+  public readonly id = 'fake';
+  public readonly capabilities = capabilities;
+  public session: LifecycleSession | undefined;
+  public createCalls = 0;
+
+  public constructor(private readonly scripts: TurnScript[]) {}
+
+  public createSession(options: AgentProviderSessionCreateOptions): AgentProviderSession {
+    this.createCalls += 1;
+    if (options.workspacePath === undefined) throw new Error('workspace path required');
+    this.session = new LifecycleSession(options.workspacePath, this.scripts);
+    return this.session;
+  }
+}
+
+function worker(outcome: AgentHubWorkerOutcome) {
+  return {
+    protocolVersion: 1 as const,
+    outcome,
+    summary: `${outcome} result`,
+    changedFiles: ['untrusted-worker-claim.txt'],
+    checks: [{ name: 'untrusted', status: 'PASSED' as const, detail: 'claim only' }],
+    blockers: outcome === 'BLOCKED' ? ['blocked'] : [],
+    questions: outcome === 'NEEDS_INPUT' ? ['need input'] : [],
+    risks: [],
+    notes: [],
+  };
+}
+
+const passingPlan: BuildTestEvidencePlan = {
+  commands: [{
+    id: 'test', phase: 'test', executable: process.execPath,
+    args: ['-e', 'process.exit(0)'], cwd: '.', timeoutMs: 5_000, inheritEnv: [], env: {},
+  }],
+};
+const failingPlan: BuildTestEvidencePlan = {
+  commands: [{
+    id: 'test', phase: 'test', executable: process.execPath,
+    args: ['-e', 'process.exit(7)'], cwd: '.', timeoutMs: 5_000, inheritEnv: [], env: {},
+  }],
+};
+const accept: ReviewDecisionInput = {
+  reviewId: 'review-accept', reviewerId: 'human', verdict: 'ACCEPT', summary: 'accepted', findings: [],
+};
+const revise: ReviewDecisionInput = {
+  reviewId: 'review-revise', reviewerId: 'human', verdict: 'REQUEST_REVISION', summary: 'revise once',
+  findings: [{ code: 'FIX_1', severity: 'error', message: 'Update the implementation', path: 'actual.txt' }],
+};
+
+async function harness(scripts: TurnScript[]) {
+  const directory = mkdtempSync(join(tmpdir(), 'agenthub-lifecycle-'));
+  const repositoryRoot = join(directory, 'repository');
+  execFileSync('git', ['init', '-b', 'main', repositoryRoot], { stdio: 'ignore' });
+  execFileSync('git', ['config', 'user.name', 'AgentHub Tests'], { cwd: repositoryRoot });
+  execFileSync('git', ['config', 'user.email', 'agenthub@example.invalid'], { cwd: repositoryRoot });
+  writeFileSync(join(repositoryRoot, 'README.md'), '# test\n', 'utf8');
+  execFileSync('git', ['add', 'README.md'], { cwd: repositoryRoot });
+  execFileSync('git', ['commit', '-m', 'initial'], { cwd: repositoryRoot, stdio: 'ignore' });
+
+  const database = new Database(join(directory, 'agenthub.db'));
+  database.initialize();
+  const bus = new EventBus();
+  const agents = new AgentRegistry(new SqliteAgentRepository(database),
+    new AgentProfileManager({ agentsDirectory: join(directory, 'agents') }), bus);
+  const tasks = new TaskManager(new SqliteTaskRepository(database), new TaskStateMachine(), bus);
+  const assignments = new AssignmentManager(new SqliteAssignmentRepository(database), tasks, agents,
+    (agentId) => agents.calculateProfileHash(agentId), bus);
+  const projectId = new SqliteProjectRepository(database).create({ id: 'project-a', name: 'Lifecycle' }).id;
+  agents.createAgent({ id: 'agent-a', projectId, name: 'Worker', provider: 'fake', model: 'fake-model',
+    position: 'Developer', status: AgentStatus.IDLE, capabilities: [], specialties: [], enabled: true });
+  tasks.createTask({ id: 'task-a', projectId, title: 'Task', description: 'Implement it',
+    complexity: TaskComplexity.SIMPLE, risk: TaskRisk.LOW, acceptanceCriteria: ['actual change is present'] });
+  const provider = new LifecycleProvider(scripts);
+  const providerFactory = new AgentProviderFactory();
+  providerFactory.register(provider);
+  const pool = new AgentPool({ providerFactory, eventBus: bus });
+  pool.register({ agentId: 'agent-a', projectId, providerId: 'fake' });
+  const scheduler = new AgentScheduler({ taskManager: tasks, agentRegistry: agents,
+    providerFactory, agentPool: pool, assignmentManager: assignments });
+  const worktrees = await GitWorktreeManager.open({ repositoryRoot });
+  const dispatcher = new AssignmentDispatcher({ taskManager: tasks, agentRegistry: agents,
+    assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
+  const lifecycle = new TaskLifecycleOrchestrator({ taskManager: tasks, agentRegistry: agents,
+    assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
+  const scheduled = scheduler.scheduleTask({ taskId: 'task-a' });
+  if (scheduled.outcome !== 'reserved') throw new Error('expected reservation');
+  const dispatch = await dispatcher.dispatch({ reservation: scheduled, baseRef: 'HEAD',
+    turn: { prompt: 'Implement once', protocol: 'worker-result' } });
+  return {
+    repositoryRoot, database, agents, tasks, assignments, provider, pool, worktrees, lifecycle, dispatch,
+    async cleanup() {
+      const snapshot = pool.getSnapshot('agent-a');
+      if (snapshot.assignmentId !== undefined) await pool.shutdown('agent-a', snapshot.assignmentId).catch(() => undefined);
+      await worktrees.removeWorkspace('task-a').catch(() => undefined);
+      database.close();
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () => {
+  it('commits, collects evidence, reviews, shuts down, and merges the actual source', async () => {
+    const h = await harness([{ outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'actual\n' } }]);
+    try {
+      const prepared = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan });
+      expect(prepared.outcome).toBe('review-ready');
+      if (prepared.outcome !== 'review-ready') throw new Error('expected review bundle');
+      expect(prepared.reviewBundle.taskCommit.outcome).toBe('committed');
+      expect(prepared.reviewBundle.source.changedPaths).toContain('actual.txt');
+      expect(prepared.reviewBundle.source.changedPaths).not.toContain('untrusted-worker-claim.txt');
+      expect(h.tasks.getTask('task-a')?.status).toBe('REVIEWING');
+
+      const tamperedBundle = { ...prepared.reviewBundle, source: { ...prepared.reviewBundle.source,
+        committed: { ...prepared.reviewBundle.source.committed,
+          patch: { status: 'captured', text: 'tampered', byteLength: 1, sha256: '0'.repeat(64) } } } };
+      await expect(h.lifecycle.applyReview({ reviewBundle: tamperedBundle as unknown as typeof prepared.reviewBundle,
+        decision: accept, buildTestPlan: passingPlan, targetBranch: 'main' }))
+        .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_INVALID_REVIEW_BUNDLE' });
+      expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'OWNED', busy: true });
+
+      const completed = await h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
+        decision: accept, buildTestPlan: passingPlan, targetBranch: 'main' });
+      expect(completed.outcome).toBe('completed');
+      expect(h.tasks.getTask('task-a')).toMatchObject({ status: 'COMPLETED', assignedAgentId: null, assignmentId: null });
+      expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('COMPLETED');
+      expect(h.agents.getAgent('agent-a')?.status).toBe('IDLE');
+      expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'IDLE', busy: false, active: false });
+      expect(readFileSync(join(h.repositoryRoot, 'actual.txt'), 'utf8')).toBe('actual\r\n');
+      expect(existsSync(join(h.repositoryRoot, '.agenthub', 'worktrees', 'task-a'))).toBe(true);
+    } finally { await h.cleanup(); }
+  });
+
+  it('reuses one assignment and healthy provider session for exactly one revision turn', async () => {
+    const h = await harness([
+      { outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'first\n' } },
+      { outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'revised\n' } },
+    ]);
+    try {
+      const first = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan });
+      if (first.outcome !== 'review-ready') throw new Error('expected first review bundle');
+      const second = await h.lifecycle.applyReview({ reviewBundle: first.reviewBundle,
+        decision: revise, buildTestPlan: passingPlan });
+      expect(second.outcome).toBe('review-ready');
+      if (second.outcome !== 'review-ready') throw new Error('expected revised review bundle');
+      expect(second.reviewBundle.assignmentId).toBe(first.reviewBundle.assignmentId);
+      expect(second.reviewBundle.taskCommit.headAfter).not.toBe(first.reviewBundle.taskCommit.headAfter);
+      expect(h.provider.createCalls).toBe(1);
+      expect(h.provider.session).toMatchObject({ runCalls: 2, startCalls: 1, shutdownCalls: 0 });
+      expect(h.provider.session?.prompts[1]).toContain('FIX_1');
+      const completed = await h.lifecycle.applyReview({ reviewBundle: second.reviewBundle,
+        decision: { ...accept, reviewId: 'review-accept-2' }, buildTestPlan: passingPlan, targetBranch: 'main' });
+      expect(completed.outcome).toBe('completed');
+      expect(readFileSync(join(h.repositoryRoot, 'actual.txt'), 'utf8')).toBe('revised\r\n');
+    } finally { await h.cleanup(); }
+  });
+
+  it('converges NEEDS_INPUT without evidence and clears all scheduling ownership', async () => {
+    const h = await harness([{ outcome: 'NEEDS_INPUT' }]);
+    try {
+      const result = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan });
+      expect(result.outcome).toBe('waiting-input');
+      expect(h.tasks.getTask('task-a')).toMatchObject({ status: 'WAITING_INPUT', assignedAgentId: null, assignmentId: null });
+      expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('RELEASED');
+      expect(h.agents.getAgent('agent-a')?.status).toBe('IDLE');
+      expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'IDLE', busy: false, active: false });
+    } finally { await h.cleanup(); }
+  });
+
+  it('captures failed stable evidence but refuses ACCEPT at the merge gate', async () => {
+    const h = await harness([{ outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'actual\n' } }]);
+    try {
+      const prepared = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: failingPlan });
+      if (prepared.outcome !== 'review-ready') throw new Error('expected review bundle');
+      expect(prepared.reviewBundle.buildTestEvidence.outcome).toBe('failed');
+      const denied = await h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
+        decision: accept, buildTestPlan: passingPlan, targetBranch: 'main' });
+      expect(denied.outcome).toBe('merge-denied');
+      expect(h.tasks.getTask('task-a')?.status).toBe('REVIEWING');
+      expect(existsSync(join(h.repositoryRoot, 'actual.txt'))).toBe(false);
+    } finally { await h.cleanup(); }
+  });
+});
