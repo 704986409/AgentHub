@@ -149,6 +149,7 @@ export class AssignmentManager {
     const task = this.tasks.getTask(assignment.taskId);
     if (task === null) throw new Error(`Task ${assignment.taskId} was not found`);
     this.assertLifecycleLineage(task, assignment, target);
+    this.assertAgentReleaseOwnership(assignment);
     if (task.status !== target) {
       try { this.tasks.transitionTask(task.id, target); }
       catch (error) {
@@ -173,6 +174,7 @@ export class AssignmentManager {
     const task = this.tasks.getTask(assignment.taskId);
     if (task === null) throw new Error(`Task ${assignment.taskId} was not found`);
     this.assertLifecycleLineage(task, assignment, TaskStatus.FAILED);
+    this.assertAgentReleaseOwnership(assignment);
     if (task.status !== TaskStatus.FAILED) {
       try { this.tasks.transitionTask(task.id, TaskStatus.FAILED); }
       catch (error) { if (this.tasks.getTask(task.id)?.status !== TaskStatus.FAILED) throw error; }
@@ -195,6 +197,7 @@ export class AssignmentManager {
     const task = this.tasks.getTask(assignment.taskId);
     if (task === null) throw new Error(`Task ${assignment.taskId} was not found`);
     this.assertLifecycleLineage(task, assignment, TaskStatus.COMPLETED);
+    this.assertAgentReleaseOwnership(assignment);
     if (task.status !== TaskStatus.COMPLETED) {
       try { this.tasks.transitionTask(task.id, TaskStatus.COMPLETED); }
       catch (error) { if (this.tasks.getTask(task.id)?.status !== TaskStatus.COMPLETED) throw error; }
@@ -240,6 +243,16 @@ export class AssignmentManager {
   private releaseAgent(agentId: string): void {
     const agent = this.agents.getAgent(agentId);
     if (agent?.status === AgentStatus.BUSY) this.agents.updateAgent(agentId, { status: AgentStatus.IDLE });
+  }
+
+  private assertAgentReleaseOwnership(assignment: Assignment): void {
+    const agent = this.agents.getAgent(assignment.agentId);
+    if (agent?.status !== AgentStatus.BUSY) return;
+    const competing = this.repository.list().some((candidate) => candidate.id !== assignment.id &&
+      candidate.agentId === assignment.agentId && [
+        AssignmentStatus.DISPATCHING, AssignmentStatus.ACCEPTED, AssignmentStatus.ACTIVE, AssignmentStatus.PENDING,
+      ].includes(candidate.status));
+    if (competing) throw new Error(`Agent ${assignment.agentId} is owned by another live assignment`);
   }
 
   private releaseAgentConverged(agentId: string): void {

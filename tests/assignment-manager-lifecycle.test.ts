@@ -59,6 +59,43 @@ describe('AssignmentManager lifecycle convergence', () => {
     h.database.close();
   });
 
+
+  it.each([
+    ['suspend', AssignmentStatus.RELEASED, TaskStatus.BLOCKED],
+    ['fail', AssignmentStatus.RELEASED, TaskStatus.FAILED],
+    ['complete', AssignmentStatus.COMPLETED, TaskStatus.COMPLETED],
+  ] as const)('fails closed when historical %s convergence sees same-agent live ownership', (operation, oldStatus, oldTaskStatus) => {
+    const h = active();
+    h.database.connection.prepare('UPDATE assignments SET status = ? WHERE id = ?').run(oldStatus, h.assignment.id);
+    h.tasks.transitionTask(h.task.id, oldTaskStatus);
+    h.tasks.updateTask(h.task.id, { assignedAgentId: null, assignmentId: null });
+    const newTask = h.tasks.createTask({ projectId: h.task.projectId, title: 'New task',
+      complexity: TaskComplexity.SIMPLE, risk: TaskRisk.LOW });
+    const newerId = `${h.assignment.id}-new-owner`;
+    const now = new Date().toISOString();
+    h.database.connection.prepare(`INSERT INTO assignments
+      (id, task_id, agent_id, spec_version, profile_hash, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(newerId, newTask.id, h.agent.id, '1.0.0', 'new-profile',
+      AssignmentStatus.ACTIVE, now, now);
+    h.tasks.updateTask(newTask.id, { assignedAgentId: h.agent.id, assignmentId: newerId });
+    h.agents.updateAgent(h.agent.id, { status: AgentStatus.BUSY });
+    const beforeTask = h.tasks.getTask(h.task.id);
+    const beforeNewTask = h.tasks.getTask(newTask.id);
+    const beforeNewer = h.assignments.getAssignment(newerId);
+    const beforeAgent = h.agents.getAgent(h.agent.id);
+    const invoke = () => operation === 'complete'
+      ? h.assignments.finalizeCompletedAssignment(h.assignment.id)
+      : operation === 'fail'
+        ? h.assignments.finalizeFailedAssignment(h.assignment.id)
+        : h.assignments.suspendActiveAssignment(h.assignment.id, TaskStatus.BLOCKED);
+    expect(invoke).toThrow(/owned by another live assignment/u);
+    expect(h.tasks.getTask(h.task.id)).toEqual(beforeTask);
+    expect(h.tasks.getTask(newTask.id)).toEqual(beforeNewTask);
+    expect(h.assignments.getAssignment(newerId)).toEqual(beforeNewer);
+    expect(h.agents.getAgent(h.agent.id)).toEqual(beforeAgent);
+    h.database.close();
+  });
+
   it.each([
     ['suspend', AssignmentStatus.RELEASED],
     ['fail', AssignmentStatus.STALE],

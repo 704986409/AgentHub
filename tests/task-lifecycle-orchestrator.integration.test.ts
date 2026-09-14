@@ -47,6 +47,7 @@ const capabilities: AgentProviderCapabilities = Object.freeze({
 interface TurnScript {
   readonly outcome: AgentHubWorkerOutcome;
   readonly write?: { readonly path: string; readonly content: string };
+  readonly throwAfterWrite?: boolean;
 }
 
 class LifecycleSession implements AgentProviderSession {
@@ -74,6 +75,7 @@ class LifecycleSession implements AgentProviderSession {
     this.prompts.push(request.prompt);
     if (script === undefined) return Promise.reject(new Error('unexpected turn'));
     if (script.write !== undefined) writeFileSync(join(this.workspacePath, script.write.path), script.write.content, 'utf8');
+    if (script.throwAfterWrite === true) return Promise.reject(new Error('provider failed after writing source'));
     return Promise.resolve({
       providerId: this.providerId,
       sessionId: this.sessionId,
@@ -185,7 +187,7 @@ async function harness(scripts: TurnScript[]) {
   const dispatch = await dispatcher.dispatch({ reservation: scheduled, baseRef: 'HEAD',
     turn: { prompt: 'Implement once', protocol: 'worker-result' } });
   return {
-    repositoryRoot, database, agents, tasks, assignments, provider, pool, worktrees, lifecycle, dispatch,
+    repositoryRoot, database, agents, tasks, assignments, provider, pool, scheduler, dispatcher, worktrees, lifecycle, dispatch,
     async cleanup() {
       const snapshot = pool.getSnapshot('agent-a');
       if (snapshot.assignmentId !== undefined) await pool.shutdown('agent-a', snapshot.assignmentId).catch(() => undefined);
@@ -241,6 +243,27 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
       expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'IDLE', busy: false, active: false });
       expect(readFileSync(join(h.repositoryRoot, 'actual.txt'), 'utf8')).toBe('actual\r\n');
       expect(existsSync(join(h.repositoryRoot, '.agenthub', 'worktrees', 'task-a'))).toBe(true);
+
+      h.tasks.createTask({ id: 'task-b', projectId: 'project-a', title: 'New task', description: 'New ownership',
+        complexity: TaskComplexity.SIMPLE, risk: TaskRisk.LOW });
+      const scheduledB = h.scheduler.scheduleTask({ taskId: 'task-b' });
+      if (scheduledB.outcome !== 'reserved') throw new Error('expected second reservation');
+      const dispatchB = await h.dispatcher.dispatch({ reservation: scheduledB, baseRef: 'main',
+        turn: { prompt: 'Implement task B', protocol: 'worker-result' } });
+      expect(dispatchB.assignmentId).not.toBe(h.dispatch.assignmentId);
+      expect(h.agents.getAgent('agent-a')?.status).toBe(AgentStatus.BUSY);
+      const taskBBefore = h.tasks.getTask('task-b');
+      const assignmentBBefore = h.assignments.getAssignment(dispatchB.assignmentId);
+      const poolBBefore = h.pool.getSnapshot('agent-a');
+      const mergeCalls = mergeSpy.mock.calls.length;
+      const replayed = await h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
+        decision: accept, buildTestPlan: passingPlan, targetBranch: 'main' });
+      expect(replayed).toEqual(completed);
+      expect(mergeSpy).toHaveBeenCalledTimes(mergeCalls);
+      expect(h.tasks.getTask('task-b')).toEqual(taskBBefore);
+      expect(h.assignments.getAssignment(dispatchB.assignmentId)).toEqual(assignmentBBefore);
+      expect(h.agents.getAgent('agent-a')?.status).toBe(AgentStatus.BUSY);
+      expect(h.pool.getSnapshot('agent-a')).toEqual(poolBBefore);
     } finally { await h.cleanup(); }
   });
 
@@ -270,6 +293,32 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
     } finally { await h.cleanup(); }
   });
 
+  it('quarantines and preserves source when a revision writes then throws', async () => {
+    const h = await harness([
+      { outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'first\n' } },
+      { outcome: 'COMPLETED', write: { path: 'partial.txt', content: 'forensic\n' }, throwAfterWrite: true },
+    ]);
+    try {
+      const prepared = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan });
+      if (prepared.outcome !== 'review-ready') throw new Error('expected review bundle');
+      await expect(h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
+        decision: revise, buildTestPlan: passingPlan }))
+        .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_REVISION_FAILED' });
+      expect(readFileSync(join(h.repositoryRoot, '.agenthub', 'worktrees', 'task-a', 'partial.txt'), 'utf8'))
+        .toBe('forensic\n');
+      await expect(h.worktrees.createWorkspace({ taskId: 'task-a', baseRef: 'main' }))
+        .rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+      await expect(h.worktrees.commitTaskWorkspace('task-a'))
+        .rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+      await expect(h.worktrees.collectBuildTestEvidence('task-a', passingPlan))
+        .rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+      await expect(h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
+        decision: revise, buildTestPlan: passingPlan }))
+        .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_STALE_EXECUTION' });
+      expect(h.provider.session?.runCalls).toBe(2);
+    } finally { await h.cleanup(); }
+  });
+
   it('closes a failed revision turn without allowing the stale review to run again', async () => {
     const h = await harness([{ outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'first\n' } }]);
     try {
@@ -284,6 +333,9 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
       expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('RELEASED');
       expect(h.agents.getAgent('agent-a')?.status).toBe('IDLE');
       expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'IDLE', busy: false, active: false });
+      const workspace = await h.worktrees.inspectWorkspace('task-a');
+      expect(workspace).toBeDefined();
+      expect(readFileSync(join(h.repositoryRoot, '.agenthub', 'worktrees', 'task-a', 'actual.txt'), 'utf8')).toBe('first\n');
       await expect(h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
         decision: revise, buildTestPlan: passingPlan }))
         .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_STALE_EXECUTION' });
@@ -311,7 +363,7 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
   });
 
   it('replays no-change completion without repeating the final gate after partial persistence', async () => {
-    const h = await harness([{ outcome: 'COMPLETED' }]);
+    const h = await harness([{ outcome: 'COMPLETED' }, { outcome: 'BLOCKED' }]);
     try {
       const prepared = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan });
       if (prepared.outcome !== 'review-ready') throw new Error('expected review bundle');
@@ -339,6 +391,25 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
       expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('COMPLETED');
       expect(h.agents.getAgent('agent-a')?.status).toBe('IDLE');
       expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'IDLE', busy: false, active: false });
+
+      h.tasks.createTask({ id: 'task-b', projectId: 'project-a', title: 'New no-change task', description: 'New ownership',
+        complexity: TaskComplexity.SIMPLE, risk: TaskRisk.LOW });
+      const scheduledB = h.scheduler.scheduleTask({ taskId: 'task-b' });
+      if (scheduledB.outcome !== 'reserved') throw new Error('expected second reservation');
+      const dispatchB = await h.dispatcher.dispatch({ reservation: scheduledB, baseRef: 'main',
+        turn: { prompt: 'Implement task B', protocol: 'worker-result' } });
+      const taskBBefore = h.tasks.getTask('task-b');
+      const assignmentBBefore = h.assignments.getAssignment(dispatchB.assignmentId);
+      const agentBefore = h.agents.getAgent('agent-a');
+      const poolBBefore = h.pool.getSnapshot('agent-a');
+      const gateCalls = gateSpy.mock.calls.length;
+      const replayed = await h.lifecycle.applyReview(request);
+      expect(replayed).toEqual(completed);
+      expect(gateSpy).toHaveBeenCalledTimes(gateCalls);
+      expect(h.tasks.getTask('task-b')).toEqual(taskBBefore);
+      expect(h.assignments.getAssignment(dispatchB.assignmentId)).toEqual(assignmentBBefore);
+      expect(h.agents.getAgent('agent-a')).toEqual(agentBefore);
+      expect(h.pool.getSnapshot('agent-a')).toEqual(poolBBefore);
     } finally { await h.cleanup(); }
   });
   it.each(['source', 'visibility'] as const)(

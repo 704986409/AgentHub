@@ -132,6 +132,7 @@ export class TaskLifecycleOrchestrator {
     const receiptKey = lifecycleReceiptKey(bundle, review, input);
     const receipt = receipts.get(this.#assignments)?.get(receiptKey);
     if (receipt !== undefined) {
+      if (this.#isCompletionConverged(bundle.assignmentId)) return receipt.result;
       try { this.#finalizeCompleted(bundle.assignmentId, receipt.mergeResult); }
       catch { throw lifecycleError('TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED', receipt.mergeResult); }
       return receipt.result;
@@ -224,10 +225,18 @@ export class TaskLifecycleOrchestrator {
     let raw: AgentProviderTurnResult;
     try { raw = await this.#pool.runTurn(bundle.agentId, bundle.assignmentId, { prompt, protocol: 'worker-result' }); }
     catch {
+      let sourceChanged = true;
       try {
         await this.#shutdown(bundle);
-        this.#suspend(bundle.assignmentId, TaskStatus.BLOCKED);
-      } catch { throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED'); }
+        const current = await this.#captureReviewSource(bundle.taskId);
+        sourceChanged = !sameSourceIdentity(bundle.source, current) || !cleanSource(current);
+      } catch { /* capture ambiguity is quarantined below */ }
+      if (sourceChanged) {
+        try { this.#worktrees.quarantineWorkspace(bundle.taskId); }
+        catch { throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED'); }
+      }
+      try { this.#suspend(bundle.assignmentId, TaskStatus.BLOCKED); }
+      catch { throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED'); }
       throw lifecycleError('TASK_LIFECYCLE_REVISION_FAILED');
     }
     let turn: AgentProviderTurnResult;
@@ -393,11 +402,17 @@ export class TaskLifecycleOrchestrator {
       const assignment = this.#assignments.getAssignment(assignmentId);
       const task = assignment === null ? null : this.#tasks.getTask(assignment.taskId);
       if (assignment !== null && assignment.status === AssignmentStatus.COMPLETED &&
-        task?.status === TaskStatus.COMPLETED && task.assignedAgentId === null && task.assignmentId === null &&
-        this.#agents.getAgent(assignment.agentId)?.status === AgentStatus.IDLE) return;
+        task?.status === TaskStatus.COMPLETED && task.assignedAgentId === null && task.assignmentId === null) return;
     }
     throw lifecycleError('TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED', merge);
   }
+  #isCompletionConverged(assignmentId: string): boolean {
+    const assignment = this.#assignments.getAssignment(assignmentId);
+    const task = assignment === null ? null : this.#tasks.getTask(assignment.taskId);
+    return assignment?.status === AssignmentStatus.COMPLETED && task?.status === TaskStatus.COMPLETED &&
+      task.assignedAgentId === null && task.assignmentId === null;
+  }
+
   #rememberReceipt(key: string, receipt: LifecycleReceipt): void {
     const byKey = receipts.get(this.#assignments) ?? new Map<string, LifecycleReceipt>();
     byKey.set(key, receipt);

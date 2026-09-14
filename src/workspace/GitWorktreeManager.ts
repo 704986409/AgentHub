@@ -200,6 +200,11 @@ export class GitWorktreeManager {
 
   public get repositoryRoot(): string { return this.#repositoryRoot; }
 
+  public quarantineWorkspace(taskIdValue: string): void {
+    const taskId = validateTaskId(taskIdValue);
+    quarantineTask(this.#repositoryKey, taskId);
+  }
+
   public createWorkspace(request: CreateTaskWorkspaceRequest): Promise<CreatedTaskWorkspace> {
     let taskId: string;
     let baseRef: string;

@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { GitCommandRunner, GitWorktreeManager } from '../src/index.js';
+import { createReviewEvidence, GitCommandRunner, GitWorktreeManager, type BuildTestEvidencePlan } from '../src/index.js';
 
 const runner = new GitCommandRunner();
 const roots: string[] = [];
@@ -325,6 +325,33 @@ describe('GitWorktreeManager real Git integration', { timeout: 15_000 }, () => {
       .toBe(1);
   });
 
+  it('quarantines a task workspace without deleting its audit source', async () => {
+    const fixture = await committedFixture('agenthub explicit quarantine ');
+    const evidence = await fixture.manager.collectBuildTestEvidence('TASK-A', plan());
+    const review = createReviewEvidence(evidence, { reviewId: 'review', reviewerId: 'reviewer', verdict: 'ACCEPT',
+      summary: 'accepted exact evidence' });
+    const gate = await fixture.manager.evaluateMergeGate('TASK-A', evidence, review);
+
+    fixture.manager.quarantineWorkspace('TASK-A');
+    await expect(fixture.manager.inspectWorkspace('TASK-A')).resolves.toMatchObject({ taskId: 'TASK-A' });
+    await expect(fixture.manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+    await expect(fixture.manager.captureWorkspaceChanges('TASK-A'))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+    await expect(fixture.manager.commitTaskWorkspace('TASK-A'))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+    await expect(fixture.manager.collectBuildTestEvidence('TASK-A', plan()))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+    await expect(fixture.manager.evaluateMergeGate('TASK-A', evidence, review))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+    await expect(fixture.manager.mergeTaskWorkspace({ taskId: 'TASK-A', targetBranch: 'main',
+      buildEvidence: evidence, reviewEvidence: review, gateDecision: gate }))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+    await expect(fixture.manager.removeWorkspace('TASK-A'))
+      .rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+    await expect(readFile(path.join(fixture.workspace.worktreePath, 'task.txt'), 'utf8')).resolves.toBe('task\n');
+  });
+
   it('recovers only an exact clean missing base marker and rejects ambiguous migration', async () => {
     const repo = await createRepository('agenthub marker recovery ');
     let manager = await GitWorktreeManager.open({ repositoryRoot: repo });
@@ -384,6 +411,20 @@ describe('GitWorktreeManager real Git integration', { timeout: 15_000 }, () => {
   });
 });
 
+async function committedFixture(prefix: string) {
+  const repo = await createRepository(prefix);
+  const manager = await GitWorktreeManager.open({ repositoryRoot: repo });
+  const workspace = await manager.createWorkspace({ taskId: 'TASK-A', baseRef: 'HEAD' });
+  await writeFile(path.join(workspace.worktreePath, 'task.txt'), 'task\n', 'utf8');
+  await git(workspace.worktreePath, ['add', 'task.txt']);
+  await git(workspace.worktreePath, ['commit', '-m', 'task source']);
+  return { repo, manager, workspace };
+}
+
+function plan(): BuildTestEvidencePlan {
+  return { commands: [{ id: 'verify', phase: 'test', executable: process.execPath,
+    args: ['-e', 'process.stdout.write("ok")'], timeoutMs: 5_000 }] };
+}
 async function createRepository(prefix: string): Promise<string> {
   const repo = await temporaryDirectory(prefix);
   await git(repo, ['init', '-b', 'main']);
