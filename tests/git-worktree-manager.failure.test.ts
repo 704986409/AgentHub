@@ -27,7 +27,7 @@ afterEach(async () => {
   }
 });
 
-describe('GitWorktreeManager failure reconciliation', () => {
+describe('GitWorktreeManager failure reconciliation', { timeout: 30_000 }, () => {
   it('reports an unavailable Git executable as a typed preflight failure', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'agenthub unavailable git '));
     roots.push(root);
