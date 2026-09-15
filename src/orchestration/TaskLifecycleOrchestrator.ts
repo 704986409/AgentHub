@@ -225,9 +225,14 @@ export class TaskLifecycleOrchestrator {
     let raw: AgentProviderTurnResult;
     try { raw = await this.#pool.runTurn(bundle.agentId, bundle.assignmentId, { prompt, protocol: 'worker-result' }); }
     catch {
+      try { await this.#shutdown(bundle); }
+      catch {
+        try { this.#worktrees.quarantineWorkspace(bundle.taskId); }
+        catch { /* unresolved runtime ownership remains authoritative */ }
+        throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED');
+      }
       let sourceChanged = true;
       try {
-        await this.#shutdown(bundle);
         const current = await this.#captureReviewSource(bundle.taskId);
         sourceChanged = !sameSourceIdentity(bundle.source, current) || !cleanSource(current);
       } catch { /* capture ambiguity is quarantined below */ }

@@ -343,6 +343,58 @@ describe('TaskLifecycleOrchestrator real integration', { timeout: 120_000 }, () 
     } finally { await h.cleanup(); }
   });
 
+  it('preserves visible ownership and quarantines source when failed revision shutdown is unproven', async () => {
+    const h = await harness([
+      { outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'first\n' } },
+      { outcome: 'COMPLETED', write: { path: 'partial.txt', content: 'forensic\n' }, throwAfterWrite: true },
+    ]);
+    try {
+      const prepared = await h.lifecycle.prepareReview({ dispatchResult: h.dispatch, buildTestPlan: passingPlan });
+      if (prepared.outcome !== 'review-ready') throw new Error('expected review bundle');
+      const suspend = vi.spyOn(h.assignments, 'suspendActiveAssignment');
+      vi.spyOn(h.pool, 'shutdown').mockRejectedValue(new Error('unproven runtime shutdown'));
+      const commit = vi.spyOn(h.worktrees, 'commitTaskWorkspace');
+      const evidence = vi.spyOn(h.worktrees, 'collectBuildTestEvidence');
+      const capture = vi.spyOn(h.worktrees, 'captureWorkspaceChanges');
+      const gate = vi.spyOn(h.worktrees, 'evaluateMergeGate');
+      const merge = vi.spyOn(h.worktrees, 'mergeTaskWorkspace');
+      const callsBefore = {
+        commit: commit.mock.calls.length,
+        evidence: evidence.mock.calls.length,
+        capture: capture.mock.calls.length,
+        gate: gate.mock.calls.length,
+        merge: merge.mock.calls.length,
+      };
+
+      await expect(h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
+        decision: revise, buildTestPlan: passingPlan }))
+        .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED' });
+
+      expect(suspend).not.toHaveBeenCalled();
+      expect(h.assignments.getAssignment(h.dispatch.assignmentId)?.status).toBe('ACTIVE');
+      expect(h.tasks.getTask('task-a')).toMatchObject({ status: 'IMPLEMENTING',
+        assignedAgentId: 'agent-a', assignmentId: h.dispatch.assignmentId });
+      expect(h.agents.getAgent('agent-a')?.status).toBe('BUSY');
+      expect(h.pool.getSnapshot('agent-a')).toMatchObject({ state: 'OWNED', busy: true,
+        assignmentId: h.dispatch.assignmentId });
+      expect(readFileSync(join(h.repositoryRoot, '.agenthub', 'worktrees', 'task-a', 'partial.txt'), 'utf8'))
+        .toBe('forensic\n');
+      expect({
+        commit: commit.mock.calls.length,
+        evidence: evidence.mock.calls.length,
+        capture: capture.mock.calls.length,
+        gate: gate.mock.calls.length,
+        merge: merge.mock.calls.length,
+      }).toEqual({ ...callsBefore, capture: callsBefore.capture + 1 });
+      await expect(h.worktrees.createWorkspace({ taskId: 'task-a', baseRef: 'main' }))
+        .rejects.toMatchObject({ code: 'GIT_WORKTREE_TASK_QUARANTINED' });
+      await expect(h.lifecycle.applyReview({ reviewBundle: prepared.reviewBundle,
+        decision: revise, buildTestPlan: passingPlan }))
+        .rejects.toMatchObject({ code: 'TASK_LIFECYCLE_STALE_EXECUTION' });
+      expect(h.provider.session?.runCalls).toBe(2);
+    } finally { await h.cleanup(); }
+  });
+
   it('retains immutable BLOCK review evidence and binds it into lifecycle identity', async () => {
     const h = await harness([{ outcome: 'COMPLETED', write: { path: 'actual.txt', content: 'actual\n' } }]);
     try {
