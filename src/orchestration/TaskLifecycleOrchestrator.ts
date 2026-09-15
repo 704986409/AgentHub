@@ -8,16 +8,16 @@ import type { TaskManager } from '../services/task-manager.js';
 import {
   GitMergeError, GitTaskCommitError, GitWorktreeManager, createReviewEvidence,
   type BuildTestEvidence, type BuildTestEvidencePlan, type GitWorkspaceChangeSnapshot,
-  type MergeGateDecision, type ReviewEvidence, type TaskCommitResult, type TaskMergeResult,
+  type MergeGateDecision, type ReviewEvidence, type TaskMergeResult,
 } from '../workspace/index.js';
 import { snapshotAssignmentTurnResult, type AssignmentDispatchResult } from './AssignmentDispatcher.js';
+import { ReviewPreparationCoordinator } from './lifecycle/ReviewPreparationCoordinator.js';
 import {
   TaskLifecycleError,
   isRecord,
   lifecycleError,
   lifecycleReceiptKey,
   lifecycleResult,
-  makeReviewBundle,
   snapshotApplyRequest,
   snapshotPrepareRequest,
   sourceMatchesEvidence,
@@ -63,6 +63,7 @@ export class TaskLifecycleOrchestrator {
   readonly #tasks: TaskManager; readonly #agents: AgentRegistry;
   readonly #assignments: AssignmentManager; readonly #pool: AgentPool;
   readonly #worktrees: GitWorktreeManager;
+  readonly #reviewPreparation: ReviewPreparationCoordinator;
 
   public constructor(options: TaskLifecycleOrchestratorOptions) {
     if (!isRecord(options) || !(options.worktreeManager instanceof GitWorktreeManager)) {
@@ -71,6 +72,7 @@ export class TaskLifecycleOrchestrator {
     this.#tasks = options.taskManager; this.#agents = options.agentRegistry;
     this.#assignments = options.assignmentManager; this.#pool = options.agentPool;
     this.#worktrees = options.worktreeManager;
+    this.#reviewPreparation = new ReviewPreparationCoordinator(this.#worktrees);
   }
 
   public prepareReview(request: PrepareTaskReviewRequest): Promise<TaskLifecyclePreparationResult> {
@@ -243,33 +245,17 @@ export class TaskLifecycleOrchestrator {
         taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
     }
     await this.#requireExecution(dispatch, TaskStatus.IMPLEMENTING);
-    return this.#prepareCompleted({ dispatch, workerResult: worker, buildTestPlan: input.buildTestPlan,
-      evidenceOptions: input.evidenceOptions });
-  }
-
-  async #prepareCompleted(input: ReviewPreparationInput): Promise<TaskLifecyclePreparationResult> {
-    let commit: TaskCommitResult;
-    try { commit = await this.#worktrees.commitTaskWorkspace(input.dispatch.taskId); }
-    catch (error) {
+    let prepared: Awaited<ReturnType<ReviewPreparationCoordinator['prepare']>>;
+    try {
+      prepared = await this.#reviewPreparation.prepare({ dispatch, workerResult: worker,
+        buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions });
+    } catch (error) {
       if (error instanceof GitTaskCommitError) throw lifecycleError('TASK_LIFECYCLE_COMMIT_FAILED');
       throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED');
     }
-    let evidence: BuildTestEvidence;
-    try { evidence = await this.#worktrees.collectBuildTestEvidence(input.dispatch.taskId,
-      input.buildTestPlan, input.evidenceOptions); }
-    catch { return this.#blockEvidenceIntegrity(input.dispatch); }
-    if (evidence.outcome === 'workspace-mutated' || evidence.outcome === 'infrastructure-failed') {
-      return this.#blockEvidenceIntegrity(input.dispatch);
-    }
-    let source: GitWorkspaceChangeSnapshot;
-    try { source = await this.#captureReviewSource(input.dispatch.taskId); }
-    catch { return this.#blockEvidenceIntegrity(input.dispatch); }
-    if (!sourceMatchesEvidence(source, evidence) || source.headCommit !== commit.headAfter || !cleanSource(source)) {
-      return this.#blockEvidenceIntegrity(input.dispatch);
-    }
-    const bundle = makeReviewBundle(input.dispatch, commit, evidence, source, input.workerResult);
-    this.#transition(input.dispatch.taskId, TaskStatus.REVIEWING);
-    return lifecycleResult({ outcome: 'review-ready' as const, reviewBundle: bundle });
+    if (prepared.outcome === 'evidence-integrity-blocked') return this.#blockEvidenceIntegrity(dispatch);
+    this.#transition(dispatch.taskId, TaskStatus.REVIEWING);
+    return lifecycleResult({ outcome: 'review-ready' as const, reviewBundle: prepared.reviewBundle });
   }
 
   async #blockEvidenceIntegrity(dispatch: Readonly<AssignmentDispatchResult>): Promise<TaskLifecyclePreparationResult> {
