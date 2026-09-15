@@ -8,16 +8,38 @@ import { SqliteAgentRepository, SqliteAssignmentRepository, SqliteEventRepositor
   SqliteProjectRepository, SqliteTaskRepository } from '../repositories/index.js';
 import { AgentPool, AgentProviderFactory, ClaudeAgentProvider, CodexAgentProvider } from '../runtime/index.js';
 import { AgentProfileManager, AgentRegistry, AssignmentManager, TaskManager, TaskStateMachine } from '../services/index.js';
-import { GitWorktreeManager } from '../workspace/index.js';
+import { GitCommandRunner, GitWorktreeManager, type GitCommandRunnerLike } from '../workspace/index.js';
 import type { AgentHubApplication } from './AgentHubApplication.js';
 
 export interface LocalAgentHubOptions { readonly repositoryRoot?: string; readonly dataDirectory?: string }
 export interface OwnedAgentHubApplication { readonly application: AgentHubApplication; close(): Promise<void> }
 
+export async function resolvePrimaryBranch(repositoryRoot: string,
+  runner: GitCommandRunnerLike = new GitCommandRunner()): Promise<string> {
+  const root = resolve(repositoryRoot);
+  const result = await runner.run(['symbolic-ref', '--quiet', 'HEAD'], {
+    cwd: root, acceptedExitCodes: [0, 1],
+  });
+  const symbolicRef = result.stdout.trim();
+  if (result.exitCode !== 0 || !symbolicRef.startsWith('refs/heads/') || symbolicRef.includes('\n') || symbolicRef.includes('\r')) {
+    throw new Error('Repository must have a checked-out local branch');
+  }
+  const branch = symbolicRef.slice('refs/heads/'.length);
+  const valid = await runner.run(['check-ref-format', '--branch', branch], {
+    cwd: root, acceptedExitCodes: [0, 1],
+  });
+  const local = await runner.run(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], {
+    cwd: root, acceptedExitCodes: [0, 1],
+  });
+  if (valid.exitCode !== 0 || local.exitCode !== 0) throw new Error('Repository local branch is invalid');
+  return branch;
+}
+
 /** Production composition root. The transport borrows this graph and never owns it. */
 export async function createLocalAgentHubApplication(options: LocalAgentHubOptions = {}): Promise<OwnedAgentHubApplication> {
   const repositoryRoot = resolve(options.repositoryRoot ?? process.cwd());
   const dataDirectory = resolve(options.dataDirectory ?? join(repositoryRoot, 'data'));
+  const targetBranch = await resolvePrimaryBranch(repositoryRoot);
   mkdirSync(dataDirectory, { recursive: true });
   const database = new Database(join(dataDirectory, 'agenthub.db')); database.initialize();
   const eventBus = new EventBus();
@@ -49,6 +71,6 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
     assignments, assignmentQueries: assignmentRepository, events, eventBus, scheduler, dispatcher, lifecycle,
     buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }),
-    targetBranch: 'HEAD' });
+    targetBranch });
   return { application, async close() { await pool.shutdownAll(); events.close(); database.close(); } };
 }

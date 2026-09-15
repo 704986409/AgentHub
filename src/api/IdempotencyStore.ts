@@ -1,12 +1,21 @@
 import { createHash } from 'node:crypto';
 
-import { apiError } from './ApiErrors.js';
+import { apiError, normalizeApiError } from './ApiErrors.js';
 
-interface Entry<T> {
+interface InFlightEntry<T> {
+  readonly state: 'IN_FLIGHT';
+  readonly fingerprint: string;
+  readonly promise: Promise<Readonly<T>>;
+}
+
+interface CompletedEntry<T> {
+  readonly state: 'COMPLETED_SUCCESS' | 'COMPLETED_FAILURE';
   readonly fingerprint: string;
   readonly expiresAt: number;
   readonly promise: Promise<Readonly<T>>;
 }
+
+type Entry<T> = InFlightEntry<T> | CompletedEntry<T>;
 
 export interface IdempotencyStoreOptions {
   readonly maxEntries?: number;
@@ -27,7 +36,7 @@ export class IdempotencyStore {
   }
 
   public execute<T>(key: string, fingerprint: string, operation: () => Promise<T>): Promise<Readonly<T>> {
-    this.#prune();
+    this.#pruneCompleted();
     const existing = this.#entries.get(key);
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) {
@@ -35,22 +44,44 @@ export class IdempotencyStore {
       }
       return existing.promise as Promise<Readonly<T>>;
     }
-    while (this.#entries.size >= this.#maxEntries) {
-      const oldest = this.#entries.keys().next().value;
-      if (oldest === undefined) break;
-      this.#entries.delete(oldest);
+    this.#makeCapacity();
+    if (this.#entries.size >= this.#maxEntries) {
+      return Promise.reject(apiError('AGENTHUB_API_IDEMPOTENCY_CAPACITY', 503));
     }
-    const promise = Promise.resolve().then(operation).then((value) => deepFreeze(structuredClone(value)));
-    this.#entries.set(key, { fingerprint, expiresAt: this.#now() + this.#ttlMs, promise });
-    void promise.catch(() => { if (this.#entries.get(key)?.promise === promise) this.#entries.delete(key); });
+    const promise = Promise.resolve().then(operation).then(
+      (value) => deepFreeze(structuredClone(value)),
+      (error: unknown) => Promise.reject(normalizeApiError(error)),
+    );
+    const inFlight: InFlightEntry<T> = { state: 'IN_FLIGHT', fingerprint, promise };
+    this.#entries.set(key, inFlight);
+    void promise.then(
+      () => this.#complete(key, inFlight, 'COMPLETED_SUCCESS'),
+      () => this.#complete(key, inFlight, 'COMPLETED_FAILURE'),
+    );
     return promise;
   }
 
   public clear(): void { this.#entries.clear(); }
 
-  #prune(): void {
+  #complete<T>(key: string, expected: InFlightEntry<T>, state: CompletedEntry<T>['state']): void {
+    if (this.#entries.get(key) !== expected) return;
+    this.#entries.set(key, { state, fingerprint: expected.fingerprint,
+      expiresAt: this.#now() + this.#ttlMs, promise: expected.promise });
+  }
+
+  #makeCapacity(): void {
+    while (this.#entries.size >= this.#maxEntries) {
+      const completed = [...this.#entries].find(([, entry]) => entry.state !== 'IN_FLIGHT');
+      if (completed === undefined) return;
+      this.#entries.delete(completed[0]);
+    }
+  }
+
+  #pruneCompleted(): void {
     const now = this.#now();
-    for (const [key, entry] of this.#entries) if (entry.expiresAt <= now) this.#entries.delete(key);
+    for (const [key, entry] of this.#entries) {
+      if (entry.state !== 'IN_FLIGHT' && entry.expiresAt <= now) this.#entries.delete(key);
+    }
   }
 }
 

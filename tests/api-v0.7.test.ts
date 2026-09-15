@@ -40,6 +40,42 @@ describe('V0.7 local API control plane', () => {
     await expect(store.execute('key', 'different', operation)).rejects.toMatchObject({ status: 409 });
   });
 
+  it('never expires or evicts in-flight work and starts TTL at settlement', async () => {
+    let now = 0; let calls = 0; let resolveOperation!: (value: { value: number }) => void;
+    const store = new IdempotencyStore({ maxEntries: 1, ttlMs: 10, now: () => now });
+    const operation = () => { calls += 1; return new Promise<{ value: number }>((resolve) => { resolveOperation = resolve; }); };
+    const first = store.execute('first', 'same', operation);
+    now = 100;
+    expect(store.execute('first', 'same', operation)).toBe(first);
+    await expect(store.execute('second', 'other', operation)).rejects.toMatchObject({
+      code: 'AGENTHUB_API_IDEMPOTENCY_CAPACITY', status: 503,
+    });
+    await expect(store.execute('first', 'different', operation)).rejects.toMatchObject({ status: 409 });
+    expect(calls).toBe(1);
+    resolveOperation({ value: 1 });
+    await expect(first).resolves.toEqual({ value: 1 });
+    now = 109;
+    await expect(store.execute('first', 'same', operation)).resolves.toEqual({ value: 1 });
+    expect(calls).toBe(1);
+    now = 110;
+    const replacement = store.execute('first', 'same', () => { calls += 1; return Promise.resolve({ value: 2 }); });
+    await expect(replacement).resolves.toEqual({ value: 2 });
+    expect(calls).toBe(2);
+  });
+
+  it('caches normalized failures and evicts only completed entries', async () => {
+    const store = new IdempotencyStore({ maxEntries: 1 }); let sideEffects = 0;
+    const failure = () => { sideEffects += 1; return Promise.reject(new Error('private token')); };
+    const first = store.execute('failed', 'same', failure);
+    await expect(first).rejects.toMatchObject({ code: 'AGENTHUB_API_INTERNAL', status: 500,
+      message: 'Internal server error' });
+    const retry = store.execute('failed', 'same', failure);
+    expect(retry).toBe(first);
+    await expect(retry).rejects.toMatchObject({ code: 'AGENTHUB_API_INTERNAL', status: 500 });
+    expect(sideEffects).toBe(1);
+    await expect(store.execute('next', 'next', () => Promise.resolve({ value: 2 }))).resolves.toEqual({ value: 2 });
+  });
+
   it('keeps review bundles server-owned and expires handles', () => {
     const store = new ReviewHandleStore();
     const bundle = { taskId: 'task-a', reviewBundleSha256: 'a'.repeat(64) } as unknown as TaskReviewBundle;
@@ -82,6 +118,70 @@ describe('V0.7 local API control plane', () => {
     } finally { await server.stop(); }
   });
 
+  it('replays task-creation failure after persistence without duplicating the side effect', async () => {
+    const bus = new EventBus(); const app = fakeApplication(bus); let persisted = 0;
+    const createTask = app.tasks.createTask.bind(app.tasks);
+    bus.subscribe(() => { throw new Error('private subscriber failure'); });
+    Object.assign(app as unknown as Record<string, unknown>, { tasks: {
+      listTasks: () => [], getTask: () => null,
+      createTask: (input: never) => { persisted += 1; const task = createTask(input);
+        bus.publish({ eventType: 'TaskCreated', taskId: task.id }); return task; },
+    } });
+    const server = new AgentHubHttpServer({ application: app, port: 0 }); const address = await server.start();
+    const base = `http://${address.host}:${String(address.port)}`;
+    try {
+      const create = () => fetch(`${base}/api/v1/tasks`, { method: 'POST',
+        headers: { 'content-type': 'application/json', 'idempotency-key': 'create-failure' },
+        body: JSON.stringify({ projectId: 'project-a', title: 'API task', complexity: 'SIMPLE', risk: 'LOW' }) });
+      const first = await create(); const firstBody = await first.json() as { error: { code: string; message: string } };
+      const second = await create(); const secondBody = await second.json() as { error: { code: string; message: string } };
+      expect(first.status).toBe(500); expect(second.status).toBe(500);
+      expect(secondBody.error).toEqual(firstBody.error);
+      expect(firstBody.error).toEqual({ code: 'AGENTHUB_API_INTERNAL', message: 'Internal server error' });
+      expect(persisted).toBe(1);
+    } finally { await server.stop(); }
+  });
+
+  it('replays completed execute and review failures without repeating lifecycle side effects', async () => {
+    const bus = new EventBus(); const app = fakeApplication(bus);
+    const counts = { schedule: 0, dispatch: 0, prepare: 0, review: 0 };
+    const handle = 'f'.repeat(64); const bundle = reviewBundle(handle);
+    Object.assign(app as unknown as Record<string, unknown>, {
+      tasks: { listTasks: () => [], getTask: () => ({ id: 'task-created' }), createTask: () => ({}) },
+      scheduler: { scheduleTask: () => { counts.schedule += 1; return { outcome: 'reserved' }; } },
+      dispatcher: { dispatch: () => { counts.dispatch += 1; return Promise.reject(new Error('dispatch private')); } },
+      lifecycle: { prepareReview: () => { counts.prepare += 1; return Promise.resolve({}); }, applyReview: () => {
+        counts.review += 1; return Promise.reject(new Error('review private'));
+      } },
+    });
+    const server = new AgentHubHttpServer({ application: app, port: 0 }); const address = await server.start();
+    const base = `http://${address.host}:${String(address.port)}`;
+    try {
+      const execute = () => fetch(`${base}/api/v1/tasks/task-created/execute`, { method: 'POST',
+        headers: { 'content-type': 'application/json', 'idempotency-key': 'execute-failure' },
+        body: JSON.stringify({ baseRef: 'main', prompt: 'Implement' }) });
+      expect((await execute()).status).toBe(500); expect((await execute()).status).toBe(500);
+      expect(counts).toMatchObject({ schedule: 1, dispatch: 1, prepare: 0 });
+
+      Object.assign(app as unknown as Record<string, unknown>, {
+        dispatcher: { dispatch: () => Promise.resolve({}) },
+        lifecycle: { prepareReview: () => Promise.resolve({ outcome: 'review-ready', reviewBundle: bundle,
+          lifecycleSha256: 'c'.repeat(64) }), applyReview: () => { counts.review += 1;
+          return Promise.reject(new Error('review private')); } },
+      });
+      const prepared = await fetch(`${base}/api/v1/tasks/task-created/execute`, { method: 'POST',
+        headers: { 'content-type': 'application/json', 'idempotency-key': 'prepare-review' },
+        body: JSON.stringify({ baseRef: 'main', prompt: 'Prepare review' }) });
+      expect(prepared.status).toBe(200);
+      const decisionBody = JSON.stringify({ reviewId: 'review-failure', reviewerId: 'human', verdict: 'ACCEPT',
+        summary: 'Accepted', findings: [], allowNoChangeCompletion: true });
+      const decide = () => fetch(`${base}/api/v1/reviews/${handle}/decision`, { method: 'POST',
+        headers: { 'content-type': 'application/json', 'idempotency-key': 'review-failure' }, body: decisionBody });
+      expect((await decide()).status).toBe(500); expect((await decide()).status).toBe(500);
+      expect(counts.review).toBe(1);
+    } finally { await server.stop(); }
+  });
+
   it('streams redacted EventBus events over WebSocket and shuts down cleanly', async () => {
     const bus = new EventBus(); const server = new AgentHubHttpServer({ application: fakeApplication(bus), port: 0 });
     const address = await server.start(); const socket = new WebSocket(`ws://${address.host}:${String(address.port)}/api/v1/realtime`);
@@ -112,7 +212,7 @@ function fakeApplication(eventBus: EventBus): AgentHubApplication {
     agents: { listAgents: empty, getAgent: () => null }, tasks: { listTasks: empty, getTask: () => null,
       createTask: () => task }, assignments: {}, assignmentQueries: { list: empty, findById: () => null },
     events: { list: empty }, eventBus, scheduler: {}, dispatcher: {}, lifecycle: {},
-    buildTestPlan: { commands: [] }, targetBranch: 'HEAD',
+    buildTestPlan: { commands: [] }, targetBranch: 'main',
   } as unknown as AgentHubApplication;
 }
 
