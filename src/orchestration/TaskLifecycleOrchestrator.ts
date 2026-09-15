@@ -8,10 +8,12 @@ import type { TaskManager } from '../services/task-manager.js';
 import {
   GitTaskCommitError, GitWorktreeManager, createReviewEvidence,
   type BuildTestEvidencePlan, type GitWorkspaceChangeSnapshot,
-  type ReviewEvidence, type TaskMergeResult,
+  type ReviewEvidence,
 } from '../workspace/index.js';
 import { type AssignmentDispatchResult } from './AssignmentDispatcher.js';
 import { CompletionCoordinator } from './lifecycle/CompletionCoordinator.js';
+import { LifecycleConvergence } from './lifecycle/LifecycleConvergence.js';
+import { RuntimeGuard } from './lifecycle/RuntimeGuard.js';
 import { ReviewPreparationCoordinator } from './lifecycle/ReviewPreparationCoordinator.js';
 import { RevisionCoordinator, RevisionTurnError } from './lifecycle/RevisionCoordinator.js';
 import {
@@ -42,11 +44,6 @@ export type {
 } from './lifecycle/TaskLifecycleContract.js';
 
 const fences = new WeakMap<AssignmentManager, Set<string>>();
-interface LifecycleReceipt {
-  readonly mergeResult?: TaskMergeResult;
-  readonly result: TaskLifecycleReviewResult;
-}
-const receipts = new WeakMap<AssignmentManager, Map<string, LifecycleReceipt>>();
 export interface TaskLifecycleOrchestratorOptions {
   readonly taskManager: TaskManager; readonly agentRegistry: AgentRegistry;
   readonly assignmentManager: AssignmentManager; readonly agentPool: AgentPool;
@@ -66,6 +63,8 @@ export class TaskLifecycleOrchestrator {
   readonly #worktrees: GitWorktreeManager;
   readonly #reviewPreparation: ReviewPreparationCoordinator;
   readonly #completionCoordinator: CompletionCoordinator;
+  readonly #runtimeGuard: RuntimeGuard;
+  readonly #convergence: LifecycleConvergence;
   readonly #revisionCoordinator: RevisionCoordinator;
 
   public constructor(options: TaskLifecycleOrchestratorOptions) {
@@ -77,6 +76,8 @@ export class TaskLifecycleOrchestrator {
     this.#worktrees = options.worktreeManager;
     this.#reviewPreparation = new ReviewPreparationCoordinator(this.#worktrees);
     this.#completionCoordinator = new CompletionCoordinator(this.#worktrees);
+    this.#runtimeGuard = new RuntimeGuard({ pool: this.#pool, assignments: this.#assignments, tasks: this.#tasks, agents: this.#agents });
+    this.#convergence = new LifecycleConvergence(this.#assignments, this.#tasks);
     this.#revisionCoordinator = new RevisionCoordinator(this.#pool);
   }
 
@@ -102,31 +103,31 @@ export class TaskLifecycleOrchestrator {
     try { review = createReviewEvidence(bundle.buildTestEvidence, input.decision); }
     catch { throw lifecycleError('TASK_LIFECYCLE_INVALID_REQUEST'); }
     const receiptKey = lifecycleReceiptKey(bundle, review, input);
-    const receipt = receipts.get(this.#assignments)?.get(receiptKey);
+    const receipt = this.#convergence.getReceipt(receiptKey);
     if (receipt !== undefined) {
-      if (this.#isCompletionConverged(bundle.assignmentId)) return receipt.result;
-      try { this.#finalizeCompleted(bundle.assignmentId, receipt.mergeResult); }
+      if (this.#convergence.isCompletionConverged(bundle.assignmentId)) return receipt.result;
+      try { this.#convergence.finalizeCompleted(bundle.assignmentId, receipt.mergeResult); }
       catch { throw lifecycleError('TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED', receipt.mergeResult); }
       return receipt.result;
     }
     await this.#requireBundleFresh(bundle);
     if (review.verdict === 'BLOCK') {
-      await this.#shutdown(bundle); this.#finalizeFailed(bundle.assignmentId);
+      await this.#runtimeGuard.shutdown(bundle); this.#convergence.finalizeFailed(bundle.assignmentId);
       return lifecycleResult({ outcome: 'failed' as const, taskId: bundle.taskId, assignmentId: bundle.assignmentId, reviewEvidence: review });
     }
     if (review.verdict === 'REQUEST_REVISION') return this.#revise(bundle, review, input);
     if (bundle.taskCommit.outcome === 'no-changes') {
       this.#completionCoordinator.validateNoChangeCompletion(bundle, input.allowNoChangeCompletion);
       const noChangeGate = await this.#completionCoordinator.evaluateNoChangeGate(bundle, review, input.mergePolicy);
-      await this.#requireBundleFresh(bundle); await this.#shutdown(bundle);
+      await this.#requireBundleFresh(bundle); await this.#runtimeGuard.shutdown(bundle);
       const finalNoChangeGate = await this.#completionCoordinator.evaluateNoChangeGate(bundle, review, input.mergePolicy);
       this.#completionCoordinator.assertNoChangeGateIdentity(noChangeGate, finalNoChangeGate);
       const result = lifecycleResult({ outcome: 'completed-no-change' as const, taskId: bundle.taskId, reviewEvidence: review });
-      try { this.#finalizeCompleted(bundle.assignmentId); }
+      try { this.#convergence.finalizeCompleted(bundle.assignmentId); }
       catch (error) {
         if (error instanceof TaskLifecycleError &&
           error.code === 'TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED') {
-          this.#rememberReceipt(receiptKey, { result });
+          this.#convergence.rememberReceipt(receiptKey, { result });
         }
         throw error;
       }
@@ -136,15 +137,15 @@ export class TaskLifecycleOrchestrator {
     const gate = await this.#completionCoordinator.evaluateMergeGate(bundle, review, input.mergePolicy);
     if (!gate.eligible) return lifecycleResult({ outcome: 'merge-denied' as const, taskId: bundle.taskId,
       reviewEvidence: review, mergeGate: gate });
-    await this.#shutdown(bundle); this.#requirePersistentAfterShutdown(bundle);
+    await this.#runtimeGuard.shutdown(bundle); this.#runtimeGuard.requirePersistentAfterShutdown(bundle);
     const merge = await this.#completionCoordinator.merge(bundle, review, input.targetBranch, gate, input.mergePolicy);
     const result = lifecycleResult({ outcome: 'completed' as const, taskId: bundle.taskId,
       reviewEvidence: review, mergeGate: gate, mergeResult: merge });
-    try { this.#finalizeCompleted(bundle.assignmentId, merge); }
+    try { this.#convergence.finalizeCompleted(bundle.assignmentId, merge); }
     catch (error) {
       if (error instanceof TaskLifecycleError &&
         error.code === 'TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED') {
-        this.#rememberReceipt(receiptKey, { mergeResult: merge, result });
+        this.#convergence.rememberReceipt(receiptKey, { mergeResult: merge, result });
       }
       throw error;
     }
@@ -162,7 +163,7 @@ export class TaskLifecycleOrchestrator {
     try { turn = await this.#revisionCoordinator.run(revisionPlan); }
     catch (error) {
       if (!(error instanceof RevisionTurnError)) throw error;
-      try { await this.#shutdown(bundle); }
+      try { await this.#runtimeGuard.shutdown(bundle); }
       catch {
         try { this.#worktrees.quarantineWorkspace(bundle.taskId); }
         catch { /* unresolved runtime ownership remains authoritative */ }
@@ -177,7 +178,7 @@ export class TaskLifecycleOrchestrator {
         try { this.#worktrees.quarantineWorkspace(bundle.taskId); }
         catch { throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED'); }
       }
-      try { this.#suspend(bundle.assignmentId, TaskStatus.BLOCKED); }
+      try { this.#convergence.suspend(bundle.assignmentId, TaskStatus.BLOCKED); }
       catch { throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED'); }
       throw lifecycleError('TASK_LIFECYCLE_REVISION_FAILED');
     }
@@ -193,18 +194,18 @@ export class TaskLifecycleOrchestrator {
     const { dispatch, turnResult } = input;
     if (turnResult.protocol !== 'worker-result') throw lifecycleError('TASK_LIFECYCLE_UNSUPPORTED_TURN_PROTOCOL');
     if (!turnResult.protocolValid) {
-      await this.#shutdown(dispatch); this.#suspend(dispatch.assignmentId, TaskStatus.BLOCKED);
+      await this.#runtimeGuard.shutdown(dispatch); this.#convergence.suspend(dispatch.assignmentId, TaskStatus.BLOCKED);
       return lifecycleResult({ outcome: 'blocked' as const, taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
     }
     const worker = turnResult.workerResult;
     if (worker.outcome === 'FAILED') {
-      await this.#shutdown(dispatch); this.#finalizeFailed(dispatch.assignmentId);
+      await this.#runtimeGuard.shutdown(dispatch); this.#convergence.finalizeFailed(dispatch.assignmentId);
       return lifecycleResult({ outcome: 'failed' as const, taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
     }
     if (worker.outcome === 'BLOCKED' || worker.outcome === 'NEEDS_INPUT') {
-      await this.#shutdown(dispatch);
+      await this.#runtimeGuard.shutdown(dispatch);
       const target = worker.outcome === 'BLOCKED' ? TaskStatus.BLOCKED : TaskStatus.WAITING_INPUT;
-      this.#suspend(dispatch.assignmentId, target);
+      this.#convergence.suspend(dispatch.assignmentId, target);
       return lifecycleResult({ outcome: worker.outcome === 'BLOCKED' ? 'blocked' as const : 'waiting-input' as const,
         taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
     }
@@ -223,8 +224,8 @@ export class TaskLifecycleOrchestrator {
   }
 
   async #blockEvidenceIntegrity(dispatch: Readonly<AssignmentDispatchResult>): Promise<TaskLifecyclePreparationResult> {
-    await this.#shutdown(dispatch);
-    this.#suspend(dispatch.assignmentId, TaskStatus.BLOCKED);
+    await this.#runtimeGuard.shutdown(dispatch);
+    this.#convergence.suspend(dispatch.assignmentId, TaskStatus.BLOCKED);
     return lifecycleResult({ outcome: 'blocked' as const, taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
   }
 
@@ -268,38 +269,10 @@ export class TaskLifecycleOrchestrator {
     }
   }
 
-  #requirePersistentAfterShutdown(bundle: TaskReviewBundle): void {
-    const assignment = this.#assignments.getAssignment(bundle.assignmentId);
-    const task = this.#tasks.getTask(bundle.taskId);
-    const agent = this.#agents.getAgent(bundle.agentId);
-    let hash: string;
-    try { hash = this.#agents.calculateExecutionProfileHash(bundle.agentId); }
-    catch { throw lifecycleError('TASK_LIFECYCLE_STALE_PROFILE'); }
-    if (assignment === null || assignment.status !== AssignmentStatus.ACTIVE || task === null ||
-      task.status !== TaskStatus.REVIEWING || task.assignmentId !== bundle.assignmentId ||
-      task.assignedAgentId !== bundle.agentId || agent === null || agent.status !== AgentStatus.BUSY ||
-      !agent.enabled || hash !== bundle.executionProfileSha256) throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
-  }
-
   async #captureReviewSource(taskId: string): Promise<GitWorkspaceChangeSnapshot> {
     return this.#worktrees.captureWorkspaceChanges(taskId, { includePatchText: true,
       maxPatchBytes: 1024 * 1024, maxChangedPaths: 4096,
       maxFingerprintBytes: 64 * 1024 * 1024, maxIgnoredPaths: 4096 });
-  }
-
-  async #shutdown(value: Pick<AssignmentDispatchResult, 'agentId' | 'assignmentId'>): Promise<void> {
-    try { await this.#pool.shutdown(value.agentId, value.assignmentId); }
-    catch { throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED'); }
-    this.#requireCleanPool(value);
-  }
-
-  #requireCleanPool(value: Pick<AssignmentDispatchResult, 'agentId' | 'assignmentId'>): void {
-    let pool: Readonly<AgentPoolEntrySnapshot>;
-    try { pool = this.#pool.getSnapshot(value.agentId); }
-    catch { throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED'); }
-    if (pool.state !== 'IDLE' || pool.busy || pool.active || pool.reserved || pool.taskId !== undefined ||
-      pool.assignmentId !== undefined || pool.specVersion !== undefined || pool.profileHash !== undefined ||
-      pool.sessionId !== undefined) throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED');
   }
 
   #transition(taskId: string, status: TaskStatus): void {
@@ -307,36 +280,6 @@ export class TaskLifecycleOrchestrator {
     catch { if (this.#tasks.getTask(taskId)?.status !== status) {
       throw lifecycleError('TASK_LIFECYCLE_REVIEW_TRANSITION_FAILED');
     } }
-  }
-  #suspend(assignmentId: string, status: TaskStatus.BLOCKED | TaskStatus.WAITING_INPUT): void {
-    try { this.#assignments.suspendActiveAssignment(assignmentId, status); }
-    catch { throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED'); }
-  }
-  #finalizeFailed(assignmentId: string): void {
-    try { this.#assignments.finalizeFailedAssignment(assignmentId); }
-    catch { throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED'); }
-  }
-  #finalizeCompleted(assignmentId: string, merge?: TaskMergeResult): void {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try { this.#assignments.finalizeCompletedAssignment(assignmentId); } catch { /* retry exact partial state */ }
-      const assignment = this.#assignments.getAssignment(assignmentId);
-      const task = assignment === null ? null : this.#tasks.getTask(assignment.taskId);
-      if (assignment !== null && assignment.status === AssignmentStatus.COMPLETED &&
-        task?.status === TaskStatus.COMPLETED && task.assignedAgentId === null && task.assignmentId === null) return;
-    }
-    throw lifecycleError('TASK_LIFECYCLE_POST_MERGE_RECONCILIATION_REQUIRED', merge);
-  }
-  #isCompletionConverged(assignmentId: string): boolean {
-    const assignment = this.#assignments.getAssignment(assignmentId);
-    const task = assignment === null ? null : this.#tasks.getTask(assignment.taskId);
-    return assignment?.status === AssignmentStatus.COMPLETED && task?.status === TaskStatus.COMPLETED &&
-      task.assignedAgentId === null && task.assignmentId === null;
-  }
-
-  #rememberReceipt(key: string, receipt: LifecycleReceipt): void {
-    const byKey = receipts.get(this.#assignments) ?? new Map<string, LifecycleReceipt>();
-    byKey.set(key, receipt);
-    receipts.set(this.#assignments, byKey);
   }
   #withFence<T>(taskId: string, operation: () => Promise<T>): Promise<T> {
     const active = fences.get(this.#assignments) ?? new Set<string>();
