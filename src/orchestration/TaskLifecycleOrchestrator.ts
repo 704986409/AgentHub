@@ -1,4 +1,4 @@
-import { AgentStatus, AssignmentStatus, TaskStatus, type Task } from '../core/types.js';
+import { AgentStatus, AssignmentStatus, TaskStatus } from '../core/types.js';
 import type { AgentHubWorkerResult } from '../protocol/AgentHubWorkerResult.js';
 import type { AgentPool, AgentPoolEntrySnapshot } from '../runtime/AgentPool.js';
 import type { AgentProviderTurnResult } from '../runtime/providers/AgentProvider.js';
@@ -10,8 +10,9 @@ import {
   type BuildTestEvidence, type BuildTestEvidencePlan, type GitWorkspaceChangeSnapshot,
   type MergeGateDecision, type ReviewEvidence, type TaskMergeResult,
 } from '../workspace/index.js';
-import { snapshotAssignmentTurnResult, type AssignmentDispatchResult } from './AssignmentDispatcher.js';
+import { type AssignmentDispatchResult } from './AssignmentDispatcher.js';
 import { ReviewPreparationCoordinator } from './lifecycle/ReviewPreparationCoordinator.js';
+import { RevisionCoordinator, RevisionTurnError } from './lifecycle/RevisionCoordinator.js';
 import {
   TaskLifecycleError,
   isRecord,
@@ -45,7 +46,6 @@ interface LifecycleReceipt {
   readonly result: TaskLifecycleReviewResult;
 }
 const receipts = new WeakMap<AssignmentManager, Map<string, LifecycleReceipt>>();
-const maxRevisionPromptBytes = 1024 * 1024;
 export interface TaskLifecycleOrchestratorOptions {
   readonly taskManager: TaskManager; readonly agentRegistry: AgentRegistry;
   readonly assignmentManager: AssignmentManager; readonly agentPool: AgentPool;
@@ -64,6 +64,7 @@ export class TaskLifecycleOrchestrator {
   readonly #assignments: AssignmentManager; readonly #pool: AgentPool;
   readonly #worktrees: GitWorktreeManager;
   readonly #reviewPreparation: ReviewPreparationCoordinator;
+  readonly #revisionCoordinator: RevisionCoordinator;
 
   public constructor(options: TaskLifecycleOrchestratorOptions) {
     if (!isRecord(options) || !(options.worktreeManager instanceof GitWorktreeManager)) {
@@ -73,6 +74,7 @@ export class TaskLifecycleOrchestrator {
     this.#assignments = options.assignmentManager; this.#pool = options.agentPool;
     this.#worktrees = options.worktreeManager;
     this.#reviewPreparation = new ReviewPreparationCoordinator(this.#worktrees);
+    this.#revisionCoordinator = new RevisionCoordinator(this.#pool);
   }
 
   public prepareReview(request: PrepareTaskReviewRequest): Promise<TaskLifecyclePreparationResult> {
@@ -185,13 +187,14 @@ export class TaskLifecycleOrchestrator {
   async #revise(bundle: TaskReviewBundle, review: ReviewEvidence, input: ApplySnapshot): Promise<TaskLifecycleReviewResult> {
     const task = this.#tasks.getTask(bundle.taskId);
     if (task === null) throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
-    const prompt = revisionPrompt(review, task);
+    const revisionPlan = this.#revisionCoordinator.prepare(review, task, bundle);
     this.#transition(bundle.taskId, TaskStatus.REVISION_REQUIRED);
     this.#transition(bundle.taskId, TaskStatus.IMPLEMENTING);
     await this.#requireExecution(bundleToDispatch(bundle), TaskStatus.IMPLEMENTING);
-    let raw: AgentProviderTurnResult;
-    try { raw = await this.#pool.runTurn(bundle.agentId, bundle.assignmentId, { prompt, protocol: 'worker-result' }); }
-    catch {
+    let turn: AgentProviderTurnResult;
+    try { turn = await this.#revisionCoordinator.run(revisionPlan); }
+    catch (error) {
+      if (!(error instanceof RevisionTurnError)) throw error;
       try { await this.#shutdown(bundle); }
       catch {
         try { this.#worktrees.quarantineWorkspace(bundle.taskId); }
@@ -210,12 +213,6 @@ export class TaskLifecycleOrchestrator {
       try { this.#suspend(bundle.assignmentId, TaskStatus.BLOCKED); }
       catch { throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED'); }
       throw lifecycleError('TASK_LIFECYCLE_REVISION_FAILED');
-    }
-    let turn: AgentProviderTurnResult;
-    try { turn = snapshotAssignmentTurnResult(raw, 'worker-result', bundle.providerId); }
-    catch {
-      turn = { protocol: 'worker-result', protocolValid: false, providerId: bundle.providerId,
-        failure: { kind: 'schema_invalid', message: 'invalid revision result' } };
     }
     const revised = await this.#handleTurn({ dispatch: bundleToDispatch(bundle), turnResult: turn,
       buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions });
@@ -412,22 +409,6 @@ function buildPassed(evidence: BuildTestEvidence): boolean {
     command.outcome === 'passed' && command.exitCode === 0 && command.cleanupFailed !== true &&
     command.sourceStable && command.sourceAfter.status === 'captured' && command.sourceAfter.stable &&
     command.sourceVisibilityAfter.status === 'captured' && command.sourceVisibilityAfter.stable);
-}
-function revisionPrompt(review: ReviewEvidence, task: Task): string {
-  const lines = ['Apply exactly one revision for the current task.', '', `Review summary: ${review.summary}`,
-    '', 'Findings:'];
-  if (review.findings.length === 0) lines.push('(none)');
-  for (const finding of review.findings) lines.push(
-    `- [${finding.severity}] ${finding.code}: ${finding.message}${finding.path === undefined ? '' : ` (${finding.path})`}`,
-  );
-  lines.push('', 'Acceptance criteria:');
-  if (task.acceptanceCriteria.length === 0) lines.push('(none)');
-  else task.acceptanceCriteria.forEach((criterion, index) => lines.push(`${String(index + 1)}. ${criterion}`));
-  const prompt = lines.join('\n');
-  if (Buffer.byteLength(prompt, 'utf8') > maxRevisionPromptBytes) {
-    throw lifecycleError('TASK_LIFECYCLE_INVALID_REQUEST');
-  }
-  return prompt;
 }
 function rejectPreserving(error: unknown): Promise<never> {
   return Promise.resolve().then(() => { throw error; });
