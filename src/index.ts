@@ -10,3 +10,5 @@ export * from './providers/claude/index.js';
 export * from './runtime/index.js';
 export * from './workspace/index.js';
 export * from './orchestration/index.js';
+export * from './application/index.js';
+export * from './api/index.js';
