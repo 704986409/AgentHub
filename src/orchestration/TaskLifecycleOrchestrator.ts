@@ -6,11 +6,12 @@ import type { AgentRegistry } from '../services/agent-registry.js';
 import type { AssignmentManager } from '../services/assignment-manager.js';
 import type { TaskManager } from '../services/task-manager.js';
 import {
-  GitMergeError, GitTaskCommitError, GitWorktreeManager, createReviewEvidence,
-  type BuildTestEvidence, type BuildTestEvidencePlan, type GitWorkspaceChangeSnapshot,
-  type MergeGateDecision, type ReviewEvidence, type TaskMergeResult,
+  GitTaskCommitError, GitWorktreeManager, createReviewEvidence,
+  type BuildTestEvidencePlan, type GitWorkspaceChangeSnapshot,
+  type ReviewEvidence, type TaskMergeResult,
 } from '../workspace/index.js';
 import { type AssignmentDispatchResult } from './AssignmentDispatcher.js';
+import { CompletionCoordinator } from './lifecycle/CompletionCoordinator.js';
 import { ReviewPreparationCoordinator } from './lifecycle/ReviewPreparationCoordinator.js';
 import { RevisionCoordinator, RevisionTurnError } from './lifecycle/RevisionCoordinator.js';
 import {
@@ -64,6 +65,7 @@ export class TaskLifecycleOrchestrator {
   readonly #assignments: AssignmentManager; readonly #pool: AgentPool;
   readonly #worktrees: GitWorktreeManager;
   readonly #reviewPreparation: ReviewPreparationCoordinator;
+  readonly #completionCoordinator: CompletionCoordinator;
   readonly #revisionCoordinator: RevisionCoordinator;
 
   public constructor(options: TaskLifecycleOrchestratorOptions) {
@@ -74,6 +76,7 @@ export class TaskLifecycleOrchestrator {
     this.#assignments = options.assignmentManager; this.#pool = options.agentPool;
     this.#worktrees = options.worktreeManager;
     this.#reviewPreparation = new ReviewPreparationCoordinator(this.#worktrees);
+    this.#completionCoordinator = new CompletionCoordinator(this.#worktrees);
     this.#revisionCoordinator = new RevisionCoordinator(this.#pool);
   }
 
@@ -113,35 +116,11 @@ export class TaskLifecycleOrchestrator {
     }
     if (review.verdict === 'REQUEST_REVISION') return this.#revise(bundle, review, input);
     if (bundle.taskCommit.outcome === 'no-changes') {
-      if (!input.allowNoChangeCompletion || !buildPassed(bundle.buildTestEvidence) ||
-        bundle.taskCommit.headAfter !== bundle.taskCommit.baseCommit || !cleanSource(bundle.source)) {
-        throw lifecycleError('TASK_LIFECYCLE_GATE_DENIED');
-      }
-      let noChangeGate: MergeGateDecision;
-      try {
-        noChangeGate = await this.#worktrees.evaluateMergeGate(
-          bundle.taskId, bundle.buildTestEvidence, review, input.mergePolicy,
-        );
-      } catch { throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED'); }
-      if (noChangeGate.eligible || noChangeGate.reasons.length !== 1 ||
-        noChangeGate.reasons[0] !== 'NO_COMMITTED_CHANGES') {
-        throw lifecycleError('TASK_LIFECYCLE_GATE_DENIED');
-      }
+      this.#completionCoordinator.validateNoChangeCompletion(bundle, input.allowNoChangeCompletion);
+      const noChangeGate = await this.#completionCoordinator.evaluateNoChangeGate(bundle, review, input.mergePolicy);
       await this.#requireBundleFresh(bundle); await this.#shutdown(bundle);
-      let finalNoChangeGate: MergeGateDecision;
-      try {
-        finalNoChangeGate = await this.#worktrees.evaluateMergeGate(
-          bundle.taskId, bundle.buildTestEvidence, review, input.mergePolicy,
-        );
-      } catch { throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED'); }
-      if (finalNoChangeGate.eligible || finalNoChangeGate.reasons.length !== 1 ||
-        finalNoChangeGate.reasons[0] !== 'NO_COMMITTED_CHANGES' ||
-        finalNoChangeGate.changeSetSha256 !== noChangeGate.changeSetSha256 ||
-        finalNoChangeGate.sourceVisibilitySha256 !== noChangeGate.sourceVisibilitySha256 ||
-        finalNoChangeGate.buildTestEvidenceSha256 !== noChangeGate.buildTestEvidenceSha256 ||
-        finalNoChangeGate.reviewEvidenceSha256 !== noChangeGate.reviewEvidenceSha256) {
-        throw lifecycleError('TASK_LIFECYCLE_GATE_DENIED');
-      }
+      const finalNoChangeGate = await this.#completionCoordinator.evaluateNoChangeGate(bundle, review, input.mergePolicy);
+      this.#completionCoordinator.assertNoChangeGateIdentity(noChangeGate, finalNoChangeGate);
       const result = lifecycleResult({ outcome: 'completed-no-change' as const, taskId: bundle.taskId, reviewEvidence: review });
       try { this.#finalizeCompleted(bundle.assignmentId); }
       catch (error) {
@@ -154,23 +133,11 @@ export class TaskLifecycleOrchestrator {
       return result;
     }
     if (input.targetBranch === undefined) throw lifecycleError('TASK_LIFECYCLE_INVALID_REQUEST');
-    let gate: MergeGateDecision;
-    try { gate = await this.#worktrees.evaluateMergeGate(bundle.taskId, bundle.buildTestEvidence, review, input.mergePolicy); }
-    catch { throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED'); }
+    const gate = await this.#completionCoordinator.evaluateMergeGate(bundle, review, input.mergePolicy);
     if (!gate.eligible) return lifecycleResult({ outcome: 'merge-denied' as const, taskId: bundle.taskId,
       reviewEvidence: review, mergeGate: gate });
     await this.#shutdown(bundle); this.#requirePersistentAfterShutdown(bundle);
-    let merge: TaskMergeResult;
-    try { merge = await this.#worktrees.mergeTaskWorkspace({ taskId: bundle.taskId,
-      targetBranch: input.targetBranch, buildEvidence: bundle.buildTestEvidence, reviewEvidence: review,
-      gateDecision: gate, gatePolicy: input.mergePolicy }); }
-    catch (error) {
-      if (error instanceof GitMergeError &&
-        (error.code === 'GIT_MERGE_CLEANUP_FAILED' || error.code === 'GIT_MERGE_CONTRACT_VIOLATION')) {
-        throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED');
-      }
-      throw lifecycleError('TASK_LIFECYCLE_MERGE_FAILED');
-    }
+    const merge = await this.#completionCoordinator.merge(bundle, review, input.targetBranch, gate, input.mergePolicy);
     const result = lifecycleResult({ outcome: 'completed' as const, taskId: bundle.taskId,
       reviewEvidence: review, mergeGate: gate, mergeResult: merge });
     try { this.#finalizeCompleted(bundle.assignmentId, merge); }
@@ -395,20 +362,14 @@ function ownedPool(pool: Readonly<AgentPoolEntrySnapshot>, dispatch: Pick<Assign
     pool.taskId === dispatch.taskId && pool.assignmentId === dispatch.assignmentId &&
     pool.specVersion === specVersion && pool.profileHash === profileHash;
 }
-function sameSourceIdentity(left: GitWorkspaceChangeSnapshot, right: GitWorkspaceChangeSnapshot): boolean {
-  return left.taskId === right.taskId && left.branchName === right.branchName &&
-    left.baseCommit === right.baseCommit && left.headCommit === right.headCommit &&
-    left.changeSetSha256 === right.changeSetSha256 && cleanSource(right);
-}
 function cleanSource(source: GitWorkspaceChangeSnapshot): boolean {
   return !source.hasConflicts && source.conflicts.length === 0 && source.staged.changes.length === 0 &&
     source.unstaged.changes.length === 0 && source.untracked.length === 0;
 }
-function buildPassed(evidence: BuildTestEvidence): boolean {
-  return evidence.outcome === 'passed' && evidence.commands.length > 0 && evidence.commands.every((command) =>
-    command.outcome === 'passed' && command.exitCode === 0 && command.cleanupFailed !== true &&
-    command.sourceStable && command.sourceAfter.status === 'captured' && command.sourceAfter.stable &&
-    command.sourceVisibilityAfter.status === 'captured' && command.sourceVisibilityAfter.stable);
+function sameSourceIdentity(left: GitWorkspaceChangeSnapshot, right: GitWorkspaceChangeSnapshot): boolean {
+  return left.taskId === right.taskId && left.branchName === right.branchName &&
+    left.baseCommit === right.baseCommit && left.headCommit === right.headCommit &&
+    left.changeSetSha256 === right.changeSetSha256 && cleanSource(right);
 }
 function rejectPreserving(error: unknown): Promise<never> {
   return Promise.resolve().then(() => { throw error; });
