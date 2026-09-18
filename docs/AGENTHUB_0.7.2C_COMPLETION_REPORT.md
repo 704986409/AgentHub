@@ -9,7 +9,7 @@ Base tag: 0.7.2B (MUST NOT MOVE)
 Historical tags 0.7.2 / 0.7.2A: unchanged
 Release version: 0.7.2C
 Release tag: 0.7.2C
-Final SHA: pending-git-commit
+Final SHA: b26c2412f81b6c52f0a1cfe9f6f18ceef2b12173
 ```
 
 ## Exact production fixes
