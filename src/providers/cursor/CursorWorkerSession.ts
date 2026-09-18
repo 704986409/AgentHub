@@ -9,6 +9,7 @@ import {
 } from '../../protocol/AgentHubWorkerResultParser.js';
 import { resolveCursorExecutable } from './CursorExecutableResolver.js';
 import { CursorStreamParseError, CursorStreamParser } from './CursorStreamParser.js';
+import { killProcessTreeAndWait } from '../shared/ProcessCleanup.js';
 
 export interface CursorWorkerSessionOptions {
   context: AgentRuntimeContext;
@@ -85,6 +86,8 @@ export class CursorWorkerSession {
   #executablePath: string | undefined;
   #turnGeneration = 0;
   #settleActiveTurn: ((error: Error) => void) | null = null;
+  #cleanupInFlight: Promise<void> | null = null;
+  #cleanupFailed = false;
 
   public constructor(options: CursorWorkerSessionOptions) {
     this.#context = options.context;
@@ -110,6 +113,14 @@ export class CursorWorkerSession {
 
   public get sessionId(): string | undefined {
     return this.#sessionId;
+  }
+
+  public get ownsChildProcess(): boolean {
+    return this.#currentProcess !== null;
+  }
+
+  public get cleanupFailed(): boolean {
+    return this.#cleanupFailed;
   }
 
   public start(): Promise<void> {
@@ -160,12 +171,11 @@ export class CursorWorkerSession {
       throw err;
     } finally {
       this.#active = false;
-      this.#currentProcess = null;
     }
   }
 
   public async shutdown(): Promise<void> {
-    if (!this.#started) return;
+    if (!this.#started && this.#currentProcess === null) return;
 
     this.#turnGeneration += 1;
     const settle = this.#settleActiveTurn;
@@ -178,14 +188,24 @@ export class CursorWorkerSession {
         ),
       );
     }
+    if (this.#cleanupInFlight !== null) {
+      await this.#cleanupInFlight;
+      this.#cleanupInFlight = null;
+    }
     if (this.#currentProcess !== null) {
-      await this.#killProcessTree(this.#currentProcess);
-      this.#currentProcess = null;
+      await this.#releaseOwnedProcess(this.#currentProcess);
+    }
+
+    if (this.#currentProcess !== null) {
+      this.#cleanupRequired = true;
+      this.#active = false;
+      return;
     }
 
     this.#started = false;
     this.#active = false;
     this.#cleanupRequired = false;
+    this.#cleanupFailed = false;
     this.#sessionId = undefined;
   }
 
@@ -224,8 +244,11 @@ export class CursorWorkerSession {
         settled = true;
         this.#settleActiveTurn = null;
         clearTimeout(timer);
-        reject(error);
-        void this.#killProcessTree(child);
+        const work = (async () => {
+          await this.#releaseOwnedProcess(child);
+          reject(error);
+        })();
+        this.#cleanupInFlight = work;
       };
 
       this.#settleActiveTurn = settleFatal;
@@ -235,6 +258,7 @@ export class CursorWorkerSession {
         settled = true;
         this.#settleActiveTurn = null;
         clearTimeout(timer);
+        if (this.#currentProcess === child) this.#currentProcess = null;
         resolve(value);
       };
 
@@ -307,10 +331,10 @@ export class CursorWorkerSession {
       );
     }
 
-    if (outcome.exitCode !== 0 && outcome.exitCode !== null) {
+    if (outcome.exitCode !== 0 || outcome.signal !== null) {
       throw new CursorWorkerSessionError(
         'CURSOR_WORKER_SESSION_PROCESS_FAILED',
-        `Cursor process exited with code ${String(outcome.exitCode)}: ${stderrText.slice(0, 1024)}`,
+        `Cursor process failed (exitCode=${String(outcome.exitCode)}, signal=${String(outcome.signal)}): ${stderrText.slice(0, 1024)}`,
       );
     }
 
@@ -343,36 +367,13 @@ export class CursorWorkerSession {
       : new CursorWorkerSessionError('CURSOR_WORKER_SESSION_PROTOCOL', String(err));
   }
 
-  async #killProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
-    if (child.pid === undefined) return;
-    const pid = child.pid;
-
-    if (process.platform === 'win32') {
-      try {
-        const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
-          shell: false,
-          windowsHide: true,
-        });
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, this.#stopTimeoutMs);
-          killer.on('exit', () => {
-            clearTimeout(timer);
-            resolve();
-          });
-          killer.on('error', () => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
-      } catch {
-        // ignore fallback
-      }
+  async #releaseOwnedProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
+    const cleanup = await killProcessTreeAndWait(child, this.#stopTimeoutMs);
+    if (cleanup.status === 'exited') {
+      if (this.#currentProcess === child) this.#currentProcess = null;
+      return;
     }
-
-    try {
-      child.kill('SIGKILL');
-    } catch {
-      // ignore
-    }
+    this.#cleanupFailed = true;
+    this.#cleanupRequired = true;
   }
 }

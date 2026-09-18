@@ -106,14 +106,10 @@ function parseKnownGrammar(trimmed: string): CursorModelDto[] {
     return parseJsonModels(json);
   }
 
-  if (looksLikeHelpOrBanner(trimmed)) {
-    throw new CursorModelDiscoveryError(
-      'CURSOR_MODEL_DISCOVERY_MALFORMED',
-      'Cursor native model discovery output is not a known model grammar',
-    );
-  }
-
-  return parseLineList(trimmed);
+  throw new CursorModelDiscoveryError(
+    'CURSOR_MODEL_DISCOVERY_MALFORMED',
+    'Cursor native model discovery output is not a known JSON grammar',
+  );
 }
 
 function parseJsonModels(json: unknown): CursorModelDto[] {
@@ -134,11 +130,6 @@ function parseJsonModels(json: unknown): CursorModelDto[] {
     'CURSOR_MODEL_DISCOVERY_MALFORMED',
     'Cursor native model discovery JSON is not a known schema',
   );
-}
-
-function parseLineList(trimmed: string): CursorModelDto[] {
-  const lines = trimmed.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line.length > 0);
-  return parseModelItems(lines);
 }
 
 function parseModelItems(rawList: readonly unknown[]): CursorModelDto[] {
@@ -217,9 +208,4 @@ function firstString(record: Record<string, unknown>, keys: readonly string[]): 
     if (typeof value === 'string') return value;
   }
   return undefined;
-}
-
-function looksLikeHelpOrBanner(text: string): boolean {
-  const first = text.split(/\r?\n/u).map((line) => line.trim()).find((line) => line.length > 0) ?? '';
-  return /^(?:usage:|error:|warning:|#|options:|commands:)/iu.test(first);
 }

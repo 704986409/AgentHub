@@ -9,6 +9,7 @@ import {
 } from '../../protocol/AgentHubWorkerResultParser.js';
 import { resolveAntigravityExecutable } from './AntigravityExecutableResolver.js';
 import { AntigravityStreamParseError, AntigravityStreamParser } from './AntigravityStreamParser.js';
+import { killProcessTreeAndWait } from '../shared/ProcessCleanup.js';
 
 export const ANTIGRAVITY_CONVERSATION_RESUME_FLAG = '--conversation';
 
@@ -90,6 +91,8 @@ export class AntigravityWorkerSession {
   #stdoutListener: ((chunk: Buffer | string) => void) | null = null;
   #stderrListener: ((chunk: Buffer | string) => void) | null = null;
   #settleActiveTurn: ((error: Error) => void) | null = null;
+  #cleanupInFlight: Promise<void> | null = null;
+  #cleanupFailed = false;
 
   public constructor(options: AntigravityWorkerSessionOptions) {
     this.#context = options.context;
@@ -119,6 +122,14 @@ export class AntigravityWorkerSession {
 
   public get sessionId(): string | undefined {
     return this.#conversationId;
+  }
+
+  public get ownsChildProcess(): boolean {
+    return this.#process !== null;
+  }
+
+  public get cleanupFailed(): boolean {
+    return this.#cleanupFailed;
   }
 
   public start(): Promise<void> {
@@ -173,7 +184,7 @@ export class AntigravityWorkerSession {
   }
 
   public async shutdown(): Promise<void> {
-    if (!this.#started) return;
+    if (!this.#started && this.#process === null) return;
 
     this.#turnGeneration += 1;
     const settle = this.#settleActiveTurn;
@@ -187,14 +198,24 @@ export class AntigravityWorkerSession {
       );
     }
     this.#detachListeners();
+    if (this.#cleanupInFlight !== null) {
+      await this.#cleanupInFlight;
+      this.#cleanupInFlight = null;
+    }
     if (this.#process !== null) {
-      await this.#killProcessTree(this.#process);
-      this.#process = null;
+      await this.#releaseOwnedProcess(this.#process);
+    }
+
+    if (this.#process !== null) {
+      this.#cleanupRequired = true;
+      this.#active = false;
+      return;
     }
 
     this.#started = false;
     this.#active = false;
     this.#cleanupRequired = false;
+    this.#cleanupFailed = false;
     this.#conversationId = undefined;
   }
 
@@ -246,9 +267,11 @@ export class AntigravityWorkerSession {
         this.#settleActiveTurn = null;
         clearTimeout(timer);
         this.#detachListeners();
-        if (generation === this.#turnGeneration) this.#process = null;
-        reject(error);
-        void this.#killProcessTree(child);
+        const work = (async () => {
+          await this.#releaseOwnedProcess(child);
+          reject(error);
+        })();
+        this.#cleanupInFlight = work;
       };
 
       this.#settleActiveTurn = settleFatal;
@@ -259,6 +282,9 @@ export class AntigravityWorkerSession {
         this.#settleActiveTurn = null;
         clearTimeout(timer);
         this.#detachListeners();
+        if (child.exitCode !== null || child.signalCode != null) {
+          if (this.#process === child) this.#process = null;
+        }
         resolve(value);
       };
 
@@ -315,7 +341,6 @@ export class AntigravityWorkerSession {
       const onExit = (exitCode: number | null): void => {
         if (generation !== this.#turnGeneration) return;
         child.off('error', onError);
-        this.#process = null;
         settleOk({ exitCode });
       };
       child.once('error', onError);
@@ -400,36 +425,13 @@ export class AntigravityWorkerSession {
       : new AntigravityWorkerSessionError('ANTIGRAVITY_WORKER_SESSION_PROTOCOL', String(err));
   }
 
-  async #killProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
-    if (child.pid === undefined) return;
-    const pid = child.pid;
-
-    if (process.platform === 'win32') {
-      try {
-        const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
-          shell: false,
-          windowsHide: true,
-        });
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, this.#stopTimeoutMs);
-          killer.on('exit', () => {
-            clearTimeout(timer);
-            resolve();
-          });
-          killer.on('error', () => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
-      } catch {
-        // fallback
-      }
+  async #releaseOwnedProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
+    const cleanup = await killProcessTreeAndWait(child, this.#stopTimeoutMs);
+    if (cleanup.status === 'exited') {
+      if (this.#process === child) this.#process = null;
+      return;
     }
-
-    try {
-      child.kill('SIGKILL');
-    } catch {
-      // ignore
-    }
+    this.#cleanupFailed = true;
+    this.#cleanupRequired = true;
   }
 }

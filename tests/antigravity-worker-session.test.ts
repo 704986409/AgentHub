@@ -186,8 +186,8 @@ describe('Antigravity worker session & components', () => {
 gemini-1.5-pro
 `;
     const parsedText = parseAntigravityModelsOutput(textOutput);
-    expect(parsedText.modelDiscovery).toBe('native');
-    expect(parsedText.models.map((m: { modelId: string }) => m.modelId)).toEqual(['gemini-2.0-flash', 'gemini-1.5-pro']);
+    expect(parsedText.modelDiscovery).toBe('unavailable');
+    expect(parsedText.models).toEqual([]);
   }, 5_000);
 
   it('AntigravityCapabilityDetector returns structured report', () => {

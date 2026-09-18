@@ -131,6 +131,15 @@ export class AntigravityCapabilityDetector {
         checkedAt,
       });
     }
+    if (helpRes.error !== undefined || helpRes.exitCode !== 0) {
+      return this.#report({
+        usable: false,
+        installed: true,
+        version,
+        status: 'PROBE_FAILED',
+        checkedAt,
+      });
+    }
 
     const helpText = `${helpRes.stdout}\n${helpRes.stderr}`;
     const streamOk = ANTIGRAVITY_STREAM_TOKENS.every((token) => helpText.includes(token));

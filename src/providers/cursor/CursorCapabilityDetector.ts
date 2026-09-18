@@ -122,6 +122,15 @@ export class CursorCapabilityDetector {
         checkedAt,
       });
     }
+    if (helpRes.error !== undefined || helpRes.exitCode !== 0) {
+      return this.#report({
+        usable: false,
+        installed: true,
+        version,
+        status: 'PROBE_FAILED',
+        checkedAt,
+      });
+    }
 
     const helpText = `${helpRes.stdout}\n${helpRes.stderr}`;
     const missingRuntime = CURSOR_HELP_REQUIRED_TOKENS.filter((token) => !helpText.includes(token));

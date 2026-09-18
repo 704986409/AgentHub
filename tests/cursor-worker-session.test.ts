@@ -194,8 +194,8 @@ describe('Cursor worker session & components', () => {
 cursor-fast
 `;
     const parsedText = parseCursorModelsOutput(textOutput);
-    expect(parsedText.modelDiscovery).toBe('native');
-    expect(parsedText.models.map((m: { modelId: string }) => m.modelId)).toEqual(['cursor-small', 'cursor-fast']);
+    expect(parsedText.modelDiscovery).toBe('unavailable');
+    expect(parsedText.models).toEqual([]);
   }, 5_000);
 
   it('CursorCapabilityDetector returns structured report', () => {

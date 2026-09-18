@@ -212,7 +212,7 @@ describe('Cursor 0.7.2A fail-closed runtime', () => {
       exitCode: 1,
     }));
     await session.start();
-    await expect(session.runTurn({ prompt: 't', timeoutMs: 1000 })).rejects.toThrow(/exited with code 1/u);
+    await expect(session.runTurn({ prompt: 't', timeoutMs: 1000 })).rejects.toThrow(/exitCode=1/u);
     await session.shutdown();
   }, TIMEOUT);
 
@@ -222,7 +222,7 @@ describe('Cursor 0.7.2A fail-closed runtime', () => {
       exitCode: 2,
     }));
     await session.start();
-    await expect(session.runTurn({ prompt: 't', timeoutMs: 1000 })).rejects.toThrow(/exited with code 2/u);
+    await expect(session.runTurn({ prompt: 't', timeoutMs: 1000 })).rejects.toThrow(/exitCode=2/u);
     await session.shutdown();
   }, TIMEOUT);
 
