@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import type { AgentHubApplication } from '../application/index.js';
-import { agentDto, assignmentDto, eventDto, lifecycleDto, projectDto, reviewReadyDto,
-  snapshotCreateTask, snapshotExecuteCommand, snapshotReviewDecision, taskDto } from './ApiDtos.js';
+import { agentDeleteDto, agentDto, assignmentDto, eventDto, lifecycleDto, projectDto, reviewReadyDto,
+  snapshotCreateAgent, snapshotCreateTask, snapshotEmptyObject, snapshotExecuteCommand,
+  snapshotReviewDecision, snapshotUpdateAgent, taskDto } from './ApiDtos.js';
 import { apiError, normalizeApiError } from './ApiErrors.js';
 import { IdempotencyStore, requestFingerprint } from './IdempotencyStore.js';
 import { RealtimeHub } from './RealtimeHub.js';
@@ -69,7 +70,9 @@ export class AgentHubHttpServer {
       let result: { status: number; data: unknown };
       if (method === 'GET') result = this.#get(url);
       else if (method === 'POST') result = await this.#post(url.pathname, request);
-      else throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+      else if (method === 'PUT') result = await this.#put(url.pathname, request);
+      else if (method === 'DELETE') result = await this.#delete(url.pathname, request);
+      else throw apiError('AGENTHUB_API_METHOD_NOT_ALLOWED', 405);
       this.#write(response, result.status, { ok: true, data: result.data, requestId });
     } catch (error) {
       const normalized = normalizeApiError(error);
@@ -82,7 +85,7 @@ export class AgentHubHttpServer {
     noUnknownQuery(url, url.pathname === '/api/v1/events'
       ? ['limit', 'after', 'projectId', 'agentId', 'taskId', 'assignmentId', 'eventType'] : []);
     const path = url.pathname;
-    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.0' });
+    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.1' });
     if (path === '/api/v1/state') return ok({ projects: this.#app.projects.list().map(projectDto),
       agents: this.#app.agents.listAgents().map(agentDto), tasks: this.#app.tasks.listTasks().map(taskDto),
       assignments: this.#app.assignmentQueries.list().map(assignmentDto) });
@@ -105,9 +108,28 @@ export class AgentHubHttpServer {
 
   async #post(path: string, request: IncomingMessage): Promise<{ status: number; data: unknown }> {
     const body = await readJson(request, this.#maxBodyBytes);
+    if (path === '/api/v1/agents') {
+      const input = snapshotCreateAgent(body);
+      return this.#mutate(request, 'POST', path, input, () =>
+        Promise.resolve(agentDto(this.#app.agentManagement.createAgent(input))), 201);
+    }
+    const enable = /^\/api\/v1\/agents\/([^/]+)\/enable$/u.exec(path);
+    const disable = /^\/api\/v1\/agents\/([^/]+)\/disable$/u.exec(path);
+    if (enable !== null) {
+      snapshotEmptyObject(body);
+      const agentId = decodeURIComponent(enable[1] ?? '');
+      return this.#mutate(request, 'POST', path, {}, () =>
+        Promise.resolve(agentDto(this.#app.agentManagement.enableAgent(agentId))));
+    }
+    if (disable !== null) {
+      snapshotEmptyObject(body);
+      const agentId = decodeURIComponent(disable[1] ?? '');
+      return this.#mutate(request, 'POST', path, {}, () =>
+        Promise.resolve(agentDto(this.#app.agentManagement.disableAgent(agentId))));
+    }
     if (path === '/api/v1/tasks') {
       const input = snapshotCreateTask(body);
-      return this.#mutate(request, path, body, () => {
+      return this.#mutate(request, 'POST', path, body, () => {
         if (this.#app.projects.findById(input.projectId) === null) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
         return Promise.resolve(taskDto(this.#app.tasks.createTask(input)));
       }, 201);
@@ -116,7 +138,7 @@ export class AgentHubHttpServer {
     const review = /^\/api\/v1\/reviews\/([^/]+)\/decision$/u.exec(path);
     if (execute !== null) {
       const taskId = decodeURIComponent(execute[1] ?? ''); const input = snapshotExecuteCommand(body);
-      return this.#mutate(request, path, body, async () => {
+      return this.#mutate(request, 'POST', path, body, async () => {
         if (this.#app.tasks.getTask(taskId) === null) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
         const reservation = this.#app.scheduler.scheduleTask({ taskId });
         if (reservation.outcome !== 'reserved') throw apiError('AGENTHUB_API_CONFLICT', 409);
@@ -130,7 +152,7 @@ export class AgentHubHttpServer {
     }
     if (review !== null) {
       const reviewHandle = decodeURIComponent(review[1] ?? ''); const input = snapshotReviewDecision(body);
-      return this.#mutate(request, path, body, async () => {
+      return this.#mutate(request, 'POST', path, body, async () => {
         this.#reviews.claim(reviewHandle);
         try {
           const bundle = this.#reviews.resolve(reviewHandle);
@@ -147,11 +169,30 @@ export class AgentHubHttpServer {
     throw apiError('AGENTHUB_API_NOT_FOUND', 404);
   }
 
-  async #mutate(request: IncomingMessage, path: string, body: unknown,
+  async #put(path: string, request: IncomingMessage): Promise<{ status: number; data: unknown }> {
+    const match = /^\/api\/v1\/agents\/([^/]+)$/u.exec(path);
+    if (match === null) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+    const body = await readJson(request, this.#maxBodyBytes);
+    const input = snapshotUpdateAgent(body);
+    const agentId = decodeURIComponent(match[1] ?? '');
+    return this.#mutate(request, 'PUT', path, input, () =>
+      Promise.resolve(agentDto(this.#app.agentManagement.updateAgent(agentId, input))));
+  }
+
+  async #delete(path: string, request: IncomingMessage): Promise<{ status: number; data: unknown }> {
+    const match = /^\/api\/v1\/agents\/([^/]+)$/u.exec(path);
+    if (match === null) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+    await assertNoBody(request);
+    const agentId = decodeURIComponent(match[1] ?? '');
+    return this.#mutate(request, 'DELETE', path, {}, () =>
+      Promise.resolve(agentDeleteDto(this.#app.agentManagement.deleteAgent(agentId))));
+  }
+
+  async #mutate(request: IncomingMessage, method: string, path: string, body: unknown,
     operation: () => Promise<unknown>, status = 200): Promise<{ status: number; data: unknown }> {
     const key = request.headers['idempotency-key'];
     if (typeof key !== 'string' || key.length === 0 || key.length > 256) throw apiError('AGENTHUB_API_IDEMPOTENCY_KEY_REQUIRED', 400);
-    const data = await this.#idempotency.execute(key, requestFingerprint('POST', path, body), operation);
+    const data = await this.#idempotency.execute(key, requestFingerprint(method, path, body), operation);
     return { status, data };
   }
 
@@ -174,6 +215,13 @@ export class AgentHubHttpServer {
 }
 
 function ok(data: unknown) { return { status: 200, data }; }
+async function assertNoBody(request: IncomingMessage): Promise<void> {
+  const length = request.headers['content-length'];
+  if (length !== undefined && length !== '0') throw apiError('AGENTHUB_API_INVALID_REQUEST', 400);
+  for await (const chunk of request) {
+    if (Buffer.from(chunk as Uint8Array).length > 0) throw apiError('AGENTHUB_API_INVALID_REQUEST', 400);
+  }
+}
 function noUnknownQuery(url: URL, allowed: readonly string[]): void {
   for (const key of url.searchParams.keys()) if (!allowed.includes(key) || url.searchParams.getAll(key).length !== 1) {
     throw apiError('AGENTHUB_API_INVALID_REQUEST', 400);

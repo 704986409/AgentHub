@@ -7,7 +7,7 @@ import { AgentScheduler, AssignmentDispatcher, TaskLifecycleOrchestrator } from 
 import { SqliteAgentRepository, SqliteAssignmentRepository, SqliteEventRepository,
   SqliteProjectRepository, SqliteTaskRepository } from '../repositories/index.js';
 import { AgentPool, AgentProviderFactory, ClaudeAgentProvider, CodexAgentProvider } from '../runtime/index.js';
-import { AgentProfileManager, AgentRegistry, AssignmentManager, TaskManager, TaskStateMachine } from '../services/index.js';
+import { AgentManagementService, AgentProfileManager, AgentRegistry, AssignmentManager, TaskManager, TaskStateMachine } from '../services/index.js';
 import { GitCommandRunner, GitWorktreeManager, type GitCommandRunnerLike } from '../workspace/index.js';
 import type { AgentHubApplication } from './AgentHubApplication.js';
 
@@ -62,12 +62,16 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
   }
   const scheduler = new AgentScheduler({ taskManager: tasks, agentRegistry: agents, providerFactory,
     agentPool: pool, assignmentManager: assignments });
+  const agentManagement = new AgentManagementService({
+    agentRegistry: agents, agentPool: pool, providerFactory, projects: projectRepository,
+    assignments: assignmentRepository, tasks,
+  });
   const worktrees = await GitWorktreeManager.open({ repositoryRoot });
   const dispatcher = new AssignmentDispatcher({ taskManager: tasks, agentRegistry: agents,
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
   const lifecycle = new TaskLifecycleOrchestrator({ taskManager: tasks, agentRegistry: agents,
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
-  const application: AgentHubApplication = Object.freeze({ projects: projectRepository, agents, tasks,
+  const application: AgentHubApplication = Object.freeze({ projects: projectRepository, agents, agentManagement, tasks,
     assignments, assignmentQueries: assignmentRepository, events, eventBus, scheduler, dispatcher, lifecycle,
     buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }),

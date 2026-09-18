@@ -1,10 +1,11 @@
-import { TaskComplexity, TaskRisk, type Agent, type AgentHubEvent,
+import { AgentAuthority, TaskComplexity, TaskRisk, type Agent, type AgentHubEvent,
   type Assignment, type Project, type Task } from '../core/types.js';
 import type { TaskLifecycleReviewResult, TaskReviewBundle } from '../orchestration/TaskLifecycleOrchestrator.js';
 import type { CreateTaskInput } from '../repositories/interfaces.js';
 import type { DomainEvent } from '../events/event-bus.js';
 import { redactEventValue } from '../events/event-redaction.js';
 import type { ReviewDecisionInput, ReviewFindingInput, ReviewFindingSeverity, ReviewVerdict } from '../workspace/index.js';
+import type { CreateManagedAgentInput, UpdateManagedAgentInput, AgentDeleteResult } from '../services/agent-management-service.js';
 import { apiError } from './ApiErrors.js';
 
 const encoder = new TextEncoder();
@@ -26,7 +27,7 @@ export function projectDto(value: Project) {
 }
 export function agentDto(value: Agent) {
   return frozen({ agentId: value.id, projectId: value.projectId, name: value.name, providerId: value.provider,
-    position: value.position, status: value.status, allowedComplexities: [...value.allowedComplexities],
+    modelId: value.model, position: value.position, status: value.status, allowedComplexities: [...value.allowedComplexities],
     allowedRiskLevels: [...value.allowedRiskLevels], capabilities: [...value.capabilities],
     specialties: [...value.specialties], authority: value.authority, routingPriority: value.routingPriority,
     enabled: value.enabled, createdAt: value.createdAt, updatedAt: value.updatedAt });
@@ -78,6 +79,54 @@ export function lifecycleDto(result: Readonly<TaskLifecycleReviewResult>): unkno
       ? record.reviewEvidence.reviewEvidenceSha256 : undefined,
     merge: isRecord(record.mergeResult) ? publicValue(record.mergeResult) : undefined,
     mergeGate: isRecord(record.mergeGate) ? publicValue(record.mergeGate) : undefined });
+}
+
+export function agentDeleteDto(value: AgentDeleteResult) {
+  return frozen({ agentId: value.agentId, deleted: true as const });
+}
+
+export function snapshotCreateAgent(value: unknown): Readonly<CreateManagedAgentInput> {
+  const record = exactRecord(value, ['projectId', 'name', 'providerId', 'modelId', 'position',
+    'allowedComplexities', 'allowedRiskLevels', 'capabilities', 'specialties', 'authority',
+    'routingPriority', 'enabled']);
+  if (typeof record.enabled !== 'boolean') invalid();
+  return frozen({
+    projectId: nullableProjectId(record.projectId),
+    name: exactBoundedText(record.name, 256),
+    providerId: exactBoundedText(record.providerId, 128),
+    modelId: exactBoundedText(record.modelId, 512),
+    position: exactBoundedText(record.position, 256),
+    allowedComplexities: enumArray(record.allowedComplexities, Object.values(TaskComplexity)),
+    allowedRiskLevels: enumArray(record.allowedRiskLevels, Object.values(TaskRisk)),
+    capabilities: uniqueStringArray(record.capabilities, 256, 512),
+    specialties: uniqueStringArray(record.specialties, 256, 512),
+    authority: exactEnum(record.authority, Object.values(AgentAuthority)),
+    routingPriority: exactPriority(record.routingPriority),
+    enabled: record.enabled,
+  });
+}
+
+export function snapshotUpdateAgent(value: unknown): Readonly<UpdateManagedAgentInput> {
+  const record = exactRecord(value, ['name', 'providerId', 'modelId', 'position',
+    'allowedComplexities', 'allowedRiskLevels', 'capabilities', 'specialties', 'authority',
+    'routingPriority']);
+  return frozen({
+    name: exactBoundedText(record.name, 256),
+    providerId: exactBoundedText(record.providerId, 128),
+    modelId: exactBoundedText(record.modelId, 512),
+    position: exactBoundedText(record.position, 256),
+    allowedComplexities: enumArray(record.allowedComplexities, Object.values(TaskComplexity)),
+    allowedRiskLevels: enumArray(record.allowedRiskLevels, Object.values(TaskRisk)),
+    capabilities: uniqueStringArray(record.capabilities, 256, 512),
+    specialties: uniqueStringArray(record.specialties, 256, 512),
+    authority: exactEnum(record.authority, Object.values(AgentAuthority)),
+    routingPriority: exactPriority(record.routingPriority),
+  });
+}
+
+export function snapshotEmptyObject(value: unknown): Readonly<Record<string, never>> {
+  exactRecord(value, []);
+  return frozen({});
 }
 
 export function snapshotCreateTask(value: unknown): Readonly<CreateTaskInput> {
@@ -149,6 +198,35 @@ function boundedText(value: unknown, maxBytes: number, nonBlank: boolean): strin
   if (typeof value !== 'string' || value.includes('\0') || encoder.encode(value).byteLength > maxBytes ||
     (nonBlank && value.trim().length === 0)) invalid();
   return value;
+}
+function exactBoundedText(value: unknown, maxBytes: number): string {
+  if (typeof value !== 'string' || value.includes('\0') || encoder.encode(value).byteLength > maxBytes ||
+    value.trim().length === 0 || value !== value.trim()) invalid();
+  return value;
+}
+function nullableProjectId(value: unknown): string | null {
+  if (value === null) return null;
+  return exactBoundedText(value, 256);
+}
+function exactEnum<T extends string>(value: unknown, allowed: readonly T[]): T {
+  if (typeof value !== 'string' || !allowed.includes(value as T)) invalid();
+  return value as T;
+}
+function exactPriority(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) invalid();
+  return value;
+}
+function enumArray<T extends string>(value: unknown, allowed: readonly T[]): T[] {
+  if (!Array.isArray(value) || value.length > 256) invalid();
+  const items = value.map((item) => exactEnum(item, allowed));
+  if (new Set(items).size !== items.length) invalid();
+  return items;
+}
+function uniqueStringArray(value: unknown, maxItems: number, maxItemBytes: number): string[] {
+  if (!Array.isArray(value) || value.length > maxItems) invalid();
+  const items = value.map((item) => exactBoundedText(item, maxItemBytes));
+  if (new Set(items).size !== items.length) invalid();
+  return items;
 }
 function stringArray(value: unknown, maxItems: number, maxItemBytes: number): string[] {
   if (value === undefined) return [];

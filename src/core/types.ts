@@ -69,6 +69,7 @@ export enum AgentAuthority {
 export enum DomainEventType {
   AGENT_CREATED = 'AgentCreated',
   AGENT_UPDATED = 'AgentUpdated',
+  AGENT_DELETED = 'AgentDeleted',
   AGENT_LOCKED = 'AgentLocked',
   AGENT_UNLOCKED = 'AgentUnlocked',
   TASK_CREATED = 'TaskCreated',

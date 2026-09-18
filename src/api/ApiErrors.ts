@@ -10,6 +10,7 @@ export type ApiErrorCode =
   | 'AGENTHUB_API_REVIEW_HANDLE_EXPIRED'
   | 'AGENTHUB_API_CONFLICT'
   | 'AGENTHUB_API_LIFECYCLE_DENIED'
+  | 'AGENTHUB_API_PROVIDER_UNAVAILABLE'
   | 'AGENTHUB_API_RUNTIME_RECONCILIATION_REQUIRED'
   | 'AGENTHUB_API_INTERNAL';
 
@@ -27,8 +28,11 @@ export function apiError(code: ApiErrorCode, status: number): ApiError {
 export function normalizeApiError(error: unknown): ApiError {
   if (error instanceof ApiError) return error;
   const code = isRecord(error) && typeof error.code === 'string' ? error.code : '';
-  if (code.includes('RUNTIME_RECONCILIATION')) {
+  if (code.includes('RECONCILIATION')) {
     return apiError('AGENTHUB_API_RUNTIME_RECONCILIATION_REQUIRED', 503);
+  }
+  if (code.includes('PROVIDER_UNAVAILABLE')) {
+    return apiError('AGENTHUB_API_PROVIDER_UNAVAILABLE', 422);
   }
   if (code.includes('BUSY') || code.includes('STALE') || code.includes('CONFLICT') ||
     code.includes('OWNERSHIP') || code.includes('ALREADY')) return apiError('AGENTHUB_API_CONFLICT', 409);
@@ -54,6 +58,7 @@ function safeApiMessage(code: ApiErrorCode): string {
     AGENTHUB_API_REVIEW_HANDLE_EXPIRED: 'Review handle is unavailable or expired',
     AGENTHUB_API_CONFLICT: 'Request conflicts with current state',
     AGENTHUB_API_LIFECYCLE_DENIED: 'Lifecycle operation was denied',
+    AGENTHUB_API_PROVIDER_UNAVAILABLE: 'Runtime provider is unavailable',
     AGENTHUB_API_RUNTIME_RECONCILIATION_REQUIRED: 'Runtime state requires reconciliation',
     AGENTHUB_API_INTERNAL: 'Internal server error',
   };

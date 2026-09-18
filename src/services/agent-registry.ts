@@ -14,7 +14,16 @@ export class AgentRegistry {
 
   public createAgent(input: CreateAgentInput, userRules = ''): Agent {
     const agent = this.repository.create(input);
-    this.profiles.writeProfile(agent, userRules);
+    try {
+      this.profiles.writeProfile(agent, userRules);
+    } catch (error) {
+      try {
+        this.repository.delete(agent.id);
+      } catch {
+        throw reconciliationRequired();
+      }
+      throw error;
+    }
     this.eventBus?.publish({ eventType: DomainEventType.AGENT_CREATED, agentId: agent.id, projectId: agent.projectId, payload: agent });
     return agent;
   }
@@ -29,22 +38,47 @@ export class AgentRegistry {
 
   public updateAgent(id: string, input: UpdateAgentInput, userRules?: string): Agent {
     const previous = this.repository.findById(id);
+    if (previous === null) throw new Error(`Agent ${id} was not found`);
+    const previousRules = this.profiles.userRules(id);
     const agent = this.repository.update(id, input);
-    const rules = userRules ?? this.profiles.userRules(id);
-    this.profiles.writeProfile(agent, rules);
+    const rules = userRules ?? previousRules;
+    try {
+      this.profiles.writeProfile(agent, rules);
+    } catch (error) {
+      try {
+        this.repository.update(id, {
+          name: previous.name,
+          provider: previous.provider,
+          model: previous.model,
+          position: previous.position,
+          status: previous.status,
+          allowedComplexities: previous.allowedComplexities,
+          allowedRiskLevels: previous.allowedRiskLevels,
+          capabilities: previous.capabilities,
+          specialties: previous.specialties,
+          authority: previous.authority,
+          routingPriority: previous.routingPriority,
+          enabled: previous.enabled,
+        });
+        this.profiles.writeProfile(previous, previousRules);
+      } catch {
+        throw reconciliationRequired();
+      }
+      throw error;
+    }
     this.eventBus?.publish({
       eventType: DomainEventType.AGENT_UPDATED,
       agentId: agent.id,
       projectId: agent.projectId,
-      oldStatus: input.status === undefined ? undefined : previous?.status,
+      oldStatus: input.status === undefined ? undefined : previous.status,
       newStatus: input.status,
       payload: { changes: input },
     });
-    if (input.status !== undefined && input.status !== previous?.status) {
+    if (input.status !== undefined && input.status !== previous.status) {
       this.eventBus?.publish({
         eventType: input.status === AgentStatus.BUSY ? DomainEventType.AGENT_LOCKED : DomainEventType.AGENT_UNLOCKED,
         agentId: agent.id,
-        oldStatus: previous?.status,
+        oldStatus: previous.status,
         newStatus: input.status,
       });
     }
@@ -52,8 +86,47 @@ export class AgentRegistry {
   }
 
   public deleteAgent(id: string): void {
+    const previous = this.repository.findById(id);
+    if (previous === null) throw new Error(`Agent ${id} was not found`);
+    let previousRules = '';
+    try {
+      previousRules = this.profiles.userRules(id);
+    } catch {
+      previousRules = '';
+    }
     this.repository.delete(id);
-    this.profiles.removeProfile(id);
+    try {
+      this.profiles.removeProfile(id);
+    } catch (error) {
+      try {
+        this.repository.create({
+          id: previous.id,
+          projectId: previous.projectId,
+          name: previous.name,
+          provider: previous.provider,
+          model: previous.model,
+          position: previous.position,
+          status: previous.status,
+          allowedComplexities: previous.allowedComplexities,
+          allowedRiskLevels: previous.allowedRiskLevels,
+          capabilities: previous.capabilities,
+          specialties: previous.specialties,
+          authority: previous.authority,
+          routingPriority: previous.routingPriority,
+          enabled: previous.enabled,
+        });
+        this.profiles.writeProfile(previous, previousRules);
+      } catch {
+        throw reconciliationRequired();
+      }
+      throw error;
+    }
+    this.eventBus?.publish({
+      eventType: DomainEventType.AGENT_DELETED,
+      agentId: previous.id,
+      projectId: previous.projectId,
+      payload: { deleted: true },
+    });
   }
 
   public enableAgent(id: string): Agent {
@@ -80,4 +153,10 @@ export class AgentRegistry {
     if (agent === null) throw new Error(`Agent ${id} was not found`);
     return this.profiles.calculateExecutionProfileHash(agent);
   }
+}
+
+function reconciliationRequired(): Error {
+  const error = new Error('Agent registry requires reconciliation') as Error & { code: string };
+  error.code = 'AGENT_REGISTRY_RECONCILIATION_REQUIRED';
+  return error;
 }

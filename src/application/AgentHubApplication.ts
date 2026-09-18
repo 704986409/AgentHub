@@ -1,13 +1,14 @@
 import type { EventBus, EventStore } from '../events/index.js';
 import type { AgentScheduler, AssignmentDispatcher, TaskLifecycleOrchestrator } from '../orchestration/index.js';
 import type { AssignmentRepository, ProjectRepository } from '../repositories/index.js';
-import type { AgentRegistry, AssignmentManager, TaskManager } from '../services/index.js';
+import type { AgentManagementService, AgentRegistry, AssignmentManager, TaskManager } from '../services/index.js';
 import type { BuildTestEvidencePlan, MergeGatePolicy } from '../workspace/index.js';
 
 /** The single authoritative object graph exposed to transport adapters. */
 export interface AgentHubApplication {
   readonly projects: ProjectRepository;
   readonly agents: AgentRegistry;
+  readonly agentManagement: AgentManagementService;
   readonly tasks: TaskManager;
   readonly assignments: AssignmentManager;
   readonly assignmentQueries: AssignmentRepository;
