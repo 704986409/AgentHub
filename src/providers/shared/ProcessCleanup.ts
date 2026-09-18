@@ -2,7 +2,10 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 export type ProcessCleanupResult =
   | { readonly status: 'exited' }
-  | { readonly status: 'timed-out' };
+  | {
+      readonly status: 'timed-out';
+      readonly pendingKiller?: ProcessCleanupKiller;
+    };
 
 export interface ProcessCleanupKiller {
   once(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): void;
@@ -21,10 +24,11 @@ export interface ProcessCleanupDeps {
 }
 
 type KillerOutcome =
-  | 'success'
-  | 'failed'
-  | 'timed-out-and-terminated'
-  | 'timed-out-cleanup-failed';
+  | { readonly status: 'success' }
+  | { readonly status: 'failed-settled' }
+  | { readonly status: 'unresolved'; readonly killer: ProcessCleanupKiller };
+
+type KillerWait = 'success' | 'failed' | 'timed-out' | 'error';
 
 export async function killProcessTreeAndWait(
   child: ChildProcessWithoutNullStreams,
@@ -41,16 +45,18 @@ export async function killProcessTreeAndWait(
   const deadline = now() + total;
   const remaining = (): number => Math.max(0, deadline - now());
 
-  let helperSettled = true;
+  let unresolvedKiller: ProcessCleanupKiller | undefined;
 
   if (platform === 'win32' && child.pid !== undefined) {
     const killer = spawnWindowsKiller(child.pid, deps);
     const helperBudget = Math.min(remaining(), Math.floor(total * 0.6));
     const killerOutcome = await settleKiller(killer, helperBudget, remaining);
-    if (killerOutcome === 'success') {
+    if (killerOutcome.status === 'success') {
       return waitForChildEnd(child, remaining());
     }
-    helperSettled = killerOutcome !== 'timed-out-cleanup-failed';
+    if (killerOutcome.status === 'unresolved') {
+      unresolvedKiller = killerOutcome.killer;
+    }
   }
 
   try {
@@ -63,10 +69,33 @@ export async function killProcessTreeAndWait(
     ? { status: 'exited' as const }
     : await waitForChildEnd(child, remaining());
 
-  if (!helperSettled) {
-    return { status: 'timed-out' };
+  if (unresolvedKiller !== undefined) {
+    return { status: 'timed-out', pendingKiller: unresolvedKiller };
   }
   return childResult;
+}
+
+export async function retryPendingKillerCleanup(
+  killer: ProcessCleanupKiller,
+  timeoutMs: number,
+): Promise<'exited' | 'timed-out'> {
+  try {
+    if (killerAlreadySettled(killer) !== null) {
+      return 'exited';
+    }
+    try {
+      killer.kill('SIGKILL');
+    } catch {
+      // ignore
+    }
+    if (killerAlreadySettled(killer) !== null) {
+      return 'exited';
+    }
+    const waited = await waitForKillerExit(killer, Math.max(0, timeoutMs));
+    return waited;
+  } catch {
+    return 'timed-out';
+  }
 }
 
 function spawnWindowsKiller(pid: number, deps: ProcessCleanupDeps): ProcessCleanupKiller {
@@ -99,8 +128,11 @@ async function settleKiller(
   remaining: () => number,
 ): Promise<KillerOutcome> {
   const first = await waitForKiller(killer, helperBudget);
-  if (first === 'success' || first === 'failed') {
-    return first;
+  if (first === 'success') {
+    return { status: 'success' };
+  }
+  if (first === 'failed') {
+    return { status: 'failed-settled' };
   }
 
   try {
@@ -109,16 +141,15 @@ async function settleKiller(
     // ignore
   }
 
-  const afterKill = killerAlreadySettled(killer);
-  if (afterKill !== null) {
-    return 'timed-out-and-terminated';
+  if (killerAlreadySettled(killer) !== null) {
+    return { status: 'failed-settled' };
   }
 
-  const second = await waitForKiller(killer, remaining());
-  if (second === 'success' || second === 'failed') {
-    return 'timed-out-and-terminated';
+  const confirmed = await waitForKillerExit(killer, remaining());
+  if (confirmed === 'exited') {
+    return { status: 'failed-settled' };
   }
-  return 'timed-out-cleanup-failed';
+  return { status: 'unresolved', killer };
 }
 
 function waitForChildEnd(
@@ -134,7 +165,7 @@ function waitForChildEnd(
 
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (status: ProcessCleanupResult['status']): void => {
+    const finish = (status: 'exited' | 'timed-out'): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -156,10 +187,7 @@ function waitForChildEnd(
   });
 }
 
-function waitForKiller(
-  killer: ProcessCleanupKiller,
-  timeoutMs: number,
-): Promise<'success' | 'failed' | 'timed-out'> {
+function waitForKiller(killer: ProcessCleanupKiller, timeoutMs: number): Promise<KillerWait> {
   const already = killerAlreadySettled(killer);
   if (already !== null) {
     return Promise.resolve(already);
@@ -170,7 +198,7 @@ function waitForKiller(
 
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (status: 'success' | 'failed' | 'timed-out'): void => {
+    const finish = (status: KillerWait): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -182,12 +210,7 @@ function waitForKiller(
       finish(code === 0 ? 'success' : 'failed');
     };
     const onError = (): void => {
-      try {
-        killer.kill('SIGKILL');
-      } catch {
-        // ignore
-      }
-      finish('failed');
+      finish('error');
     };
     killer.once('exit', onExit);
     killer.once('error', onError);
@@ -197,6 +220,39 @@ function waitForKiller(
     const raced = killerAlreadySettled(killer);
     if (raced !== null) {
       finish(raced);
+    }
+  });
+}
+
+function waitForKillerExit(
+  killer: ProcessCleanupKiller,
+  timeoutMs: number,
+): Promise<'exited' | 'timed-out'> {
+  if (killerAlreadySettled(killer) !== null) {
+    return Promise.resolve('exited');
+  }
+  if (timeoutMs <= 0) {
+    return Promise.resolve('timed-out');
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (status: 'exited' | 'timed-out'): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      killer.off('exit', onExit);
+      resolve(status);
+    };
+    const onExit = (): void => {
+      finish('exited');
+    };
+    killer.once('exit', onExit);
+    const timer = setTimeout(() => {
+      finish('timed-out');
+    }, timeoutMs);
+    if (killerAlreadySettled(killer) !== null) {
+      finish('exited');
     }
   });
 }

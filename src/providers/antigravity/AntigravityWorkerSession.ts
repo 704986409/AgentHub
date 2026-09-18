@@ -9,7 +9,7 @@ import {
 } from '../../protocol/AgentHubWorkerResultParser.js';
 import { resolveAntigravityExecutable } from './AntigravityExecutableResolver.js';
 import { AntigravityStreamParseError, AntigravityStreamParser } from './AntigravityStreamParser.js';
-import { killProcessTreeAndWait } from '../shared/ProcessCleanup.js';
+import { killProcessTreeAndWait, retryPendingKillerCleanup, type ProcessCleanupDeps, type ProcessCleanupKiller } from '../shared/ProcessCleanup.js';
 
 export const ANTIGRAVITY_CONVERSATION_RESUME_FLAG = '--conversation';
 
@@ -26,6 +26,7 @@ export interface AntigravityWorkerSessionOptions {
   resultParser?: AgentHubWorkerResultParser | undefined;
   stopTimeoutMs?: number | undefined;
   streamParserOptions?: { maxLineBytes?: number; maxTotalBytes?: number } | undefined;
+  processCleanupDeps?: ProcessCleanupDeps | undefined;
 }
 
 export interface AntigravityWorkerTurnSuccess {
@@ -80,6 +81,7 @@ export class AntigravityWorkerSession {
   readonly #stopTimeoutMs: number;
   readonly #streamParserOptions: { maxLineBytes?: number; maxTotalBytes?: number } | undefined;
   readonly #resumeFlag: string;
+  readonly #processCleanupDeps: ProcessCleanupDeps;
 
   #started = false;
   #active = false;
@@ -95,6 +97,7 @@ export class AntigravityWorkerSession {
   #settleActiveTurn: ((error: Error) => void) | null = null;
   #cleanupInFlight: Promise<void> | null = null;
   #cleanupFailed = false;
+  #pendingCleanupKiller: ProcessCleanupKiller | null = null;
 
   public constructor(options: AntigravityWorkerSessionOptions) {
     this.#context = options.context;
@@ -104,6 +107,7 @@ export class AntigravityWorkerSession {
     this.#resultParser = options.resultParser ?? new AgentHubWorkerResultParser();
     this.#stopTimeoutMs = options.stopTimeoutMs ?? 5_000;
     this.#streamParserOptions = options.streamParserOptions;
+    this.#processCleanupDeps = options.processCleanupDeps ?? {};
     const configuredFlag = typeof this.#config?.conversationResumeFlag === 'string'
       ? this.#config.conversationResumeFlag
       : ANTIGRAVITY_CONVERSATION_RESUME_FLAG;
@@ -132,6 +136,14 @@ export class AntigravityWorkerSession {
 
   public get cleanupFailed(): boolean {
     return this.#cleanupFailed;
+  }
+
+  public get cleanupRequired(): boolean {
+    return this.#cleanupRequired;
+  }
+
+  public get pendingCleanupKiller(): ProcessCleanupKiller | null {
+    return this.#pendingCleanupKiller;
   }
 
   public start(): Promise<void> {
@@ -186,7 +198,7 @@ export class AntigravityWorkerSession {
   }
 
   public async shutdown(): Promise<void> {
-    if (!this.#started && this.#process === null) return;
+    if (!this.#started && this.#process === null && this.#pendingCleanupKiller === null) return;
 
     this.#turnGeneration += 1;
     const settle = this.#settleActiveTurn;
@@ -207,9 +219,11 @@ export class AntigravityWorkerSession {
     if (this.#process !== null) {
       await this.#releaseOwnedProcess(this.#process);
     }
+    await this.#retryPendingKiller();
 
-    if (this.#process !== null) {
+    if (this.#process !== null || this.#pendingCleanupKiller !== null) {
       this.#cleanupRequired = true;
+      this.#cleanupFailed = true;
       this.#active = false;
       return;
     }
@@ -439,12 +453,29 @@ export class AntigravityWorkerSession {
   }
 
   async #releaseOwnedProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
-    const cleanup = await killProcessTreeAndWait(child, this.#stopTimeoutMs);
-    if (cleanup.status === 'exited') {
+    const cleanup = this.#pendingCleanupKiller !== null
+      ? await killProcessTreeAndWait(child, this.#stopTimeoutMs, { platform: 'linux' })
+      : await killProcessTreeAndWait(child, this.#stopTimeoutMs, this.#processCleanupDeps);
+    if (cleanup.status === 'timed-out' && cleanup.pendingKiller !== undefined) {
+      this.#pendingCleanupKiller = cleanup.pendingKiller;
+    }
+    if (cleanup.status === 'exited' && this.#pendingCleanupKiller === null) {
       if (this.#process === child) this.#process = null;
       return;
     }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      if (this.#process === child) this.#process = null;
+    }
     this.#cleanupFailed = true;
     this.#cleanupRequired = true;
+  }
+
+  async #retryPendingKiller(): Promise<void> {
+    const killer = this.#pendingCleanupKiller;
+    if (killer === null) return;
+    const retry = await retryPendingKillerCleanup(killer, this.#stopTimeoutMs);
+    if (retry === 'exited') {
+      this.#pendingCleanupKiller = null;
+    }
   }
 }

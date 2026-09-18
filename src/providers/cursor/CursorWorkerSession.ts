@@ -9,7 +9,7 @@ import {
 } from '../../protocol/AgentHubWorkerResultParser.js';
 import { resolveCursorExecutable } from './CursorExecutableResolver.js';
 import { CursorStreamParseError, CursorStreamParser } from './CursorStreamParser.js';
-import { killProcessTreeAndWait } from '../shared/ProcessCleanup.js';
+import { killProcessTreeAndWait, retryPendingKillerCleanup, type ProcessCleanupDeps, type ProcessCleanupKiller } from '../shared/ProcessCleanup.js';
 
 export interface CursorWorkerSessionOptions {
   context: AgentRuntimeContext;
@@ -24,6 +24,7 @@ export interface CursorWorkerSessionOptions {
   resultParser?: AgentHubWorkerResultParser | undefined;
   stopTimeoutMs?: number | undefined;
   streamParserOptions?: { maxLineBytes?: number; maxTotalBytes?: number } | undefined;
+  processCleanupDeps?: ProcessCleanupDeps | undefined;
 }
 
 export interface CursorWorkerTurnSuccess {
@@ -77,6 +78,7 @@ export class CursorWorkerSession {
   readonly #resultParser: AgentHubWorkerResultParser;
   readonly #stopTimeoutMs: number;
   readonly #streamParserOptions: { maxLineBytes?: number; maxTotalBytes?: number } | undefined;
+  readonly #processCleanupDeps: ProcessCleanupDeps;
 
   #started = false;
   #active = false;
@@ -88,6 +90,7 @@ export class CursorWorkerSession {
   #settleActiveTurn: ((error: Error) => void) | null = null;
   #cleanupInFlight: Promise<void> | null = null;
   #cleanupFailed = false;
+  #pendingCleanupKiller: ProcessCleanupKiller | null = null;
 
   public constructor(options: CursorWorkerSessionOptions) {
     this.#context = options.context;
@@ -97,6 +100,7 @@ export class CursorWorkerSession {
     this.#resultParser = options.resultParser ?? new AgentHubWorkerResultParser();
     this.#stopTimeoutMs = options.stopTimeoutMs ?? 5_000;
     this.#streamParserOptions = options.streamParserOptions;
+    this.#processCleanupDeps = options.processCleanupDeps ?? {};
   }
 
   public get started(): boolean {
@@ -121,6 +125,14 @@ export class CursorWorkerSession {
 
   public get cleanupFailed(): boolean {
     return this.#cleanupFailed;
+  }
+
+  public get cleanupRequired(): boolean {
+    return this.#cleanupRequired;
+  }
+
+  public get pendingCleanupKiller(): ProcessCleanupKiller | null {
+    return this.#pendingCleanupKiller;
   }
 
   public start(): Promise<void> {
@@ -175,7 +187,7 @@ export class CursorWorkerSession {
   }
 
   public async shutdown(): Promise<void> {
-    if (!this.#started && this.#currentProcess === null) return;
+    if (!this.#started && this.#currentProcess === null && this.#pendingCleanupKiller === null) return;
 
     this.#turnGeneration += 1;
     const settle = this.#settleActiveTurn;
@@ -195,9 +207,11 @@ export class CursorWorkerSession {
     if (this.#currentProcess !== null) {
       await this.#releaseOwnedProcess(this.#currentProcess);
     }
+    await this.#retryPendingKiller();
 
-    if (this.#currentProcess !== null) {
+    if (this.#currentProcess !== null || this.#pendingCleanupKiller !== null) {
       this.#cleanupRequired = true;
+      this.#cleanupFailed = true;
       this.#active = false;
       return;
     }
@@ -368,12 +382,29 @@ export class CursorWorkerSession {
   }
 
   async #releaseOwnedProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
-    const cleanup = await killProcessTreeAndWait(child, this.#stopTimeoutMs);
-    if (cleanup.status === 'exited') {
+    const cleanup = this.#pendingCleanupKiller !== null
+      ? await killProcessTreeAndWait(child, this.#stopTimeoutMs, { platform: 'linux' })
+      : await killProcessTreeAndWait(child, this.#stopTimeoutMs, this.#processCleanupDeps);
+    if (cleanup.status === 'timed-out' && cleanup.pendingKiller !== undefined) {
+      this.#pendingCleanupKiller = cleanup.pendingKiller;
+    }
+    if (cleanup.status === 'exited' && this.#pendingCleanupKiller === null) {
       if (this.#currentProcess === child) this.#currentProcess = null;
       return;
     }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      if (this.#currentProcess === child) this.#currentProcess = null;
+    }
     this.#cleanupFailed = true;
     this.#cleanupRequired = true;
+  }
+
+  async #retryPendingKiller(): Promise<void> {
+    const killer = this.#pendingCleanupKiller;
+    if (killer === null) return;
+    const retry = await retryPendingKillerCleanup(killer, this.#stopTimeoutMs);
+    if (retry === 'exited') {
+      this.#pendingCleanupKiller = null;
+    }
   }
 }
