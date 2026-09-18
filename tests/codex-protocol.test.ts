@@ -119,7 +119,8 @@ describe('Codex protocol foundation', () => {
     await expect(manager.request('timeout', undefined, 5)).rejects.toThrow(/timed out/);
   });
 
-  it.runIf(process.env.CI !== 'true')('detects the installed Codex CLI and reports doctor output', () => {
+  const hasCodex = new CodexCapabilityDetector().detect().installed;
+  it.runIf(process.env.CI !== 'true' && hasCodex)('detects the installed Codex CLI and reports doctor output', () => {
     const capabilities = new CodexCapabilityDetector().detect();
     expect(capabilities.installed).toBe(true);
     expect(capabilities.version).toContain('0.153.4');

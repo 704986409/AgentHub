@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import type { AgentHubApplication } from '../application/index.js';
-import { agentDeleteDto, agentDto, assignmentDto, eventDto, lifecycleDto, projectDto, reviewReadyDto,
+import { agentDeleteDto, agentDto, assignmentDto, eventDto, lifecycleDto, projectDto, providerDto, reviewReadyDto,
   snapshotCreateAgent, snapshotCreateTask, snapshotEmptyObject, snapshotExecuteCommand,
   snapshotReviewDecision, snapshotUpdateAgent, taskDto } from './ApiDtos.js';
 import { apiError, normalizeApiError } from './ApiErrors.js';
@@ -68,7 +68,7 @@ export class AgentHubHttpServer {
       const url = new URL(request.url ?? '/', 'http://localhost');
       if (url.pathname.length > 8192) throw apiError('AGENTHUB_API_INVALID_REQUEST', 400);
       let result: { status: number; data: unknown };
-      if (method === 'GET') result = this.#get(url);
+      if (method === 'GET') result = await this.#get(url);
       else if (method === 'POST') result = await this.#post(url.pathname, request);
       else if (method === 'PUT') result = await this.#put(url.pathname, request);
       else if (method === 'DELETE') result = await this.#delete(url.pathname, request);
@@ -81,11 +81,12 @@ export class AgentHubHttpServer {
     }
   }
 
-  #get(url: URL): { status: number; data: unknown } {
+  async #get(url: URL): Promise<{ status: number; data: unknown }> {
     noUnknownQuery(url, url.pathname === '/api/v1/events'
       ? ['limit', 'after', 'projectId', 'agentId', 'taskId', 'assignmentId', 'eventType'] : []);
     const path = url.pathname;
-    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.1-a.1' });
+    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.2' });
+    if (path === '/api/v1/providers') return ok(await this.#providers());
     if (path === '/api/v1/state') return ok({ projects: this.#app.projects.list().map(projectDto),
       agents: this.#app.agents.listAgents().map(agentDto), tasks: this.#app.tasks.listTasks().map(taskDto),
       assignments: this.#app.assignmentQueries.list().map(assignmentDto) });
@@ -104,6 +105,14 @@ export class AgentHubHttpServer {
         ? taskDto(value as never) : assignmentDto(value as never));
     }
     throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+  }
+
+  async #providers(): Promise<readonly unknown[]> {
+    if (this.#app.providerCatalog !== undefined) {
+      const catalog = await this.#app.providerCatalog.getCatalog();
+      return catalog.map(providerDto);
+    }
+    return [];
   }
 
   async #post(path: string, request: IncomingMessage): Promise<{ status: number; data: unknown }> {
@@ -140,7 +149,10 @@ export class AgentHubHttpServer {
       const taskId = decodeURIComponent(execute[1] ?? ''); const input = snapshotExecuteCommand(body);
       return this.#mutate(request, 'POST', path, body, async () => {
         if (this.#app.tasks.getTask(taskId) === null) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
-        const reservation = this.#app.scheduler.scheduleTask({ taskId });
+        const reservation = this.#app.scheduler.scheduleTask({
+          taskId,
+          requirements: { requiredOutputProtocols: ['worker-result'] },
+        });
         if (reservation.outcome !== 'reserved') throw apiError('AGENTHUB_API_CONFLICT', 409);
         const dispatched = await this.#app.dispatcher.dispatch({ reservation, baseRef: input.baseRef,
           turn: { prompt: input.prompt, protocol: 'worker-result' } });

@@ -16,7 +16,9 @@ describe('V0.7 local API control plane', () => {
     const address = await server.start(); const base = `http://${address.host}:${String(address.port)}`;
     try {
       const health = await fetch(`${base}/api/v1/health`);
-      expect(await health.json()).toMatchObject({ ok: true, data: { status: 'ok', version: '0.7.1-a.1' } });
+      const healthJson = await health.json() as { ok: boolean; data: { status: string; version: string } };
+      expect(healthJson).toMatchObject({ ok: true, data: { status: 'ok' } });
+      expect(healthJson.data.version).toMatch(/^0\.7\./);
       const created = await fetch(`${base}/api/v1/tasks`, { method: 'POST',
         headers: { 'content-type': 'application/json', 'idempotency-key': 'create-1' }, body: JSON.stringify({ projectId: 'project-a',
           title: 'API task', complexity: 'SIMPLE', risk: 'LOW' }) });

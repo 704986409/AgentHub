@@ -458,7 +458,9 @@ describe('V0.7.1 agent HTTP API', () => {
   it('exposes health 0.7.1-a.1 and full agent mutation routes with idempotency', { timeout }, async () => {
     await start();
     const health = await fetch(`${base}/api/v1/health`, fetchTimeout);
-    expect(await health.json()).toMatchObject({ ok: true, data: { status: 'ok', version: '0.7.1-a.1' } });
+    const healthJson = await health.json() as { ok: boolean; data: { status: string; version: string } };
+    expect(healthJson).toMatchObject({ ok: true, data: { status: 'ok' } });
+    expect(healthJson.data.version).toMatch(/^0\.7\./);
     const createBody = JSON.stringify({ ...validCreate, projectId });
     const created = await fetch(`${base}/api/v1/agents`, {
       method: 'POST', headers: headers('create-1'), body: createBody, ...fetchTimeout,

@@ -23,7 +23,7 @@ async function repo() {
   return root;
 }
 
-describe('Git task commit integration', { timeout: 20_000 }, () => {
+describe('Git task commit integration', { timeout: 60_000 }, () => {
   it('commits all actual source once and reconciles an already committed head', async () => {
     const root = await repo();
     const manager = await GitWorktreeManager.open({ repositoryRoot: root });

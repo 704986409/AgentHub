@@ -6,6 +6,7 @@ import type { DomainEvent } from '../events/event-bus.js';
 import { redactEventValue } from '../events/event-redaction.js';
 import type { ReviewDecisionInput, ReviewFindingInput, ReviewFindingSeverity, ReviewVerdict } from '../workspace/index.js';
 import type { CreateManagedAgentInput, UpdateManagedAgentInput, AgentDeleteResult } from '../services/agent-management-service.js';
+import type { ProviderDto } from '../services/provider-catalog-service.js';
 import { apiError } from './ApiErrors.js';
 
 const encoder = new TextEncoder();
@@ -243,4 +244,23 @@ function frozen<T>(value: T): Readonly<T> {
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function providerDto(value: ProviderDto): Readonly<ProviderDto> {
+  return frozen({
+    providerId: value.providerId,
+    supported: true,
+    usable: value.usable,
+    installed: value.installed,
+    authenticated: value.authenticated,
+    version: value.version,
+    status: value.status,
+    capabilities: frozen({
+      outputProtocols: frozen([...value.capabilities.outputProtocols]),
+      sessionContinuation: value.capabilities.sessionContinuation,
+    }),
+    modelDiscovery: value.modelDiscovery,
+    models: frozen(value.models.map((m) => frozen({ modelId: m.modelId, label: m.label }))),
+    checkedAt: value.checkedAt,
+  });
 }

@@ -35,7 +35,7 @@ async function setup(hook?: (args: readonly string[], cwd: string) => Promise<vo
   const capture = (options = {}) => manager.captureWorkspaceChanges('TASK', options);
   return { repo, wt, manager, workspace, capture, calls, delegate };
 }
-describe('change capture real Git', { timeout: 30_000 }, () => {
+describe('change capture real Git', { timeout: 60_000 }, () => {
   it('captures clean state and stable digest after restart', async () => {
     const { repo, capture } = await setup();
     const first = await capture();

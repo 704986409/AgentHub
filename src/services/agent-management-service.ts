@@ -47,6 +47,7 @@ export interface AgentManagementServiceOptions {
   readonly assignments: AssignmentRepository;
   readonly tasks: TaskManager;
   readonly eventBus?: EventBus;
+  readonly isProviderUsable?: (providerId: string) => boolean;
 }
 
 export class AgentManagementError extends Error {
@@ -64,6 +65,7 @@ export class AgentManagementService {
   readonly #assignments: AssignmentRepository;
   readonly #tasks: TaskManager;
   readonly #eventBus: EventBus | undefined;
+  readonly #isProviderUsable: (providerId: string) => boolean;
 
   public constructor(options: AgentManagementServiceOptions) {
     this.#agents = options.agentRegistry;
@@ -73,6 +75,7 @@ export class AgentManagementService {
     this.#assignments = options.assignments;
     this.#tasks = options.tasks;
     this.#eventBus = options.eventBus ?? options.agentRegistry.eventBusInstance;
+    this.#isProviderUsable = options.isProviderUsable ?? ((id) => options.providerFactory.has(id));
   }
 
   public createAgent(input: CreateManagedAgentInput): Agent {
@@ -80,6 +83,9 @@ export class AgentManagementService {
       throw new AgentManagementError('PROJECT_NOT_FOUND', 'Project was not found');
     }
     this.#requireSupportedProvider(input.providerId);
+    if (input.enabled && !this.#isProviderUsable(input.providerId)) {
+      throw new AgentManagementError('AGENT_PROVIDER_UNAVAILABLE', 'Runtime provider is unavailable');
+    }
     const agent = this.#agents.createAgent({
       projectId: input.projectId,
       name: input.name,
@@ -115,6 +121,9 @@ export class AgentManagementService {
     this.#assertRuntimeClean(previous);
     this.#requireSupportedProvider(input.providerId);
     const rebind = previous.provider !== input.providerId || previous.model !== input.modelId;
+    if (previous.enabled && rebind && !this.#isProviderUsable(input.providerId)) {
+      throw new AgentManagementError('AGENT_PROVIDER_UNAVAILABLE', 'Runtime provider is unavailable');
+    }
     const previousRegistered = this.#pool.has(agentId);
     if (rebind && previousRegistered) this.#pool.unregister(agentId);
     try {
@@ -141,6 +150,9 @@ export class AgentManagementService {
   public enableAgent(agentId: string): Agent {
     const agent = this.#requireAgent(agentId);
     this.#requireSupportedProvider(agent.provider);
+    if (!this.#isProviderUsable(agent.provider)) {
+      throw new AgentManagementError('AGENT_PROVIDER_UNAVAILABLE', 'Runtime provider is unavailable');
+    }
     this.#assertRuntimeClean(agent);
     if (agent.enabled) {
       throw new AgentManagementError('AGENT_ALREADY_ENABLED', 'Agent is already enabled');

@@ -2,7 +2,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { CodexAppServerClient, CodexManagerUseCase, CodexProcessManager, CodexProvider, CodexProviderStatus } from '../src/index.js';
+import { CodexAppServerClient, CodexCapabilityDetector, CodexManagerUseCase, CodexProcessManager, CodexProvider, CodexProviderStatus } from '../src/index.js';
 
 const managerFixture = fileURLToPath(new URL('./fixtures/codex/fake-manager-app-server.mjs', import.meta.url));
 
@@ -48,7 +48,8 @@ describe('Codex app-server process integration', () => {
     expect(client.processManager.running).toBe(false);
   });
 
-  it.runIf(process.env.CI !== 'true')('performs the required Codex initialization handshake and shuts down cleanly', async () => {
+  const hasCodex = new CodexCapabilityDetector().detect().installed;
+  it.runIf(process.env.CI !== 'true' && hasCodex)('performs the required Codex initialization handshake and shuts down cleanly', async () => {
     const provider = new CodexProvider({ requestTimeoutMs: 20_000, debug: true });
     const response = await provider.initialize();
     expect(provider.client.processManager.running).toBe(true);

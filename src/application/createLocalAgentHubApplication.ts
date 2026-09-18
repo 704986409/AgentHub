@@ -6,8 +6,8 @@ import { EventBus, EventStore } from '../events/index.js';
 import { AgentScheduler, AssignmentDispatcher, TaskLifecycleOrchestrator } from '../orchestration/index.js';
 import { SqliteAgentRepository, SqliteAssignmentRepository, SqliteEventRepository,
   SqliteProjectRepository, SqliteTaskRepository } from '../repositories/index.js';
-import { AgentPool, AgentProviderFactory, ClaudeAgentProvider, CodexAgentProvider } from '../runtime/index.js';
-import { AgentManagementService, AgentProfileManager, AgentRegistry, AssignmentManager, TaskManager, TaskStateMachine } from '../services/index.js';
+import { AgentPool, AgentProviderFactory, AntigravityAgentProvider, ClaudeAgentProvider, CodexAgentProvider, CursorAgentProvider } from '../runtime/index.js';
+import { AgentManagementService, AgentProfileManager, AgentRegistry, AssignmentManager, ProviderCatalogService, TaskManager, TaskStateMachine } from '../services/index.js';
 import { GitCommandRunner, GitWorktreeManager, type GitCommandRunnerLike } from '../workspace/index.js';
 import type { AgentHubApplication } from './AgentHubApplication.js';
 
@@ -54,7 +54,11 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
   const assignments = new AssignmentManager(assignmentRepository, tasks, agents,
     (agentId) => agents.calculateProfileHash(agentId), eventBus);
   const providerFactory = new AgentProviderFactory();
-  providerFactory.register(new CodexAgentProvider()); providerFactory.register(new ClaudeAgentProvider());
+  providerFactory.register(new CodexAgentProvider());
+  providerFactory.register(new ClaudeAgentProvider());
+  providerFactory.register(new CursorAgentProvider());
+  providerFactory.register(new AntigravityAgentProvider());
+  const providerCatalog = new ProviderCatalogService({ providerFactory });
   const pool = new AgentPool({ providerFactory, eventBus });
   for (const agent of agents.listAgents()) if (providerFactory.has(agent.provider)) {
     pool.register({ agentId: agent.id, ...(agent.projectId === null ? {} : { projectId: agent.projectId }),
@@ -65,6 +69,7 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
   const agentManagement = new AgentManagementService({
     agentRegistry: agents, agentPool: pool, providerFactory, projects: projectRepository,
     assignments: assignmentRepository, tasks, eventBus,
+    isProviderUsable: (id) => providerCatalog.isUsableSync(id),
   });
   const worktrees = await GitWorktreeManager.open({ repositoryRoot });
   const dispatcher = new AssignmentDispatcher({ taskManager: tasks, agentRegistry: agents,
@@ -75,6 +80,6 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
     assignments, assignmentQueries: assignmentRepository, events, eventBus, scheduler, dispatcher, lifecycle,
     buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }),
-    targetBranch });
+    targetBranch, providerCatalog });
   return { application, async close() { await pool.shutdownAll(); events.close(); database.close(); } };
 }

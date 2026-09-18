@@ -287,7 +287,7 @@ export class ClaudeProcessManager extends EventEmitter {
     this.requestTermination(child);
     if (await waitUntilSettled(this.waitForExit(), this.#stopTimeoutMs)) return;
     this.forceStopChild(child);
-    if (await waitUntilSettled(this.waitForExit(), 1_000)) return;
+    if (await waitUntilSettled(this.waitForExit(), 5_000)) return;
     throw new ClaudeProcessError('CLAUDE_PROCESS_STOP_TIMEOUT', 'Claude process did not exit after forced stop');
   }
 
