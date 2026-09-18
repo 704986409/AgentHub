@@ -13,7 +13,7 @@ export interface CursorCapabilityReport {
   readonly status: ProviderRuntimeStatus;
   readonly capabilities: {
     readonly outputProtocols: readonly ['worker-result'];
-    readonly sessionContinuation: true;
+    readonly sessionContinuation: boolean;
   };
   readonly modelDiscovery: 'native' | 'unavailable';
   readonly models: readonly CursorModelDto[];
@@ -38,6 +38,8 @@ export const CURSOR_CAPABILITIES = Object.freeze({
   sessionContinuation: true,
 });
 
+const CURSOR_HELP_REQUIRED_TOKENS = Object.freeze(['--print', '--output-format', 'stream-json', '--resume']);
+
 export class CursorCapabilityDetector {
   readonly #command: string;
   readonly #env: NodeJS.ProcessEnv;
@@ -55,7 +57,7 @@ export class CursorCapabilityDetector {
     this.#env = options.env ?? process.env;
     this.#timeoutMs = options.timeoutMs ?? 5_000;
     this.#resolver = options.resolver ?? ((cmd, env) => resolveCursorExecutable(cmd, env));
-    this.#runner = options.runner ?? defaultRunner;
+    this.#runner = options.runner ?? ((executable, args) => defaultRunner(executable, args, this.#timeoutMs));
   }
 
   public detect(): CursorCapabilityReport {
@@ -66,31 +68,17 @@ export class CursorCapabilityDetector {
       executablePath = this.#resolver(this.#command, this.#env);
     } catch (err) {
       if (err instanceof CursorExecutableResolutionError || (err instanceof Error && err.message.includes('not found'))) {
-        return Object.freeze({
-          providerId: 'cursor',
-          supported: true,
+        return this.#report({
           usable: false,
           installed: false,
-          authenticated: null,
-          version: null,
           status: 'EXECUTABLE_NOT_FOUND',
-          capabilities: CURSOR_CAPABILITIES,
-          modelDiscovery: 'unavailable',
-          models: Object.freeze([]),
           checkedAt,
         });
       }
-      return Object.freeze({
-        providerId: 'cursor',
-        supported: true,
+      return this.#report({
         usable: false,
         installed: false,
-        authenticated: null,
-        version: null,
         status: 'PROBE_FAILED',
-        capabilities: CURSOR_CAPABILITIES,
-        modelDiscovery: 'unavailable',
-        models: Object.freeze([]),
         checkedAt,
       });
     }
@@ -98,70 +86,102 @@ export class CursorCapabilityDetector {
     let version: string | null = null;
     try {
       const probeRes = this.#runner(executablePath, ['--version']);
-      if (probeRes.error && probeRes.error.toLowerCase().includes('timeout')) {
-        return Object.freeze({
-          providerId: 'cursor',
-          supported: true,
+      if (isTimeout(probeRes.error)) {
+        return this.#report({
           usable: false,
           installed: true,
-          authenticated: null,
-          version: null,
           status: 'PROBE_TIMEOUT',
-          capabilities: CURSOR_CAPABILITIES,
-          modelDiscovery: 'unavailable',
-          models: Object.freeze([]),
           checkedAt,
         });
       }
       if (probeRes.exitCode !== 0) {
-        return Object.freeze({
-          providerId: 'cursor',
-          supported: true,
+        return this.#report({
           usable: false,
           installed: true,
-          authenticated: null,
-          version: null,
           status: 'PROBE_FAILED',
-          capabilities: CURSOR_CAPABILITIES,
-          modelDiscovery: 'unavailable',
-          models: Object.freeze([]),
           checkedAt,
         });
       }
       version = parseVersion(probeRes.stdout || probeRes.stderr);
     } catch {
-      return Object.freeze({
-        providerId: 'cursor',
-        supported: true,
+      return this.#report({
         usable: false,
         installed: true,
-        authenticated: null,
-        version: null,
         status: 'PROBE_FAILED',
-        capabilities: CURSOR_CAPABILITIES,
-        modelDiscovery: 'unavailable',
-        models: Object.freeze([]),
         checkedAt,
       });
     }
 
-    const modelResult = discoverCursorModels(executablePath, {
-      timeoutMs: this.#timeoutMs,
-      runner: this.#runner,
-    });
+    const helpRes = this.#runner(executablePath, ['--help']);
+    if (isTimeout(helpRes.error)) {
+      return this.#report({
+        usable: false,
+        installed: true,
+        version,
+        status: 'PROBE_TIMEOUT',
+        checkedAt,
+      });
+    }
 
-    return Object.freeze({
-      providerId: 'cursor',
-      supported: true,
+    const helpText = `${helpRes.stdout}\n${helpRes.stderr}`;
+    const missingRuntime = CURSOR_HELP_REQUIRED_TOKENS.filter((token) => !helpText.includes(token));
+    const resumeAvailable = helpText.includes('--resume');
+    if (missingRuntime.length > 0 || !resumeAvailable) {
+      return this.#report({
+        usable: false,
+        installed: true,
+        version,
+        status: 'PROBE_FAILED',
+        sessionContinuation: false,
+        checkedAt,
+      });
+    }
+
+    const nativeAdvertised = /\bmodels\b/u.test(helpText);
+    const modelResult = nativeAdvertised
+      ? discoverCursorModels(executablePath, {
+          timeoutMs: this.#timeoutMs,
+          runner: this.#runner,
+        })
+      : { modelDiscovery: 'unavailable' as const, models: Object.freeze([]) as readonly CursorModelDto[] };
+
+    return this.#report({
       usable: true,
       installed: true,
-      authenticated: null,
       version: version || 'unknown',
       status: 'READY',
-      capabilities: CURSOR_CAPABILITIES,
+      sessionContinuation: true,
       modelDiscovery: modelResult.modelDiscovery,
       models: modelResult.models,
       checkedAt,
+    });
+  }
+
+  #report(input: {
+    usable: boolean;
+    installed: boolean;
+    version?: string | null;
+    status: ProviderRuntimeStatus;
+    sessionContinuation?: boolean;
+    modelDiscovery?: 'native' | 'unavailable';
+    models?: readonly CursorModelDto[];
+    checkedAt: string;
+  }): CursorCapabilityReport {
+    return Object.freeze({
+      providerId: 'cursor',
+      supported: true,
+      usable: input.usable,
+      installed: input.installed,
+      authenticated: null,
+      version: input.version ?? null,
+      status: input.status,
+      capabilities: Object.freeze({
+        outputProtocols: CURSOR_CAPABILITIES.outputProtocols,
+        sessionContinuation: input.sessionContinuation ?? false,
+      }),
+      modelDiscovery: input.modelDiscovery ?? 'unavailable',
+      models: Object.freeze([...(input.models ?? [])]),
+      checkedAt: input.checkedAt,
     });
   }
 }
@@ -172,15 +192,20 @@ function parseVersion(raw: string): string {
   return match?.[1] ?? line.slice(0, 64).trim();
 }
 
+function isTimeout(error: string | undefined): boolean {
+  return error?.toLowerCase().includes('timeout') === true;
+}
+
 function defaultRunner(
   executable: string,
   args: readonly string[],
+  timeoutMs: number,
 ): { exitCode: number | null; stdout: string; stderr: string; error?: string | undefined } {
   const result = spawnSync(executable, [...args], {
     encoding: 'utf8',
     shell: false,
     windowsHide: true,
-    timeout: 5_000,
+    timeout: timeoutMs,
   });
   return {
     exitCode: result.status,

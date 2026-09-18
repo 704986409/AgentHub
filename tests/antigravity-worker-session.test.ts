@@ -178,27 +178,37 @@ describe('Antigravity worker session & components', () => {
       { modelId: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash' },
     ]);
     const parsedJson = parseAntigravityModelsOutput(jsonOutput);
-    expect(parsedJson).toHaveLength(2);
-    expect(parsedJson[0]?.modelId).toBe('gemini-1.5-pro');
+    expect(parsedJson.modelDiscovery).toBe('native');
+    expect(parsedJson.models).toHaveLength(2);
+    expect(parsedJson.models[0]?.modelId).toBe('gemini-1.5-pro');
 
-    // 2. Line format
-    const textOutput = `
-# Antigravity models
-gemini-2.0-flash
+    const textOutput = `gemini-2.0-flash
 gemini-1.5-pro
 `;
     const parsedText = parseAntigravityModelsOutput(textOutput);
-    expect(parsedText.map((m: { modelId: string }) => m.modelId)).toEqual(['gemini-2.0-flash', 'gemini-1.5-pro']);
+    expect(parsedText.modelDiscovery).toBe('native');
+    expect(parsedText.models.map((m: { modelId: string }) => m.modelId)).toEqual(['gemini-2.0-flash', 'gemini-1.5-pro']);
   }, 5_000);
 
   it('AntigravityCapabilityDetector returns structured report', () => {
     const detector = new AntigravityCapabilityDetector({
       resolver: () => 'C:\\mock\\agy.cmd',
-      runner: () => ({
-        exitCode: 0,
-        stdout: 'agy 0.9.0\n',
-        stderr: '',
-      }),
+      runner: (_executable, args) => {
+        if (args[0] === '--version') {
+          return { exitCode: 0, stdout: 'agy 0.9.0\n', stderr: '' };
+        }
+        if (args[0] === '--help') {
+          return {
+            exitCode: 0,
+            stdout: 'Usage: agy --input-format stream-json --output-format stream-json --conversation <id> --headless\nCommands:\n  models\n',
+            stderr: '',
+          };
+        }
+        if (args[0] === 'models') {
+          return { exitCode: 0, stdout: '[]\n', stderr: '' };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
     });
 
     const report = detector.detect();

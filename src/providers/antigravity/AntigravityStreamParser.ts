@@ -3,7 +3,12 @@ export class AntigravityStreamParseError extends Error {
     public readonly code:
       | 'ANTIGRAVITY_LINE_OVERFLOW'
       | 'ANTIGRAVITY_BUFFER_OVERFLOW'
-      | 'ANTIGRAVITY_PARSE_FAILED',
+      | 'ANTIGRAVITY_PARSE_FAILED'
+      | 'ANTIGRAVITY_MALFORMED_JSON'
+      | 'ANTIGRAVITY_DUPLICATE_TERMINAL'
+      | 'ANTIGRAVITY_IDENTITY_CONFLICT'
+      | 'ANTIGRAVITY_IDENTITY_BLANK'
+      | 'ANTIGRAVITY_MISSING_TERMINAL',
     message: string,
   ) {
     super(message);
@@ -14,6 +19,8 @@ export class AntigravityStreamParseError extends Error {
 const DEFAULT_MAX_LINE_BYTES = 64 * 1024; // 64 KiB
 const DEFAULT_MAX_TOTAL_BYTES = 8 * 1024 * 1024; // 8 MiB
 
+const TERMINAL_TYPES = new Set(['result', 'terminal', 'done', 'turn_complete']);
+
 export class AntigravityStreamParser {
   readonly #maxLineBytes: number;
   readonly #maxTotalBytes: number;
@@ -22,6 +29,7 @@ export class AntigravityStreamParser {
   #capturedConversationId: string | undefined;
   #accumulatedText = '';
   #terminalFound = false;
+  #failed = false;
 
   public constructor(options: { maxLineBytes?: number; maxTotalBytes?: number } = {}) {
     this.#maxLineBytes = options.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES;
@@ -41,12 +49,15 @@ export class AntigravityStreamParser {
   }
 
   public feed(chunk: string): void {
+    this.#assertNotFailed();
     const chunkBytes = Buffer.byteLength(chunk, 'utf8');
     this.#totalBytes += chunkBytes;
     if (this.#totalBytes > this.#maxTotalBytes) {
-      throw new AntigravityStreamParseError(
-        'ANTIGRAVITY_BUFFER_OVERFLOW',
-        `Antigravity stream output exceeded limit of ${String(this.#maxTotalBytes)} bytes`,
+      this.#fail(
+        new AntigravityStreamParseError(
+          'ANTIGRAVITY_BUFFER_OVERFLOW',
+          `Antigravity stream output exceeded limit of ${String(this.#maxTotalBytes)} bytes`,
+        ),
       );
     }
 
@@ -58,9 +69,11 @@ export class AntigravityStreamParser {
       this.#buffer = this.#buffer.slice(newlineIndex + 1);
 
       if (Buffer.byteLength(line, 'utf8') > this.#maxLineBytes) {
-        throw new AntigravityStreamParseError(
-          'ANTIGRAVITY_LINE_OVERFLOW',
-          `Antigravity stream line exceeded limit of ${String(this.#maxLineBytes)} bytes`,
+        this.#fail(
+          new AntigravityStreamParseError(
+            'ANTIGRAVITY_LINE_OVERFLOW',
+            `Antigravity stream line exceeded limit of ${String(this.#maxLineBytes)} bytes`,
+          ),
         );
       }
 
@@ -72,17 +85,29 @@ export class AntigravityStreamParser {
     }
 
     if (Buffer.byteLength(this.#buffer, 'utf8') > this.#maxLineBytes) {
-      throw new AntigravityStreamParseError(
-        'ANTIGRAVITY_LINE_OVERFLOW',
-        `Antigravity stream line buffer exceeded limit of ${String(this.#maxLineBytes)} bytes`,
+      this.#fail(
+        new AntigravityStreamParseError(
+          'ANTIGRAVITY_LINE_OVERFLOW',
+          `Antigravity stream line buffer exceeded limit of ${String(this.#maxLineBytes)} bytes`,
+        ),
       );
     }
   }
 
   public finish(): { conversationId?: string; responseText: string } {
+    this.#assertNotFailed();
     if (this.#buffer.trim().length > 0) {
       this.#processLine(this.#buffer.trim());
       this.#buffer = '';
+    }
+
+    if (!this.#terminalFound) {
+      this.#fail(
+        new AntigravityStreamParseError(
+          'ANTIGRAVITY_MISSING_TERMINAL',
+          'Antigravity stream completed without a terminal result frame',
+        ),
+      );
     }
 
     return {
@@ -92,32 +117,44 @@ export class AntigravityStreamParser {
   }
 
   #processLine(line: string): void {
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(line) as unknown;
-      if (typeof parsed === 'object' && parsed !== null) {
-        this.#handleParsedObject(parsed as Record<string, unknown>);
-        return;
-      }
+      parsed = JSON.parse(line) as unknown;
     } catch {
-      // not json line
+      this.#fail(
+        new AntigravityStreamParseError(
+          'ANTIGRAVITY_MALFORMED_JSON',
+          'Antigravity stream-json stdout contained a malformed JSON frame',
+        ),
+      );
     }
 
-    if (!line.startsWith('{') && !line.startsWith('[') && !line.startsWith('Warning:')) {
-      if (this.#accumulatedText.length > 0) this.#accumulatedText += '\n';
-      this.#accumulatedText += line;
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      this.#fail(
+        new AntigravityStreamParseError(
+          'ANTIGRAVITY_MALFORMED_JSON',
+          'Antigravity stream-json frame must be a JSON object',
+        ),
+      );
     }
+
+    this.#handleParsedObject(parsed as Record<string, unknown>);
   }
 
   #handleParsedObject(obj: Record<string, unknown>): void {
-    const conv = typeof obj.conversation === 'object' && obj.conversation !== null ? (obj.conversation as Record<string, unknown>) : undefined;
-    const cid = obj.conversation_id ?? obj.conversationId ?? conv?.id;
-    if (typeof cid === 'string' && cid.trim().length > 0) {
-      this.#capturedConversationId = cid.trim();
-    }
+    this.#observeIdentity(obj);
 
     const type = typeof obj.type === 'string' ? obj.type.toLowerCase() : '';
 
-    if (type === 'result' || type === 'terminal' || type === 'done' || type === 'turn_complete') {
+    if (TERMINAL_TYPES.has(type)) {
+      if (this.#terminalFound) {
+        this.#fail(
+          new AntigravityStreamParseError(
+            'ANTIGRAVITY_DUPLICATE_TERMINAL',
+            'Antigravity stream contained more than one terminal result frame',
+          ),
+        );
+      }
       this.#terminalFound = true;
       const text = obj.text ?? obj.content ?? obj.result ?? obj.response;
       if (typeof text === 'string') {
@@ -129,7 +166,6 @@ export class AntigravityStreamParser {
       return;
     }
 
-    // Message frame
     const msg = typeof obj.message === 'object' && obj.message !== null ? (obj.message as Record<string, unknown>) : undefined;
     const content = obj.content ?? obj.text ?? obj.delta ?? msg?.content;
     if (typeof content === 'string' && content.length > 0) {
@@ -138,5 +174,56 @@ export class AntigravityStreamParser {
       }
       this.#accumulatedText += content;
     }
+  }
+
+  #observeIdentity(obj: Record<string, unknown>): void {
+    const conv = typeof obj.conversation === 'object' && obj.conversation !== null ? (obj.conversation as Record<string, unknown>) : undefined;
+    const candidates: unknown[] = [obj.conversation_id, obj.conversationId, conv?.id];
+    for (const candidate of candidates) {
+      if (candidate === undefined || candidate === null) continue;
+      if (typeof candidate !== 'string') {
+        this.#fail(
+          new AntigravityStreamParseError(
+            'ANTIGRAVITY_IDENTITY_CONFLICT',
+            'Antigravity conversation identity must be a string',
+          ),
+        );
+      }
+      const id = candidate.trim();
+      if (id.length === 0) {
+        this.#fail(
+          new AntigravityStreamParseError(
+            'ANTIGRAVITY_IDENTITY_BLANK',
+            'Antigravity conversation identity was blank',
+          ),
+        );
+      }
+      if (this.#capturedConversationId === undefined) {
+        this.#capturedConversationId = id;
+        continue;
+      }
+      if (this.#capturedConversationId !== id) {
+        this.#fail(
+          new AntigravityStreamParseError(
+            'ANTIGRAVITY_IDENTITY_CONFLICT',
+            `Antigravity conversation identity conflict: locked ${this.#capturedConversationId}, got ${id}`,
+          ),
+        );
+      }
+    }
+  }
+
+  #assertNotFailed(): void {
+    if (this.#failed) {
+      throw new AntigravityStreamParseError(
+        'ANTIGRAVITY_PARSE_FAILED',
+        'Antigravity stream parser is in a terminal failed state',
+      );
+    }
+  }
+
+  #fail(error: AntigravityStreamParseError): never {
+    this.#failed = true;
+    throw error;
   }
 }

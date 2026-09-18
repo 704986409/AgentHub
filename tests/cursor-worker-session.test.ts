@@ -185,28 +185,38 @@ describe('Cursor worker session & components', () => {
       { id: 'gpt-4o', name: 'GPT-4o' },
     ]);
     const parsedJson = parseCursorModelsOutput(jsonOutput);
-    expect(parsedJson).toHaveLength(2);
-    expect(parsedJson[0]?.modelId).toBe('claude-3-5-sonnet');
-    expect(parsedJson[0]?.label).toBe('Claude 3.5 Sonnet');
+    expect(parsedJson.modelDiscovery).toBe('native');
+    expect(parsedJson.models).toHaveLength(2);
+    expect(parsedJson.models[0]?.modelId).toBe('claude-3-5-sonnet');
+    expect(parsedJson.models[0]?.label).toBe('Claude 3.5 Sonnet');
 
-    // 2. Line format
-    const textOutput = `
-# Available models
-cursor-small
+    const textOutput = `cursor-small
 cursor-fast
 `;
     const parsedText = parseCursorModelsOutput(textOutput);
-    expect(parsedText.map((m: { modelId: string }) => m.modelId)).toEqual(['cursor-small', 'cursor-fast']);
+    expect(parsedText.modelDiscovery).toBe('native');
+    expect(parsedText.models.map((m: { modelId: string }) => m.modelId)).toEqual(['cursor-small', 'cursor-fast']);
   }, 5_000);
 
   it('CursorCapabilityDetector returns structured report', () => {
     const detector = new CursorCapabilityDetector({
       resolver: () => 'C:\\mock\\agent.cmd',
-      runner: () => ({
-        exitCode: 0,
-        stdout: 'agent 1.2.3\n',
-        stderr: '',
-      }),
+      runner: (_executable, args) => {
+        if (args[0] === '--version') {
+          return { exitCode: 0, stdout: 'agent 1.2.3\n', stderr: '' };
+        }
+        if (args[0] === '--help') {
+          return {
+            exitCode: 0,
+            stdout: 'Usage: agent --print --output-format stream-json --resume <id>\nCommands:\n  models\n',
+            stderr: '',
+          };
+        }
+        if (args[0] === 'models') {
+          return { exitCode: 0, stdout: '[]\n', stderr: '' };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
     });
 
     const report = detector.detect();

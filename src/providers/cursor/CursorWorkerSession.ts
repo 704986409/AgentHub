@@ -8,7 +8,7 @@ import {
   type AgentHubWorkerResultFailure,
 } from '../../protocol/AgentHubWorkerResultParser.js';
 import { resolveCursorExecutable } from './CursorExecutableResolver.js';
-import { CursorStreamParser } from './CursorStreamParser.js';
+import { CursorStreamParseError, CursorStreamParser } from './CursorStreamParser.js';
 
 export interface CursorWorkerSessionOptions {
   context: AgentRuntimeContext;
@@ -22,12 +22,13 @@ export interface CursorWorkerSessionOptions {
   ) => ChildProcessWithoutNullStreams;
   resultParser?: AgentHubWorkerResultParser | undefined;
   stopTimeoutMs?: number | undefined;
+  streamParserOptions?: { maxLineBytes?: number; maxTotalBytes?: number } | undefined;
 }
 
 export interface CursorWorkerTurnSuccess {
   readonly protocolValid: true;
   readonly workerResult: AgentHubWorkerResult;
-  readonly sessionId?: string | undefined;
+  readonly sessionId: string;
   readonly durationMs: number;
 }
 
@@ -47,15 +48,18 @@ export type CursorWorkerSessionErrorCode =
   | 'CURSOR_WORKER_SESSION_TURN_ALREADY_ACTIVE'
   | 'CURSOR_WORKER_SESSION_CLEANUP_REQUIRED'
   | 'CURSOR_WORKER_SESSION_SESSION_MISMATCH'
+  | 'CURSOR_WORKER_SESSION_SESSION_ID_MISSING'
   | 'CURSOR_WORKER_SESSION_TIMEOUT'
-  | 'CURSOR_WORKER_SESSION_PROCESS_FAILED';
+  | 'CURSOR_WORKER_SESSION_PROCESS_FAILED'
+  | 'CURSOR_WORKER_SESSION_PROTOCOL';
 
 export class CursorWorkerSessionError extends Error {
   public constructor(
     public readonly code: CursorWorkerSessionErrorCode,
     message: string,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = 'CursorWorkerSessionError';
   }
 }
@@ -71,6 +75,7 @@ export class CursorWorkerSession {
   ) => ChildProcessWithoutNullStreams;
   readonly #resultParser: AgentHubWorkerResultParser;
   readonly #stopTimeoutMs: number;
+  readonly #streamParserOptions: { maxLineBytes?: number; maxTotalBytes?: number } | undefined;
 
   #started = false;
   #active = false;
@@ -78,6 +83,8 @@ export class CursorWorkerSession {
   #sessionId: string | undefined;
   #currentProcess: ChildProcessWithoutNullStreams | null = null;
   #executablePath: string | undefined;
+  #turnGeneration = 0;
+  #settleActiveTurn: ((error: Error) => void) | null = null;
 
   public constructor(options: CursorWorkerSessionOptions) {
     this.#context = options.context;
@@ -86,6 +93,7 @@ export class CursorWorkerSession {
     this.#spawnProcess = options.spawnProcess ?? ((cmd, args, opts) => spawn(cmd, args, opts));
     this.#resultParser = options.resultParser ?? new AgentHubWorkerResultParser();
     this.#stopTimeoutMs = options.stopTimeoutMs ?? 5_000;
+    this.#streamParserOptions = options.streamParserOptions;
   }
 
   public get started(): boolean {
@@ -143,11 +151,10 @@ export class CursorWorkerSession {
 
     this.#active = true;
     const startTime = Date.now();
-    const timeoutMs = request.timeoutMs ?? 300_000; // 5 min default
+    const timeoutMs = request.timeoutMs ?? 300_000;
 
     try {
-      const result = await this.#executeTurnProcess(request.prompt, timeoutMs, startTime);
-      return result;
+      return await this.#executeTurnProcess(request.prompt, timeoutMs, startTime);
     } catch (err) {
       this.#cleanupRequired = true;
       throw err;
@@ -160,6 +167,17 @@ export class CursorWorkerSession {
   public async shutdown(): Promise<void> {
     if (!this.#started) return;
 
+    this.#turnGeneration += 1;
+    const settle = this.#settleActiveTurn;
+    this.#settleActiveTurn = null;
+    if (settle !== null) {
+      settle(
+        new CursorWorkerSessionError(
+          'CURSOR_WORKER_SESSION_PROCESS_FAILED',
+          'Cursor worker session shut down during active turn',
+        ),
+      );
+    }
     if (this.#currentProcess !== null) {
       await this.#killProcessTree(this.#currentProcess);
       this.#currentProcess = null;
@@ -179,8 +197,9 @@ export class CursorWorkerSession {
     const model = typeof this.#config?.model === 'string' ? this.#config.model : undefined;
     if (model) args.push('--model', model);
 
-    if (this.#sessionId !== undefined) {
-      args.push('--resume', this.#sessionId);
+    const ownedSessionId = this.#sessionId;
+    if (ownedSessionId !== undefined) {
+      args.push('--resume', ownedSessionId);
     }
 
     const executable = this.#executablePath ?? resolveCursorExecutable('agent');
@@ -190,81 +209,109 @@ export class CursorWorkerSession {
       windowsHide: true,
     };
 
+    const generation = ++this.#turnGeneration;
     const child = this.#spawnProcess(executable, args, spawnOpts);
     this.#currentProcess = child;
 
-    const parser = new CursorStreamParser();
+    const parser = new CursorStreamParser(this.#streamParserOptions);
     let stderrText = '';
-
-    child.stdout.on('data', (chunk: Buffer | string) => {
-      parser.feed(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
-    });
-
-    child.stderr.on('data', (chunk: Buffer | string) => {
-      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-      if (stderrText.length < 32 * 1024) stderrText += text;
-    });
-
-    // Write prompt strictly to stdin, never argv
-    child.stdin.setDefaultEncoding('utf8');
-    child.stdin.write(fullPrompt);
-    child.stdin.end();
 
     const outcome = await new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       let settled = false;
-      const timer = setTimeout(() => {
-        void (async () => {
-          if (settled) return;
-          settled = true;
-          await this.#killProcessTree(child);
-          reject(
-            new CursorWorkerSessionError(
-              'CURSOR_WORKER_SESSION_TIMEOUT',
-              `Cursor process timed out after ${String(timeoutMs)} ms`,
-            ),
-          );
-        })();
-      }, timeoutMs);
 
-      child.on('error', (err) => {
+      const settleFatal = (error: Error): void => {
         if (settled) return;
         settled = true;
+        this.#settleActiveTurn = null;
         clearTimeout(timer);
-        reject(err);
+        reject(error);
+        void this.#killProcessTree(child);
+      };
+
+      this.#settleActiveTurn = settleFatal;
+
+      const settleOk = (value: { exitCode: number | null; signal: NodeJS.Signals | null }): void => {
+        if (settled) return;
+        settled = true;
+        this.#settleActiveTurn = null;
+        clearTimeout(timer);
+        resolve(value);
+      };
+
+      const timer = setTimeout(() => {
+        settleFatal(
+          new CursorWorkerSessionError(
+            'CURSOR_WORKER_SESSION_TIMEOUT',
+            `Cursor process timed out after ${String(timeoutMs)} ms`,
+          ),
+        );
+      }, timeoutMs);
+
+      child.stdout.on('data', (chunk: Buffer | string) => {
+        if (generation !== this.#turnGeneration) return;
+        try {
+          parser.feed(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+        } catch (err) {
+          settleFatal(this.#toProtocolError(err));
+        }
+      });
+
+      child.stderr.on('data', (chunk: Buffer | string) => {
+        if (generation !== this.#turnGeneration) return;
+        const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+        if (stderrText.length < 32 * 1024) stderrText += text;
+      });
+
+      child.stdin.setDefaultEncoding('utf8');
+      child.stdin.write(fullPrompt);
+      child.stdin.end();
+
+      child.on('error', (err) => {
+        if (generation !== this.#turnGeneration) return;
+        settleFatal(err);
       });
 
       child.on('exit', (exitCode, signal) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve({ exitCode, signal });
+        if (generation !== this.#turnGeneration) return;
+        settleOk({ exitCode, signal });
       });
     });
 
-    const finishResult = parser.finish();
-    const durationMs = Date.now() - startTime;
+    let finishResult: { sessionId?: string; responseText: string };
+    try {
+      finishResult = parser.finish();
+    } catch (err) {
+      throw this.#toProtocolError(err);
+    }
 
-    // Validate returned session identity
-    if (this.#sessionId === undefined) {
-      if (finishResult.sessionId !== undefined) {
-        this.#sessionId = finishResult.sessionId;
+    const durationMs = Date.now() - startTime;
+    const returnedSessionId = finishResult.sessionId;
+
+    if (ownedSessionId === undefined) {
+      if (returnedSessionId === undefined || returnedSessionId.trim().length === 0) {
+        throw new CursorWorkerSessionError(
+          'CURSOR_WORKER_SESSION_SESSION_ID_MISSING',
+          'Cursor first turn completed without a trusted session_id',
+        );
       }
-    } else if (finishResult.sessionId !== undefined && finishResult.sessionId !== this.#sessionId) {
+      this.#sessionId = returnedSessionId;
+    } else if (returnedSessionId === undefined || returnedSessionId.trim().length === 0) {
+      throw new CursorWorkerSessionError(
+        'CURSOR_WORKER_SESSION_SESSION_ID_MISSING',
+        `Cursor resume turn completed without returning session_id ${ownedSessionId}`,
+      );
+    } else if (returnedSessionId !== ownedSessionId) {
       throw new CursorWorkerSessionError(
         'CURSOR_WORKER_SESSION_SESSION_MISMATCH',
-        `Cursor resumed session identity mismatch: expected ${this.#sessionId}, got ${finishResult.sessionId}`,
+        `Cursor resumed session identity mismatch: expected ${ownedSessionId}, got ${returnedSessionId}`,
       );
     }
 
     if (outcome.exitCode !== 0 && outcome.exitCode !== null) {
-      // If output didn't yield worker result, treat non-zero exit as failure
-      const parsedAttempt = this.#resultParser.parse(finishResult.responseText);
-      if (!parsedAttempt.success) {
-        throw new CursorWorkerSessionError(
-          'CURSOR_WORKER_SESSION_PROCESS_FAILED',
-          `Cursor process exited with code ${String(outcome.exitCode)}: ${stderrText.slice(0, 1024)}`,
-        );
-      }
+      throw new CursorWorkerSessionError(
+        'CURSOR_WORKER_SESSION_PROCESS_FAILED',
+        `Cursor process exited with code ${String(outcome.exitCode)}: ${stderrText.slice(0, 1024)}`,
+      );
     }
 
     const parsed = this.#resultParser.parse(finishResult.responseText);
@@ -272,7 +319,7 @@ export class CursorWorkerSession {
       return {
         protocolValid: true,
         workerResult: parsed.result,
-        ...(this.#sessionId !== undefined ? { sessionId: this.#sessionId } : {}),
+        sessionId: this.#sessionId ?? returnedSessionId,
         durationMs,
       };
     }
@@ -286,6 +333,16 @@ export class CursorWorkerSession {
     };
   }
 
+  #toProtocolError(err: unknown): CursorWorkerSessionError {
+    if (err instanceof CursorWorkerSessionError) return err;
+    if (err instanceof CursorStreamParseError) {
+      return new CursorWorkerSessionError('CURSOR_WORKER_SESSION_PROTOCOL', err.message, { cause: err });
+    }
+    return err instanceof Error
+      ? new CursorWorkerSessionError('CURSOR_WORKER_SESSION_PROTOCOL', err.message, { cause: err })
+      : new CursorWorkerSessionError('CURSOR_WORKER_SESSION_PROTOCOL', String(err));
+  }
+
   async #killProcessTree(child: ChildProcessWithoutNullStreams): Promise<void> {
     if (child.pid === undefined) return;
     const pid = child.pid;
@@ -297,9 +354,15 @@ export class CursorWorkerSession {
           windowsHide: true,
         });
         await new Promise<void>((resolve) => {
-          killer.on('exit', () => resolve());
-          killer.on('error', () => resolve());
-          setTimeout(resolve, this.#stopTimeoutMs);
+          const timer = setTimeout(resolve, this.#stopTimeoutMs);
+          killer.on('exit', () => {
+            clearTimeout(timer);
+            resolve();
+          });
+          killer.on('error', () => {
+            clearTimeout(timer);
+            resolve();
+          });
         });
       } catch {
         // ignore fallback

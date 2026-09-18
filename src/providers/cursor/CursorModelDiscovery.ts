@@ -21,6 +21,19 @@ export interface CursorModelDiscoveryOptions {
   };
 }
 
+export class CursorModelDiscoveryError extends Error {
+  public constructor(
+    public readonly code:
+      | 'CURSOR_MODEL_DISCOVERY_MALFORMED'
+      | 'CURSOR_MODEL_DISCOVERY_OVERFLOW'
+      | 'CURSOR_MODEL_DISCOVERY_INVALID_ENTRY',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'CursorModelDiscoveryError';
+  }
+}
+
 const MAX_MODELS = 512;
 const MAX_MODEL_ID_BYTES = 256;
 const MAX_LABEL_BYTES = 512;
@@ -34,16 +47,15 @@ export function discoverCursorModels(
 
   try {
     const res = runner(executablePath, ['models'], timeoutMs);
-    if (res.exitCode !== 0 || !res.stdout.trim()) {
-      return { modelDiscovery: 'unavailable', models: [] };
+    if (res.error?.toLowerCase().includes('timeout') === true) {
+      return { modelDiscovery: 'unavailable', models: Object.freeze([]) };
     }
-    const parsed = parseCursorModelsOutput(res.stdout);
-    if (parsed.length === 0) {
-      return { modelDiscovery: 'unavailable', models: [] };
+    if (res.exitCode !== 0) {
+      return { modelDiscovery: 'unavailable', models: Object.freeze([]) };
     }
-    return { modelDiscovery: 'native', models: Object.freeze(parsed) };
+    return parseCursorModelsOutput(res.stdout);
   } catch {
-    return { modelDiscovery: 'unavailable', models: [] };
+    return { modelDiscovery: 'unavailable', models: Object.freeze([]) };
   }
 }
 
@@ -66,61 +78,148 @@ function defaultRunner(
   };
 }
 
-export function parseCursorModelsOutput(stdout: string): CursorModelDto[] {
+export function parseCursorModelsOutput(stdout: string): CursorModelDiscoveryResult {
   const trimmed = stdout.trim();
-  if (!trimmed) return [];
-
-  let rawList: unknown[] = [];
-  try {
-    const json = JSON.parse(trimmed) as unknown;
-    if (Array.isArray(json)) {
-      rawList = json;
-    } else if (typeof json === 'object' && json !== null && Array.isArray((json as Record<string, unknown>).models)) {
-      rawList = (json as Record<string, unknown>).models as unknown[];
-    }
-  } catch {
-    // fallback line-by-line parsing
-    rawList = trimmed
-      .split(/\r?\n/u)
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0 && !l.startsWith('#') && !l.startsWith('Warning:') && !l.startsWith('Error:'));
+  if (!trimmed) {
+    return { modelDiscovery: 'unavailable', models: Object.freeze([]) };
   }
 
-  const seen = new Set<string>();
+  try {
+    const models = parseKnownGrammar(trimmed);
+    return { modelDiscovery: 'native', models: Object.freeze(models) };
+  } catch {
+    return { modelDiscovery: 'unavailable', models: Object.freeze([]) };
+  }
+}
+
+function parseKnownGrammar(trimmed: string): CursorModelDto[] {
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    let json: unknown;
+    try {
+      json = JSON.parse(trimmed) as unknown;
+    } catch {
+      throw new CursorModelDiscoveryError(
+        'CURSOR_MODEL_DISCOVERY_MALFORMED',
+        'Cursor native model discovery returned malformed JSON',
+      );
+    }
+    return parseJsonModels(json);
+  }
+
+  if (looksLikeHelpOrBanner(trimmed)) {
+    throw new CursorModelDiscoveryError(
+      'CURSOR_MODEL_DISCOVERY_MALFORMED',
+      'Cursor native model discovery output is not a known model grammar',
+    );
+  }
+
+  return parseLineList(trimmed);
+}
+
+function parseJsonModels(json: unknown): CursorModelDto[] {
+  if (Array.isArray(json)) {
+    return parseModelItems(json);
+  }
+  if (typeof json === 'object' && json !== null && !Array.isArray(json)) {
+    const models = (json as Record<string, unknown>).models;
+    if (!Array.isArray(models)) {
+      throw new CursorModelDiscoveryError(
+        'CURSOR_MODEL_DISCOVERY_MALFORMED',
+        'Cursor native model discovery JSON object is not a known schema',
+      );
+    }
+    return parseModelItems(models);
+  }
+  throw new CursorModelDiscoveryError(
+    'CURSOR_MODEL_DISCOVERY_MALFORMED',
+    'Cursor native model discovery JSON is not a known schema',
+  );
+}
+
+function parseLineList(trimmed: string): CursorModelDto[] {
+  const lines = trimmed.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line.length > 0);
+  return parseModelItems(lines);
+}
+
+function parseModelItems(rawList: readonly unknown[]): CursorModelDto[] {
+  if (rawList.length > MAX_MODELS) {
+    throw new CursorModelDiscoveryError(
+      'CURSOR_MODEL_DISCOVERY_OVERFLOW',
+      `Cursor native model discovery returned ${String(rawList.length)} models; maximum is ${String(MAX_MODELS)}`,
+    );
+  }
+
+  const seen = new Map<string, string>();
   const models: CursorModelDto[] = [];
 
   for (const item of rawList) {
-    let modelId = '';
-    let label = '';
-
-    if (typeof item === 'string') {
-      modelId = item.trim();
-      label = item.trim();
-    } else if (typeof item === 'object' && item !== null) {
-      const rec = item as Record<string, unknown>;
-      const rawId = typeof rec.modelId === 'string' ? rec.modelId
-        : typeof rec.id === 'string' ? rec.id
-        : typeof rec.slug === 'string' ? rec.slug
-        : typeof rec.name === 'string' ? rec.name
-        : '';
-      modelId = rawId.trim();
-      const rawLabel = typeof rec.label === 'string' ? rec.label
-        : typeof rec.name === 'string' ? rec.name
-        : typeof rec.displayName === 'string' ? rec.displayName
-        : modelId;
-      label = rawLabel.trim();
+    const parsed = parseModelItem(item);
+    const existing = seen.get(parsed.modelId);
+    if (existing !== undefined) {
+      if (existing !== parsed.label) {
+        throw new CursorModelDiscoveryError(
+          'CURSOR_MODEL_DISCOVERY_INVALID_ENTRY',
+          `Cursor native model discovery contained conflicting rows for ${parsed.modelId}`,
+        );
+      }
+      continue;
     }
-
-    if (!modelId || modelId.includes('\0') || label.includes('\0')) continue;
-    if (Buffer.byteLength(modelId, 'utf8') > MAX_MODEL_ID_BYTES) continue;
-    if (Buffer.byteLength(label, 'utf8') > MAX_LABEL_BYTES) continue;
-    if (seen.has(modelId)) continue;
-
-    seen.add(modelId);
-    models.push(Object.freeze({ modelId, label: label || modelId }));
-
-    if (models.length >= MAX_MODELS) break;
+    seen.set(parsed.modelId, parsed.label);
+    models.push(Object.freeze(parsed));
   }
 
   return models;
+}
+
+function parseModelItem(item: unknown): CursorModelDto {
+  if (typeof item === 'string') {
+    return validateModel(item, item);
+  }
+  if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
+    const rec = item as Record<string, unknown>;
+    const rawId = firstString(rec, ['modelId', 'id', 'slug', 'name']);
+    const rawLabel = firstString(rec, ['label', 'displayName', 'name']) ?? rawId;
+    if (rawId === undefined) {
+      throw new CursorModelDiscoveryError(
+        'CURSOR_MODEL_DISCOVERY_INVALID_ENTRY',
+        'Cursor native model discovery object is missing modelId',
+      );
+    }
+    return validateModel(rawId, rawLabel ?? rawId);
+  }
+  throw new CursorModelDiscoveryError(
+    'CURSOR_MODEL_DISCOVERY_INVALID_ENTRY',
+    'Cursor native model discovery contained an unexpected primitive',
+  );
+}
+
+function validateModel(rawId: string, rawLabel: string): CursorModelDto {
+  const modelId = rawId.trim();
+  const label = rawLabel.trim();
+  if (modelId.length === 0) {
+    throw new CursorModelDiscoveryError('CURSOR_MODEL_DISCOVERY_INVALID_ENTRY', 'Cursor native modelId is blank');
+  }
+  if (modelId.includes('\0') || label.includes('\0')) {
+    throw new CursorModelDiscoveryError('CURSOR_MODEL_DISCOVERY_INVALID_ENTRY', 'Cursor native model metadata contains NUL');
+  }
+  if (Buffer.byteLength(modelId, 'utf8') > MAX_MODEL_ID_BYTES) {
+    throw new CursorModelDiscoveryError('CURSOR_MODEL_DISCOVERY_INVALID_ENTRY', 'Cursor native modelId exceeds size limit');
+  }
+  if (Buffer.byteLength(label, 'utf8') > MAX_LABEL_BYTES) {
+    throw new CursorModelDiscoveryError('CURSOR_MODEL_DISCOVERY_INVALID_ENTRY', 'Cursor native model label exceeds size limit');
+  }
+  return { modelId, label: label.length > 0 ? label : modelId };
+}
+
+function firstString(record: Record<string, unknown>, keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string') return value;
+  }
+  return undefined;
+}
+
+function looksLikeHelpOrBanner(text: string): boolean {
+  const first = text.split(/\r?\n/u).map((line) => line.trim()).find((line) => line.length > 0) ?? '';
+  return /^(?:usage:|error:|warning:|#|options:|commands:)/iu.test(first);
 }

@@ -88,7 +88,7 @@ class CursorAgentProviderSession implements AgentProviderSession {
         protocol: 'worker-result',
         protocolValid: true,
         workerResult: result.workerResult,
-        ...(result.sessionId !== undefined ? { sessionId: result.sessionId } : {}),
+        sessionId: result.sessionId,
         durationMs: result.durationMs,
       };
     }

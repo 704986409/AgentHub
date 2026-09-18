@@ -88,7 +88,7 @@ class AntigravityAgentProviderSession implements AgentProviderSession {
         protocol: 'worker-result',
         protocolValid: true,
         workerResult: result.workerResult,
-        ...(result.conversationId !== undefined ? { sessionId: result.conversationId } : {}),
+        sessionId: result.conversationId,
         durationMs: result.durationMs,
       };
     }

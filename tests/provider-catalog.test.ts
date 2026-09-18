@@ -144,4 +144,27 @@ describe('ProviderCatalogService', () => {
     expect(service.isUsableSync('antigravity')).toBe(false);
     expect(service.isUsableSync('unknown-provider')).toBe(false);
   }, 5_000);
+
+  it('keeps native empty model lists authoritative', async () => {
+    const service = new ProviderCatalogService({
+      claudeDetector: createMockDetector(true, true),
+      codexDetector: createMockDetector(true, true),
+      cursorDetector: {
+        detect: () => ({
+          installed: true,
+          usable: true,
+          version: '1.0.0',
+          status: 'READY',
+          modelDiscovery: 'native',
+          models: [],
+        }),
+      },
+      antigravityDetector: createMockDetector(true, true),
+    });
+
+    const catalog = await service.getCatalog();
+    const cursor = catalog.find((p) => p.providerId === 'cursor');
+    expect(cursor?.modelDiscovery).toBe('native');
+    expect(cursor?.models).toEqual([]);
+  }, 5_000);
 });

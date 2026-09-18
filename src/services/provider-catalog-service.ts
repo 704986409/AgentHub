@@ -245,6 +245,11 @@ export class ProviderCatalogService {
       const status: ProviderRuntimeStatus = res.status ?? (res.installed ? 'READY' : 'EXECUTABLE_NOT_FOUND');
       const usable = res.usable ?? (status === 'READY');
 
+      const sessionContinuation = typeof res.capabilities === 'object' && res.capabilities !== null
+        && typeof (res.capabilities as { sessionContinuation?: unknown }).sessionContinuation === 'boolean'
+        ? (res.capabilities as { sessionContinuation: boolean }).sessionContinuation
+        : CURSOR_AGENT_PROVIDER_CAPABILITIES.sessionContinuation;
+
       return Object.freeze({
         providerId: 'cursor',
         supported: true,
@@ -253,7 +258,10 @@ export class ProviderCatalogService {
         authenticated: res.authenticated ?? null,
         version: res.version ? res.version.slice(0, 64) : null,
         status,
-        capabilities: CURSOR_AGENT_PROVIDER_CAPABILITIES,
+        capabilities: Object.freeze({
+          outputProtocols: CURSOR_AGENT_PROVIDER_CAPABILITIES.outputProtocols,
+          sessionContinuation,
+        }),
         modelDiscovery: res.modelDiscovery ?? (res.models && res.models.length > 0 ? 'native' : 'unavailable'),
         models: res.models ? Object.freeze([...res.models]) : Object.freeze([]),
         checkedAt,
@@ -281,6 +289,11 @@ export class ProviderCatalogService {
       const status: ProviderRuntimeStatus = res.status ?? (res.installed ? 'READY' : 'EXECUTABLE_NOT_FOUND');
       const usable = res.usable ?? (status === 'READY');
 
+      const sessionContinuation = typeof res.capabilities === 'object' && res.capabilities !== null
+        && typeof (res.capabilities as { sessionContinuation?: unknown }).sessionContinuation === 'boolean'
+        ? (res.capabilities as { sessionContinuation: boolean }).sessionContinuation
+        : ANTIGRAVITY_AGENT_PROVIDER_CAPABILITIES.sessionContinuation;
+
       return Object.freeze({
         providerId: 'antigravity',
         supported: true,
@@ -289,7 +302,10 @@ export class ProviderCatalogService {
         authenticated: res.authenticated ?? null,
         version: res.version ? res.version.slice(0, 64) : null,
         status,
-        capabilities: ANTIGRAVITY_AGENT_PROVIDER_CAPABILITIES,
+        capabilities: Object.freeze({
+          outputProtocols: ANTIGRAVITY_AGENT_PROVIDER_CAPABILITIES.outputProtocols,
+          sessionContinuation,
+        }),
         modelDiscovery: res.modelDiscovery ?? (res.models && res.models.length > 0 ? 'native' : 'unavailable'),
         models: res.models ? Object.freeze([...res.models]) : Object.freeze([]),
         checkedAt,

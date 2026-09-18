@@ -8,6 +8,7 @@ import {
   discoverAntigravityModels,
   type AntigravityModelDto,
 } from './AntigravityModelDiscovery.js';
+import { ANTIGRAVITY_CONVERSATION_RESUME_FLAG } from './AntigravityWorkerSession.js';
 import type { ProviderRuntimeStatus } from '../../services/provider-catalog-service.js';
 
 export interface AntigravityCapabilityReport {
@@ -20,7 +21,7 @@ export interface AntigravityCapabilityReport {
   readonly status: ProviderRuntimeStatus;
   readonly capabilities: {
     readonly outputProtocols: readonly ['worker-result'];
-    readonly sessionContinuation: true;
+    readonly sessionContinuation: boolean;
   };
   readonly modelDiscovery: 'native' | 'unavailable';
   readonly models: readonly AntigravityModelDto[];
@@ -45,6 +46,9 @@ export const ANTIGRAVITY_CAPABILITIES = Object.freeze({
   sessionContinuation: true,
 });
 
+const ANTIGRAVITY_STREAM_TOKENS = Object.freeze(['--input-format', '--output-format', 'stream-json']);
+const ANTIGRAVITY_HEADLESS_TOKENS = Object.freeze(['--headless', '--non-interactive', '--print', '-p']);
+
 export class AntigravityCapabilityDetector {
   readonly #command: string;
   readonly #env: NodeJS.ProcessEnv;
@@ -62,7 +66,7 @@ export class AntigravityCapabilityDetector {
     this.#env = options.env ?? process.env;
     this.#timeoutMs = options.timeoutMs ?? 5_000;
     this.#resolver = options.resolver ?? ((cmd, env) => resolveAntigravityExecutable(cmd, env));
-    this.#runner = options.runner ?? defaultRunner;
+    this.#runner = options.runner ?? ((executable, args) => defaultRunner(executable, args, this.#timeoutMs));
   }
 
   public detect(): AntigravityCapabilityReport {
@@ -73,31 +77,17 @@ export class AntigravityCapabilityDetector {
       executablePath = this.#resolver(this.#command, this.#env);
     } catch (err) {
       if (err instanceof AntigravityExecutableResolutionError || (err instanceof Error && err.message.includes('not found'))) {
-        return Object.freeze({
-          providerId: 'antigravity',
-          supported: true,
+        return this.#report({
           usable: false,
           installed: false,
-          authenticated: null,
-          version: null,
           status: 'EXECUTABLE_NOT_FOUND',
-          capabilities: ANTIGRAVITY_CAPABILITIES,
-          modelDiscovery: 'unavailable',
-          models: Object.freeze([]),
           checkedAt,
         });
       }
-      return Object.freeze({
-        providerId: 'antigravity',
-        supported: true,
+      return this.#report({
         usable: false,
         installed: false,
-        authenticated: null,
-        version: null,
         status: 'PROBE_FAILED',
-        capabilities: ANTIGRAVITY_CAPABILITIES,
-        modelDiscovery: 'unavailable',
-        models: Object.freeze([]),
         checkedAt,
       });
     }
@@ -105,70 +95,104 @@ export class AntigravityCapabilityDetector {
     let version: string | null = null;
     try {
       const probeRes = this.#runner(executablePath, ['--version']);
-      if (probeRes.error && probeRes.error.toLowerCase().includes('timeout')) {
-        return Object.freeze({
-          providerId: 'antigravity',
-          supported: true,
+      if (isTimeout(probeRes.error)) {
+        return this.#report({
           usable: false,
           installed: true,
-          authenticated: null,
-          version: null,
           status: 'PROBE_TIMEOUT',
-          capabilities: ANTIGRAVITY_CAPABILITIES,
-          modelDiscovery: 'unavailable',
-          models: Object.freeze([]),
           checkedAt,
         });
       }
       if (probeRes.exitCode !== 0) {
-        return Object.freeze({
-          providerId: 'antigravity',
-          supported: true,
+        return this.#report({
           usable: false,
           installed: true,
-          authenticated: null,
-          version: null,
           status: 'PROBE_FAILED',
-          capabilities: ANTIGRAVITY_CAPABILITIES,
-          modelDiscovery: 'unavailable',
-          models: Object.freeze([]),
           checkedAt,
         });
       }
       version = parseVersion(probeRes.stdout || probeRes.stderr);
     } catch {
-      return Object.freeze({
-        providerId: 'antigravity',
-        supported: true,
+      return this.#report({
         usable: false,
         installed: true,
-        authenticated: null,
-        version: null,
         status: 'PROBE_FAILED',
-        capabilities: ANTIGRAVITY_CAPABILITIES,
-        modelDiscovery: 'unavailable',
-        models: Object.freeze([]),
         checkedAt,
       });
     }
 
-    const modelResult = discoverAntigravityModels(executablePath, {
-      timeoutMs: this.#timeoutMs,
-      runner: this.#runner,
-    });
+    const helpRes = this.#runner(executablePath, ['--help']);
+    if (isTimeout(helpRes.error)) {
+      return this.#report({
+        usable: false,
+        installed: true,
+        version,
+        status: 'PROBE_TIMEOUT',
+        checkedAt,
+      });
+    }
 
-    return Object.freeze({
-      providerId: 'antigravity',
-      supported: true,
+    const helpText = `${helpRes.stdout}\n${helpRes.stderr}`;
+    const streamOk = ANTIGRAVITY_STREAM_TOKENS.every((token) => helpText.includes(token));
+    const headlessOk = ANTIGRAVITY_HEADLESS_TOKENS.some((token) => helpText.includes(token));
+    const conversationResumeOk = helpText.includes(ANTIGRAVITY_CONVERSATION_RESUME_FLAG);
+
+    if (!streamOk || !headlessOk || !conversationResumeOk) {
+      return this.#report({
+        usable: false,
+        installed: true,
+        version,
+        status: 'PROBE_FAILED',
+        sessionContinuation: false,
+        checkedAt,
+      });
+    }
+
+    const nativeAdvertised = /\bmodels\b/u.test(helpText);
+    const modelResult = nativeAdvertised
+      ? discoverAntigravityModels(executablePath, {
+          timeoutMs: this.#timeoutMs,
+          runner: this.#runner,
+        })
+      : { modelDiscovery: 'unavailable' as const, models: Object.freeze([]) as readonly AntigravityModelDto[] };
+
+    return this.#report({
       usable: true,
       installed: true,
-      authenticated: null,
       version: version || 'unknown',
       status: 'READY',
-      capabilities: ANTIGRAVITY_CAPABILITIES,
+      sessionContinuation: true,
       modelDiscovery: modelResult.modelDiscovery,
       models: modelResult.models,
       checkedAt,
+    });
+  }
+
+  #report(input: {
+    usable: boolean;
+    installed: boolean;
+    version?: string | null;
+    status: ProviderRuntimeStatus;
+    sessionContinuation?: boolean;
+    modelDiscovery?: 'native' | 'unavailable';
+    models?: readonly AntigravityModelDto[];
+    checkedAt: string;
+  }): AntigravityCapabilityReport {
+    return Object.freeze({
+      providerId: 'antigravity',
+      supported: true,
+      usable: input.usable,
+      installed: input.installed,
+      authenticated: null,
+      version: input.version ?? null,
+      status: input.status,
+      capabilities: Object.freeze({
+        outputProtocols: ANTIGRAVITY_CAPABILITIES.outputProtocols,
+        sessionContinuation: input.sessionContinuation ?? false,
+      }),
+      modelDiscovery: input.modelDiscovery ?? 'unavailable',
+      models: Object.freeze([...(input.models ?? [])]),
+      checkedAt: input.checkedAt,
     });
   }
 }
@@ -179,15 +203,20 @@ function parseVersion(raw: string): string {
   return match?.[1] ?? line.slice(0, 64).trim();
 }
 
+function isTimeout(error: string | undefined): boolean {
+  return error?.toLowerCase().includes('timeout') === true;
+}
+
 function defaultRunner(
   executable: string,
   args: readonly string[],
+  timeoutMs: number,
 ): { exitCode: number | null; stdout: string; stderr: string; error?: string | undefined } {
   const result = spawnSync(executable, [...args], {
     encoding: 'utf8',
     shell: false,
     windowsHide: true,
-    timeout: 5_000,
+    timeout: timeoutMs,
   });
   return {
     exitCode: result.status,
