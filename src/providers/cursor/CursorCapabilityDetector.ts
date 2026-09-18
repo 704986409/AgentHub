@@ -112,7 +112,18 @@ export class CursorCapabilityDetector {
       });
     }
 
-    const helpRes = this.#runner(executablePath, ['--help']);
+    let helpRes;
+    try {
+      helpRes = this.#runner(executablePath, ['--help']);
+    } catch {
+      return this.#report({
+        usable: false,
+        installed: true,
+        version,
+        status: 'PROBE_FAILED',
+        checkedAt,
+      });
+    }
     if (isTimeout(helpRes.error)) {
       return this.#report({
         usable: false,

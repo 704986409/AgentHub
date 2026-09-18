@@ -90,6 +90,8 @@ export class AntigravityWorkerSession {
   #turnGeneration = 0;
   #stdoutListener: ((chunk: Buffer | string) => void) | null = null;
   #stderrListener: ((chunk: Buffer | string) => void) | null = null;
+  #errorListener: ((error: Error) => void) | null = null;
+  #exitListener: ((exitCode: number | null, signal: NodeJS.Signals | null) => void) | null = null;
   #settleActiveTurn: ((error: Error) => void) | null = null;
   #cleanupInFlight: Promise<void> | null = null;
   #cleanupFailed = false;
@@ -228,7 +230,10 @@ export class AntigravityWorkerSession {
     if (model) args.push('--model', model);
 
     const ownedConversationId = this.#conversationId;
-    const processAlive = this.#process !== null && this.#process.exitCode === null;
+    const processAlive =
+      this.#process !== null &&
+      this.#process.exitCode === null &&
+      this.#process.signalCode === null;
     if (!processAlive && ownedConversationId !== undefined) {
       args.push(this.#resumeFlag, ownedConversationId);
     }
@@ -282,7 +287,7 @@ export class AntigravityWorkerSession {
         this.#settleActiveTurn = null;
         clearTimeout(timer);
         this.#detachListeners();
-        if (child.exitCode !== null || child.signalCode != null) {
+        if (child.exitCode !== null || child.signalCode !== null) {
           if (this.#process === child) this.#process = null;
         }
         resolve(value);
@@ -335,14 +340,14 @@ export class AntigravityWorkerSession {
 
       const onError = (err: Error): void => {
         if (generation !== this.#turnGeneration) return;
-        child.off('exit', onExit);
         settleFatal(err);
       };
       const onExit = (exitCode: number | null): void => {
         if (generation !== this.#turnGeneration) return;
-        child.off('error', onError);
         settleOk({ exitCode });
       };
+      this.#errorListener = onError;
+      this.#exitListener = onExit;
       child.once('error', onError);
       child.once('exit', onExit);
     });
@@ -411,8 +416,16 @@ export class AntigravityWorkerSession {
     if (child !== null && this.#stderrListener !== null) {
       child.stderr.off('data', this.#stderrListener);
     }
+    if (child !== null && this.#errorListener !== null) {
+      child.off('error', this.#errorListener);
+    }
+    if (child !== null && this.#exitListener !== null) {
+      child.off('exit', this.#exitListener);
+    }
     this.#stdoutListener = null;
     this.#stderrListener = null;
+    this.#errorListener = null;
+    this.#exitListener = null;
   }
 
   #toProtocolError(err: unknown): AntigravityWorkerSessionError {
