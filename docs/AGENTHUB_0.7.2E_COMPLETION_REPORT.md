@@ -9,8 +9,8 @@ Base tag: 0.7.2D (MUST NOT MOVE)
 Historical tags 0.7.2 / 0.7.2A / 0.7.2B / 0.7.2C: unchanged
 Release version: 0.7.2E
 Release tag: 0.7.2E
-Production SHA: pending-git-commit
-Tag head: pending-git-commit
+Production SHA: 2e8dda40581061021632e4d0ec232f68f67aef99
+Tag head: pending-docs-commit
 ```
 
 ## Exact production fixes
