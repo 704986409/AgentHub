@@ -731,7 +731,7 @@ describe('0.7.1A Management event atomicity', () => {
   it('emits zero AgentCreated and zero AgentDeleted when create fails during pool registration', { timeout }, () => {
     setup();
     const published: DomainEventType[] = [];
-    bus.subscribe((event) => { published.push(event.eventType); });
+    bus.subscribe((event) => { published.push(event.eventType as DomainEventType); });
 
     const originalRegister = pool.register.bind(pool);
     Object.assign(pool, {
@@ -750,7 +750,7 @@ describe('0.7.1A Management event atomicity', () => {
     setup();
     const created = management.createAgent(validCreate);
     const published: DomainEventType[] = [];
-    bus.subscribe((event) => { published.push(event.eventType); });
+    bus.subscribe((event) => { published.push(event.eventType as DomainEventType); });
 
     const originalRegister = pool.register.bind(pool);
     let failNext = true;
@@ -776,7 +776,7 @@ describe('0.7.1A Management event atomicity', () => {
     setup();
     const created = management.createAgent(validCreate);
     const published: DomainEventType[] = [];
-    bus.subscribe((event) => { published.push(event.eventType); });
+    bus.subscribe((event) => { published.push(event.eventType as DomainEventType); });
 
     profiles.failRemove = true;
     expect(() => management.deleteAgent(created.id)).toThrow();
@@ -790,7 +790,7 @@ describe('0.7.1A Management event atomicity', () => {
   it('publishes exactly one AgentCreated on successful create', { timeout }, () => {
     setup();
     const published: DomainEventType[] = [];
-    bus.subscribe((event) => { published.push(event.eventType); });
+    bus.subscribe((event) => { published.push(event.eventType as DomainEventType); });
 
     management.createAgent(validCreate);
     expect(published.filter((e) => e === DomainEventType.AGENT_CREATED)).toHaveLength(1);
@@ -801,7 +801,7 @@ describe('0.7.1A Management event atomicity', () => {
     setup();
     const created = management.createAgent(validCreate);
     const published: DomainEventType[] = [];
-    bus.subscribe((event) => { published.push(event.eventType); });
+    bus.subscribe((event) => { published.push(event.eventType as DomainEventType); });
 
     management.updateAgent(created.id, updateFrom(created, { name: 'Renamed Worker' }));
     expect(published.filter((e) => e === DomainEventType.AGENT_UPDATED)).toHaveLength(1);
@@ -811,7 +811,7 @@ describe('0.7.1A Management event atomicity', () => {
     setup();
     const created = management.createAgent(validCreate);
     const published: DomainEventType[] = [];
-    bus.subscribe((event) => { published.push(event.eventType); });
+    bus.subscribe((event) => { published.push(event.eventType as DomainEventType); });
 
     management.deleteAgent(created.id);
     expect(published.filter((e) => e === DomainEventType.AGENT_DELETED)).toHaveLength(1);
