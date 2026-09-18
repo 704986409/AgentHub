@@ -64,7 +64,7 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
     agentPool: pool, assignmentManager: assignments });
   const agentManagement = new AgentManagementService({
     agentRegistry: agents, agentPool: pool, providerFactory, projects: projectRepository,
-    assignments: assignmentRepository, tasks,
+    assignments: assignmentRepository, tasks, eventBus,
   });
   const worktrees = await GitWorktreeManager.open({ repositoryRoot });
   const dispatcher = new AssignmentDispatcher({ taskManager: tasks, agentRegistry: agents,

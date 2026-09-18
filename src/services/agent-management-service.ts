@@ -1,4 +1,5 @@
-import { AgentStatus, type Agent } from '../core/types.js';
+import { AgentStatus, DomainEventType, type Agent } from '../core/types.js';
+import type { EventBus } from '../events/event-bus.js';
 import type { ProjectRepository, AssignmentRepository, UpdateAgentInput } from '../repositories/interfaces.js';
 import type { AgentPool, AgentPoolRegistration } from '../runtime/AgentPool.js';
 import type { AgentProviderFactory } from '../runtime/providers/AgentProviderFactory.js';
@@ -45,6 +46,7 @@ export interface AgentManagementServiceOptions {
   readonly projects: ProjectRepository;
   readonly assignments: AssignmentRepository;
   readonly tasks: TaskManager;
+  readonly eventBus?: EventBus;
 }
 
 export class AgentManagementError extends Error {
@@ -61,6 +63,7 @@ export class AgentManagementService {
   readonly #projects: ProjectRepository;
   readonly #assignments: AssignmentRepository;
   readonly #tasks: TaskManager;
+  readonly #eventBus: EventBus | undefined;
 
   public constructor(options: AgentManagementServiceOptions) {
     this.#agents = options.agentRegistry;
@@ -69,6 +72,7 @@ export class AgentManagementService {
     this.#projects = options.projects;
     this.#assignments = options.assignments;
     this.#tasks = options.tasks;
+    this.#eventBus = options.eventBus ?? options.agentRegistry.eventBusInstance;
   }
 
   public createAgent(input: CreateManagedAgentInput): Agent {
@@ -90,9 +94,15 @@ export class AgentManagementService {
       authority: input.authority,
       routingPriority: input.routingPriority,
       enabled: input.enabled,
-    });
+    }, '', { publishEvents: false });
     try {
       this.#register(agent);
+      this.#eventBus?.publish({
+        eventType: DomainEventType.AGENT_CREATED,
+        agentId: agent.id,
+        projectId: agent.projectId,
+        payload: agent,
+      });
       return agent;
     } catch (error) {
       this.#compensateCreate(agent.id);
@@ -108,8 +118,16 @@ export class AgentManagementService {
     const previousRegistered = this.#pool.has(agentId);
     if (rebind && previousRegistered) this.#pool.unregister(agentId);
     try {
-      const agent = this.#agents.updateAgent(agentId, this.#toUpdateInput(input));
+      const agent = this.#agents.updateAgent(agentId, this.#toUpdateInput(input), undefined, { publishEvents: false });
       if (rebind || !this.#pool.has(agentId)) this.#register(agent);
+      this.#eventBus?.publish({
+        eventType: DomainEventType.AGENT_UPDATED,
+        agentId: agent.id,
+        projectId: agent.projectId,
+        oldStatus: previous.status,
+        newStatus: agent.status,
+        payload: { changes: this.#toUpdateInput(input) },
+      });
       return agent;
     } catch (error) {
       this.#restorePrevious(previous);
@@ -123,6 +141,10 @@ export class AgentManagementService {
   public enableAgent(agentId: string): Agent {
     const agent = this.#requireAgent(agentId);
     this.#requireSupportedProvider(agent.provider);
+    this.#assertRuntimeClean(agent);
+    if (agent.enabled) {
+      throw new AgentManagementError('AGENT_ALREADY_ENABLED', 'Agent is already enabled');
+    }
     if (!this.#pool.has(agentId)) this.#register(agent);
     return this.#agents.enableAgent(agentId);
   }
@@ -145,13 +167,19 @@ export class AgentManagementService {
     const wasRegistered = this.#pool.has(agentId);
     if (wasRegistered) this.#pool.unregister(agentId);
     try {
-      this.#agents.deleteAgent(agentId);
+      this.#agents.deleteAgent(agentId, { publishEvents: false });
     } catch (error) {
       if (wasRegistered && !this.#pool.has(agentId)) {
         try { this.#register(previous); } catch { throw reconciliation(); }
       }
       throw error;
     }
+    this.#eventBus?.publish({
+      eventType: DomainEventType.AGENT_DELETED,
+      agentId: previous.id,
+      projectId: previous.projectId,
+      payload: { deleted: true },
+    });
     return { agentId, deleted: true };
   }
 
@@ -207,7 +235,7 @@ export class AgentManagementService {
   #compensateCreate(agentId: string): void {
     try {
       if (this.#pool.has(agentId)) this.#pool.unregister(agentId);
-      this.#agents.deleteAgent(agentId);
+      this.#agents.deleteAgent(agentId, { publishEvents: false });
     } catch {
       throw reconciliation();
     }
@@ -228,7 +256,7 @@ export class AgentManagementService {
         authority: previous.authority,
         routingPriority: previous.routingPriority,
         enabled: previous.enabled,
-      });
+      }, undefined, { publishEvents: false });
     } catch {
       throw reconciliation();
     }

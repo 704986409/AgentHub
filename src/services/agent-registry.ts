@@ -5,6 +5,10 @@ import type { AgentProfileManager } from './agent-profile-manager.js';
 import type { EventBus } from '../events/event-bus.js';
 import { DomainEventType } from '../core/types.js';
 
+export interface AgentMutationOptions {
+  readonly publishEvents?: boolean;
+}
+
 export class AgentRegistry {
   public constructor(
     private readonly repository: AgentRepository,
@@ -12,7 +16,11 @@ export class AgentRegistry {
     private readonly eventBus?: EventBus,
   ) {}
 
-  public createAgent(input: CreateAgentInput, userRules = ''): Agent {
+  public get eventBusInstance(): EventBus | undefined {
+    return this.eventBus;
+  }
+
+  public createAgent(input: CreateAgentInput, userRules = '', options?: AgentMutationOptions): Agent {
     const agent = this.repository.create(input);
     try {
       this.profiles.writeProfile(agent, userRules);
@@ -24,7 +32,9 @@ export class AgentRegistry {
       }
       throw error;
     }
-    this.eventBus?.publish({ eventType: DomainEventType.AGENT_CREATED, agentId: agent.id, projectId: agent.projectId, payload: agent });
+    if (options?.publishEvents !== false) {
+      this.eventBus?.publish({ eventType: DomainEventType.AGENT_CREATED, agentId: agent.id, projectId: agent.projectId, payload: agent });
+    }
     return agent;
   }
 
@@ -36,7 +46,7 @@ export class AgentRegistry {
     return this.repository.list();
   }
 
-  public updateAgent(id: string, input: UpdateAgentInput, userRules?: string): Agent {
+  public updateAgent(id: string, input: UpdateAgentInput, userRules?: string, options?: AgentMutationOptions): Agent {
     const previous = this.repository.findById(id);
     if (previous === null) throw new Error(`Agent ${id} was not found`);
     const previousRules = this.profiles.userRules(id);
@@ -66,26 +76,28 @@ export class AgentRegistry {
       }
       throw error;
     }
-    this.eventBus?.publish({
-      eventType: DomainEventType.AGENT_UPDATED,
-      agentId: agent.id,
-      projectId: agent.projectId,
-      oldStatus: input.status === undefined ? undefined : previous.status,
-      newStatus: input.status,
-      payload: { changes: input },
-    });
-    if (input.status !== undefined && input.status !== previous.status) {
+    if (options?.publishEvents !== false) {
       this.eventBus?.publish({
-        eventType: input.status === AgentStatus.BUSY ? DomainEventType.AGENT_LOCKED : DomainEventType.AGENT_UNLOCKED,
+        eventType: DomainEventType.AGENT_UPDATED,
         agentId: agent.id,
-        oldStatus: previous.status,
+        projectId: agent.projectId,
+        oldStatus: input.status === undefined ? undefined : previous.status,
         newStatus: input.status,
+        payload: { changes: input },
       });
+      if (input.status !== undefined && input.status !== previous.status) {
+        this.eventBus?.publish({
+          eventType: input.status === AgentStatus.BUSY ? DomainEventType.AGENT_LOCKED : DomainEventType.AGENT_UNLOCKED,
+          agentId: agent.id,
+          oldStatus: previous.status,
+          newStatus: input.status,
+        });
+      }
     }
     return agent;
   }
 
-  public deleteAgent(id: string): void {
+  public deleteAgent(id: string, options?: AgentMutationOptions): void {
     const previous = this.repository.findById(id);
     if (previous === null) throw new Error(`Agent ${id} was not found`);
     let previousRules = '';
@@ -121,12 +133,14 @@ export class AgentRegistry {
       }
       throw error;
     }
-    this.eventBus?.publish({
-      eventType: DomainEventType.AGENT_DELETED,
-      agentId: previous.id,
-      projectId: previous.projectId,
-      payload: { deleted: true },
-    });
+    if (options?.publishEvents !== false) {
+      this.eventBus?.publish({
+        eventType: DomainEventType.AGENT_DELETED,
+        agentId: previous.id,
+        projectId: previous.projectId,
+        payload: { deleted: true },
+      });
+    }
   }
 
   public enableAgent(id: string): Agent {

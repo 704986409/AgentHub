@@ -199,7 +199,7 @@ describe('V0.7.1 runtime-safe agent management', () => {
     providerFactory.register(codex);
     pool = new AgentPool({ providerFactory, eventBus: bus });
     management = new AgentManagementService({
-      agentRegistry: agents, agentPool: pool, providerFactory, projects, assignments: assignmentRepository, tasks,
+      agentRegistry: agents, agentPool: pool, providerFactory, projects, assignments: assignmentRepository, tasks, eventBus: bus,
     });
     scheduler = new AgentScheduler({
       taskManager: tasks, agentRegistry: agents, providerFactory, agentPool: pool, assignmentManager: assignments,
@@ -436,7 +436,7 @@ describe('V0.7.1 agent HTTP API', () => {
     providerFactory.register(new FakeProvider('codex'));
     pool = new AgentPool({ providerFactory, eventBus: bus });
     const management = new AgentManagementService({
-      agentRegistry: agents, agentPool: pool, providerFactory, projects, assignments: assignmentRepository, tasks,
+      agentRegistry: agents, agentPool: pool, providerFactory, projects, assignments: assignmentRepository, tasks, eventBus: bus,
     });
     const scheduler = new AgentScheduler({
       taskManager: tasks, agentRegistry: agents, providerFactory, agentPool: pool, assignmentManager: assignments,
@@ -455,10 +455,10 @@ describe('V0.7.1 agent HTTP API', () => {
     return { 'content-type': 'application/json', 'idempotency-key': key };
   }
 
-  it('exposes health 0.7.1 and full agent mutation routes with idempotency', { timeout }, async () => {
+  it('exposes health 0.7.1-a.1 and full agent mutation routes with idempotency', { timeout }, async () => {
     await start();
     const health = await fetch(`${base}/api/v1/health`, fetchTimeout);
-    expect(await health.json()).toMatchObject({ ok: true, data: { status: 'ok', version: '0.7.1' } });
+    expect(await health.json()).toMatchObject({ ok: true, data: { status: 'ok', version: '0.7.1-a.1' } });
     const createBody = JSON.stringify({ ...validCreate, projectId });
     const created = await fetch(`${base}/api/v1/agents`, {
       method: 'POST', headers: headers('create-1'), body: createBody, ...fetchTimeout,
@@ -512,6 +512,14 @@ describe('V0.7.1 agent HTTP API', () => {
     });
     expect(enabled.status).toBe(200);
 
+    const alreadyEnabled = await fetch(`${base}/api/v1/agents/${agentId}/enable`, {
+      method: 'POST', headers: headers('enable-again'), body: '{}', ...fetchTimeout,
+    });
+    expect(alreadyEnabled.status).toBe(409);
+    expect(await alreadyEnabled.json()).toMatchObject({
+      error: { code: 'AGENTHUB_API_CONFLICT' },
+    });
+
     const methodConflict = await fetch(`${base}/api/v1/agents/${agentId}/disable`, {
       method: 'POST', headers: headers('update-1'), body: '{}', ...fetchTimeout,
     });
@@ -562,5 +570,250 @@ describe('V0.7.1 agent HTTP API', () => {
     expect(denied.status).toBe(409);
     expect(agents.getAgent(agentId)).not.toBeNull();
     expect(assignmentRepository.list()).toHaveLength(1);
+  });
+});
+
+describe('0.7.1A Enable guard hardening', () => {
+  let directory: string | undefined;
+  let database: Database | undefined;
+  let bus: EventBus;
+  let profiles: ControllableProfiles;
+  let agents: AgentRegistry;
+  let tasks: TaskManager;
+  let assignmentRepository: SqliteAssignmentRepository;
+  let projects: SqliteProjectRepository;
+  let providerFactory: AgentProviderFactory;
+  let pool: AgentPool;
+  let management: AgentManagementService;
+
+  function setup(): void {
+    directory = mkdtempSync(join(tmpdir(), 'agenthub-enable-guard-'));
+    database = new Database(join(directory, 'agenthub.db'));
+    database.initialize();
+    bus = new EventBus();
+    profiles = new ControllableProfiles({ agentsDirectory: join(directory, 'agents') });
+    const agentRepository = new SqliteAgentRepository(database);
+    agents = new AgentRegistry(agentRepository, profiles, bus);
+    tasks = new TaskManager(new SqliteTaskRepository(database), new TaskStateMachine(), bus);
+    assignmentRepository = new SqliteAssignmentRepository(database);
+    new AssignmentManager(assignmentRepository, tasks, agents, (id) => agents.calculateProfileHash(id), bus);
+    projects = new SqliteProjectRepository(database);
+    providerFactory = new AgentProviderFactory();
+    providerFactory.register(new FakeProvider('claude'));
+    providerFactory.register(new FakeProvider('codex'));
+    pool = new AgentPool({ providerFactory, eventBus: bus });
+    management = new AgentManagementService({
+      agentRegistry: agents, agentPool: pool, providerFactory, projects, assignments: assignmentRepository, tasks, eventBus: bus,
+    });
+  }
+
+  afterEach(() => {
+    if (database !== undefined) database.close();
+    if (directory !== undefined) rmSync(directory, { recursive: true, force: true });
+  });
+
+  it('enables disabled supported agent when runtime is clean', { timeout }, () => {
+    setup();
+    const created = management.createAgent({ ...validCreate, enabled: false });
+    expect(created.enabled).toBe(false);
+    expect(created.status).toBe(AgentStatus.DISABLED);
+
+    const enabled = management.enableAgent(created.id);
+    expect(enabled.enabled).toBe(true);
+    expect(enabled.status).toBe(AgentStatus.IDLE);
+    expect(pool.has(created.id)).toBe(true);
+  });
+
+  it('rejects enable when agent is already enabled', { timeout }, () => {
+    setup();
+    const created = management.createAgent({ ...validCreate, enabled: true });
+    expect(created.enabled).toBe(true);
+
+    try {
+      management.enableAgent(created.id);
+      expect.unreachable('expected enable conflict');
+    } catch (error) {
+      expect(errorCode(error)).toBe('AGENT_ALREADY_ENABLED');
+    }
+  });
+
+  it('denies enable when agent status is BUSY', { timeout }, () => {
+    setup();
+    const created = management.createAgent({ ...validCreate, enabled: false });
+    agents.updateAgent(created.id, { status: AgentStatus.BUSY });
+
+    try {
+      management.enableAgent(created.id);
+      expect.unreachable('expected runtime busy error');
+    } catch (error) {
+      expect(errorCode(error)).toBe('AGENT_RUNTIME_BUSY');
+    }
+  });
+
+  it('denies enable when runtime pool snapshot is reserved', { timeout }, () => {
+    setup();
+    const created = management.createAgent({ ...validCreate, enabled: false });
+    pool.reserve(created.id, { taskId: 'task-mock', assignmentId: 'assign-mock', specVersion: '1.0.0', profileHash: 'hash-mock' });
+
+    try {
+      management.enableAgent(created.id);
+      expect.unreachable('expected runtime busy error');
+    } catch (error) {
+      expect(errorCode(error)).toBe('AGENT_RUNTIME_BUSY');
+    }
+  });
+
+  it('denies enable for legacy unsupported disabled agent', { timeout }, () => {
+    setup();
+    const legacy = agents.createAgent({
+      name: 'Legacy Cursor',
+      provider: 'cursor',
+      model: 'auto',
+      position: 'Developer',
+      status: AgentStatus.DISABLED,
+      allowedComplexities: [TaskComplexity.SIMPLE],
+      allowedRiskLevels: [TaskRisk.LOW],
+      capabilities: ['coding'],
+      specialties: [],
+      authority: AgentAuthority.STANDARD,
+      routingPriority: 1,
+      enabled: false,
+    });
+
+    try {
+      management.enableAgent(legacy.id);
+      expect.unreachable('expected provider unavailable error');
+    } catch (error) {
+      expect(errorCode(error)).toBe('AGENT_PROVIDER_UNAVAILABLE');
+    }
+  });
+});
+
+describe('0.7.1A Management event atomicity', () => {
+  let directory: string | undefined;
+  let database: Database | undefined;
+  let bus: EventBus;
+  let profiles: ControllableProfiles;
+  let agents: AgentRegistry;
+  let tasks: TaskManager;
+  let assignmentRepository: SqliteAssignmentRepository;
+  let projects: SqliteProjectRepository;
+  let providerFactory: AgentProviderFactory;
+  let pool: AgentPool;
+  let management: AgentManagementService;
+
+  function setup(): void {
+    directory = mkdtempSync(join(tmpdir(), 'agenthub-event-atomicity-'));
+    database = new Database(join(directory, 'agenthub.db'));
+    database.initialize();
+    bus = new EventBus();
+    profiles = new ControllableProfiles({ agentsDirectory: join(directory, 'agents') });
+    const agentRepository = new SqliteAgentRepository(database);
+    agents = new AgentRegistry(agentRepository, profiles, bus);
+    tasks = new TaskManager(new SqliteTaskRepository(database), new TaskStateMachine(), bus);
+    assignmentRepository = new SqliteAssignmentRepository(database);
+    new AssignmentManager(assignmentRepository, tasks, agents, (id) => agents.calculateProfileHash(id), bus);
+    projects = new SqliteProjectRepository(database);
+    providerFactory = new AgentProviderFactory();
+    providerFactory.register(new FakeProvider('claude'));
+    providerFactory.register(new FakeProvider('codex'));
+    pool = new AgentPool({ providerFactory, eventBus: bus });
+    management = new AgentManagementService({
+      agentRegistry: agents, agentPool: pool, providerFactory, projects, assignments: assignmentRepository, tasks, eventBus: bus,
+    });
+  }
+
+  afterEach(() => {
+    if (database !== undefined) database.close();
+    if (directory !== undefined) rmSync(directory, { recursive: true, force: true });
+  });
+
+  it('emits zero AgentCreated and zero AgentDeleted when create fails during pool registration', { timeout }, () => {
+    setup();
+    const published: DomainEventType[] = [];
+    bus.subscribe((event) => { published.push(event.eventType); });
+
+    const originalRegister = pool.register.bind(pool);
+    Object.assign(pool, {
+      register: () => { throw new Error('injected pool register failure'); },
+    });
+
+    expect(() => management.createAgent(validCreate)).toThrow();
+    Object.assign(pool, { register: originalRegister });
+
+    expect(published.filter((e) => e === DomainEventType.AGENT_CREATED)).toHaveLength(0);
+    expect(published.filter((e) => e === DomainEventType.AGENT_DELETED)).toHaveLength(0);
+    expect(agents.listAgents()).toEqual([]);
+  });
+
+  it('emits no false successful AgentUpdated event when update rebind fails', { timeout }, () => {
+    setup();
+    const created = management.createAgent(validCreate);
+    const published: DomainEventType[] = [];
+    bus.subscribe((event) => { published.push(event.eventType); });
+
+    const originalRegister = pool.register.bind(pool);
+    let failNext = true;
+    Object.assign(pool, {
+      register: (registration: Parameters<AgentPool['register']>[0]) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error('injected rebind failure');
+        }
+        return originalRegister(registration);
+      },
+    });
+
+    expect(() => management.updateAgent(created.id, updateFrom(created, { providerId: 'codex', modelId: 'gpt-5' }))).toThrow();
+    Object.assign(pool, { register: originalRegister });
+
+    const updateEvents = published.filter((e) => e === DomainEventType.AGENT_UPDATED);
+    expect(updateEvents).toHaveLength(0);
+    expect(agents.getAgent(created.id)?.provider).toBe('claude');
+  });
+
+  it('emits no AgentDeleted event when delete fails and compensates', { timeout }, () => {
+    setup();
+    const created = management.createAgent(validCreate);
+    const published: DomainEventType[] = [];
+    bus.subscribe((event) => { published.push(event.eventType); });
+
+    profiles.failRemove = true;
+    expect(() => management.deleteAgent(created.id)).toThrow();
+    profiles.failRemove = false;
+
+    const deleteEvents = published.filter((e) => e === DomainEventType.AGENT_DELETED);
+    expect(deleteEvents).toHaveLength(0);
+    expect(agents.getAgent(created.id)?.id).toBe(created.id);
+  });
+
+  it('publishes exactly one AgentCreated on successful create', { timeout }, () => {
+    setup();
+    const published: DomainEventType[] = [];
+    bus.subscribe((event) => { published.push(event.eventType); });
+
+    management.createAgent(validCreate);
+    expect(published.filter((e) => e === DomainEventType.AGENT_CREATED)).toHaveLength(1);
+    expect(published.filter((e) => e === DomainEventType.AGENT_DELETED)).toHaveLength(0);
+  });
+
+  it('publishes exactly one AgentUpdated on successful update', { timeout }, () => {
+    setup();
+    const created = management.createAgent(validCreate);
+    const published: DomainEventType[] = [];
+    bus.subscribe((event) => { published.push(event.eventType); });
+
+    management.updateAgent(created.id, updateFrom(created, { name: 'Renamed Worker' }));
+    expect(published.filter((e) => e === DomainEventType.AGENT_UPDATED)).toHaveLength(1);
+  });
+
+  it('publishes exactly one AgentDeleted on successful safe delete', { timeout }, () => {
+    setup();
+    const created = management.createAgent(validCreate);
+    const published: DomainEventType[] = [];
+    bus.subscribe((event) => { published.push(event.eventType); });
+
+    management.deleteAgent(created.id);
+    expect(published.filter((e) => e === DomainEventType.AGENT_DELETED)).toHaveLength(1);
   });
 });
