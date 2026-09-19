@@ -36,8 +36,10 @@ export function normalizeApiError(error: unknown): ApiError {
   }
   if (code.includes('BUSY') || code.includes('STALE') || code.includes('CONFLICT') ||
     code.includes('OWNERSHIP') || code.includes('ALREADY')) return apiError('AGENTHUB_API_CONFLICT', 409);
-  if (code.includes('PLAN_STALE') || code.includes('PLAN_CONFLICT')) return apiError('AGENTHUB_API_CONFLICT', 409);
-  if (code.includes('PLAN_INVALID') || code.includes('PLAN_CYCLE')) return apiError('AGENTHUB_API_INVALID_REQUEST', 400);
+  if (code.includes('PLAN_STALE') || code.includes('PLAN_CONFLICT') || code.includes('PLAN_INVALID_STATE') ||
+    code.includes('PLAN_NOT_APPROVED') || code.includes('PLAN_ALREADY_STARTED') || code.includes('PLAN_RUNTIME_LINK_CONFLICT')) return apiError('AGENTHUB_API_CONFLICT', 409);
+  if (code.includes('PLAN_INVALID') || code.includes('PLAN_CYCLE') || code.includes('PLAN_DUPLICATE') ||
+    code.includes('PLAN_UNKNOWN_PARENT') || code.includes('PLAN_UNKNOWN_DEPENDENCY') || code.includes('PLAN_PARENT_CYCLE')) return apiError('AGENTHUB_API_INVALID_REQUEST', 400);
   if (code.includes('PLAN_NOT_FOUND')) return apiError('AGENTHUB_API_NOT_FOUND', 404);
   if (code.includes('GATE_DENIED') || code.includes('MERGE_DENIED') || code.includes('REVISION_FAILED') ||
     code.includes('EVIDENCE')) return apiError('AGENTHUB_API_LIFECYCLE_DENIED', 422);

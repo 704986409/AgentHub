@@ -8,6 +8,7 @@ import type { ReviewDecisionInput, ReviewFindingInput, ReviewFindingSeverity, Re
 import type { CreateManagedAgentInput, UpdateManagedAgentInput, AgentDeleteResult } from '../services/agent-management-service.js';
 import type { ProviderDto } from '../services/provider-catalog-service.js';
 import { apiError } from './ApiErrors.js';
+import type { CreateIntakeInput, CreatePlanInput, CreatePlanRevisionInput, PlanDecisionInput, PlanStartInput } from '../lifecycle/plan-lifecycle.js';
 
 const encoder = new TextEncoder();
 const forbiddenPublicKeys = new Set(['repositoryroot', 'worktreepath', 'gitdir', 'cwd', 'env',
@@ -129,6 +130,30 @@ export function snapshotEmptyObject(value: unknown): Readonly<Record<string, nev
   exactRecord(value, []);
   return frozen({});
 }
+
+export function snapshotCreateIntake(value: unknown): Readonly<CreateIntakeInput> {
+  const r=exactRecord(value,['projectId','createdBy','goal','leadAgentId']);
+  return frozen({projectId:exactBoundedText(r.projectId,256),createdBy:exactBoundedText(r.createdBy,256),goal:boundedText(r.goal,128*1024,true),leadAgentId:exactBoundedText(r.leadAgentId,256)});
+}
+export function snapshotCreatePlan(value: unknown): Readonly<CreatePlanInput> {
+  const r=exactRecord(value,['intakeId','leadAgentId','summary','tasks','dependencies']);
+  return frozen({intakeId:exactBoundedText(r.intakeId,256),leadAgentId:exactBoundedText(r.leadAgentId,256),summary:boundedText(r.summary,16*1024,true),tasks:snapshotPlanTasks(r.tasks),dependencies:snapshotPlanDependencies(r.dependencies)});
+}
+export function snapshotCreatePlanRevision(value: unknown): Readonly<CreatePlanRevisionInput> {
+  const r=exactRecord(value,['basedOnVersion','leadAgentId','summary','tasks','dependencies']);
+  return frozen({basedOnVersion:positiveVersion(r.basedOnVersion),leadAgentId:exactBoundedText(r.leadAgentId,256),summary:boundedText(r.summary,16*1024,true),tasks:snapshotPlanTasks(r.tasks),dependencies:snapshotPlanDependencies(r.dependencies)});
+}
+export function snapshotPlanDecision(value: unknown): Readonly<PlanDecisionInput> {
+  const r=exactRecord(value,['planVersion','proposalHash','actorId','summary']);
+  const proposalHash=exactBoundedText(r.proposalHash,64); if(!/^[a-f0-9]{64}$/u.test(proposalHash))invalid();
+  return frozen({planVersion:positiveVersion(r.planVersion),proposalHash,actorId:exactBoundedText(r.actorId,256),summary:boundedText(r.summary,16*1024,false)});
+}
+export function snapshotPlanStart(value: unknown): Readonly<PlanStartInput> {
+  const r=exactRecord(value,['planVersion','proposalHash']); const proposalHash=exactBoundedText(r.proposalHash,64); if(!/^[a-f0-9]{64}$/u.test(proposalHash))invalid(); return frozen({planVersion:positiveVersion(r.planVersion),proposalHash});
+}
+function snapshotPlanTasks(value:unknown):CreatePlanInput['tasks'] { if(!Array.isArray(value)||value.length<1||value.length>1000)invalid(); return Object.freeze(value.map((item)=>{const r=exactRecord(item,['clientId','parentClientId','title','description','acceptanceCriteria','requiredCapabilities','requiredSpecialties','complexity','risk']);if(r.parentClientId!==null&&typeof r.parentClientId!=='string')invalid();if(r.description!==null&&typeof r.description!=='string')invalid();if(!Object.values(TaskComplexity).includes(r.complexity as TaskComplexity)||!Object.values(TaskRisk).includes(r.risk as TaskRisk))invalid();return frozen({clientId:exactBoundedText(r.clientId,256),parentClientId:r.parentClientId===null?null:exactBoundedText(r.parentClientId,256),title:boundedText(r.title,16*1024,true),description:r.description===null?null:boundedText(r.description,128*1024,false),acceptanceCriteria:stringArray(r.acceptanceCriteria,256,8192),requiredCapabilities:stringArray(r.requiredCapabilities,256,512),requiredSpecialties:stringArray(r.requiredSpecialties,256,512),complexity:r.complexity as TaskComplexity,risk:r.risk as TaskRisk});})); }
+function snapshotPlanDependencies(value:unknown):CreatePlanInput['dependencies'] { if(!Array.isArray(value)||value.length>4000)invalid(); return Object.freeze(value.map((item)=>{const r=exactRecord(item,['prerequisiteClientId','dependentClientId']);return frozen({prerequisiteClientId:exactBoundedText(r.prerequisiteClientId,256),dependentClientId:exactBoundedText(r.dependentClientId,256)});})); }
+function positiveVersion(value:unknown):number { if(typeof value!=='number'||!Number.isSafeInteger(value)||value<1)invalid();return value; }
 
 export function snapshotCreateTask(value: unknown): Readonly<CreateTaskInput> {
   const record = exactRecord(value, ['projectId', 'title', 'description', 'requiredCapabilities',

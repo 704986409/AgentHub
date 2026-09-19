@@ -1,11 +1,11 @@
-/* eslint-disable @typescript-eslint/no-non-null-assertion */
 import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import type { AgentHubApplication } from '../application/index.js';
 import { agentDeleteDto, agentDto, assignmentDto, eventDto, lifecycleDto, projectDto, providerDto, reviewReadyDto,
   snapshotCreateAgent, snapshotCreateTask, snapshotEmptyObject, snapshotExecuteCommand,
-  snapshotReviewDecision, snapshotUpdateAgent, taskDto } from './ApiDtos.js';
+  snapshotReviewDecision, snapshotUpdateAgent, taskDto, snapshotCreateIntake, snapshotCreatePlan,
+  snapshotCreatePlanRevision, snapshotPlanDecision, snapshotPlanStart } from './ApiDtos.js';
 import { apiError, normalizeApiError } from './ApiErrors.js';
 import { IdempotencyStore, requestFingerprint } from './IdempotencyStore.js';
 import { RealtimeHub } from './RealtimeHub.js';
@@ -92,8 +92,8 @@ export class AgentHubHttpServer {
       agents: this.#app.agents.listAgents().map(agentDto), tasks: this.#app.tasks.listTasks().map(taskDto),
       assignments: this.#app.assignmentQueries.list().map(assignmentDto),
       intakes: this.#app.planLifecycle?.listIntakes() ?? [], plans: this.#app.planLifecycle?.listPlans() ?? [],
-      planTasks: (this.#app.planLifecycle?.listPlans() ?? []).flatMap((p) => p.current?.tasks ?? []),
-      planDependencies: (this.#app.planLifecycle?.listPlans() ?? []).flatMap((p) => p.current?.dependencies ?? []) });
+      planTasks: (this.#app.planLifecycle?.listPlans() ?? []).flatMap((p) => p.tasks),
+      planDependencies: (this.#app.planLifecycle?.listPlans() ?? []).flatMap((p) => p.dependencies) });
     if (path === '/api/v1/projects') return ok(this.#app.projects.list().map(projectDto));
     if (path === '/api/v1/agents') return ok(this.#app.agents.listAgents().map(agentDto));
     if (path === '/api/v1/tasks') return ok(this.#app.tasks.listTasks().map(taskDto));
@@ -152,23 +152,24 @@ export class AgentHubHttpServer {
       }, 201);
     }
     if (path === '/api/v1/intakes') {
-      if (!this.#app.planLifecycle) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
-      return this.#mutate(request, 'POST', path, body, () => Promise.resolve(this.#app.planLifecycle!.createIntake(body as never)), 201);
+      const lifecycle=this.#app.planLifecycle; if (!lifecycle) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+      const input=snapshotCreateIntake(body); return this.#mutate(request, 'POST', path, input, () => Promise.resolve(lifecycle.createIntake(input)), 201);
     }
     if (path === '/api/v1/plans') {
-      if (!this.#app.planLifecycle) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
-      return this.#mutate(request, 'POST', path, body, () => Promise.resolve(this.#app.planLifecycle!.createPlan(body as never)), 201);
+      const lifecycle=this.#app.planLifecycle; if (!lifecycle) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+      const input=snapshotCreatePlan(body); return this.#mutate(request, 'POST', path, input, () => Promise.resolve(lifecycle.createPlan(input)), 201);
     }
+    const revision = /^\/api\/v1\/plans\/([^/]+)\/revisions$/u.exec(path);
+    if (revision !== null) { const lifecycle=this.#app.planLifecycle;if(!lifecycle)throw apiError('AGENTHUB_API_NOT_FOUND',404);const planId=decodeURIComponent(revision[1]??'');const input=snapshotCreatePlanRevision(body);return this.#mutate(request,'POST',path,input,()=>Promise.resolve(lifecycle.createRevision(planId,input)),201); }
     const decision = /^\/api\/v1\/plans\/([^/]+)\/(approve|request-changes|reject)$/u.exec(path);
     if (decision !== null) {
-      if (!this.#app.planLifecycle) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+      const lifecycle=this.#app.planLifecycle; if (!lifecycle) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
       const planId = decodeURIComponent(decision[1] ?? ''); const action = decision[2] === 'approve' ? 'APPROVE' : decision[2] === 'reject' ? 'REJECT' : 'REQUEST_CHANGES';
-      return this.#mutate(request, 'POST', path, body, () => Promise.resolve(this.#app.planLifecycle!.decide(planId, (body as { planVersion: number }).planVersion, action, (body as { actorId: string }).actorId, (body as { summary?: string }).summary ?? '')), 200);
+      const input=snapshotPlanDecision(body); return this.#mutate(request, 'POST', path, input, () => Promise.resolve(lifecycle.decide(planId,action,input)), 200);
     }
     const start = /^\/api\/v1\/plans\/([^/]+)\/start$/u.exec(path);
     if (start !== null) {
-      if (!this.#app.planLifecycle) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
-      const planId = decodeURIComponent(start[1] ?? ''); return this.#mutate(request, 'POST', path, body, () => Promise.resolve(this.#app.planLifecycle!.start(planId, (body as { planVersion: number }).planVersion)), 200);
+      const execution=this.#app.planExecution;if(!execution)throw apiError('AGENTHUB_API_NOT_FOUND',404);const planId=decodeURIComponent(start[1]??'');const input=snapshotPlanStart(body);return this.#mutate(request,'POST',path,input,async()=>{const result=await execution.start(planId,input);for(const bundle of result.reviewBundles)this.#reviews.register(bundle);return result.plan;},200);
     }
     const execute = /^\/api\/v1\/tasks\/([^/]+)\/execute$/u.exec(path);
     const review = /^\/api\/v1\/reviews\/([^/]+)\/decision$/u.exec(path);
@@ -201,6 +202,9 @@ export class AgentHubHttpServer {
             allowNoChangeCompletion: input.allowNoChangeCompletion });
           if (result.outcome === 'review-ready') { this.#reviews.expire(reviewHandle); this.#reviews.register(result.reviewBundle); }
           else if (result.outcome !== 'merge-denied') this.#reviews.expire(reviewHandle);
+          if (result.outcome !== 'review-ready' && result.outcome !== 'merge-denied') {
+            for (const next of await this.#app.planExecution?.afterReview(bundle.taskId) ?? []) this.#reviews.register(next);
+          }
           return lifecycleDto(result);
         } finally { this.#reviews.release(reviewHandle); }
       });

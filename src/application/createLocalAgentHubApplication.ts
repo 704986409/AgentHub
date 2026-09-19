@@ -11,6 +11,7 @@ import { AgentManagementService, AgentProfileManager, AgentRegistry, AssignmentM
 import { GitCommandRunner, GitWorktreeManager, type GitCommandRunnerLike } from '../workspace/index.js';
 import type { AgentHubApplication } from './AgentHubApplication.js';
 import { PlanLifecycleService } from '../lifecycle/plan-lifecycle.js';
+import { PlanExecutionCoordinator } from '../lifecycle/plan-execution-coordinator.js';
 
 export interface LocalAgentHubOptions { readonly repositoryRoot?: string; readonly dataDirectory?: string }
 export interface OwnedAgentHubApplication { readonly application: AgentHubApplication; close(): Promise<void> }
@@ -77,10 +78,13 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
   const lifecycle = new TaskLifecycleOrchestrator({ taskManager: tasks, agentRegistry: agents,
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
-  const planLifecycle = new PlanLifecycleService(projectRepository, agents, eventBus, database);
+  const planLifecycle = new PlanLifecycleService(projectRepository, agents, eventBus, database, tasks, assignmentRepository);
+  const planExecution = new PlanExecutionCoordinator({ planLifecycle, tasks, scheduler, dispatcher,
+    taskLifecycle: lifecycle, targetBranch, buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
+      executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }), eventBus });
   const application: AgentHubApplication = Object.freeze({ projects: projectRepository, agents, agentManagement, tasks,
     assignments, assignmentQueries: assignmentRepository, events, eventBus, scheduler, dispatcher, lifecycle,
-    planLifecycle,
+    planLifecycle, planExecution,
     buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }),
     targetBranch, providerCatalog });
