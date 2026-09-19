@@ -11,29 +11,41 @@ export interface PlanExecutionCoordinatorOptions { planLifecycle:PlanLifecycleSe
 
 export class PlanExecutionCoordinator {
   readonly #active=new Set<string>();
+  readonly #queues=new Map<string,Promise<unknown>>();
   public constructor(private readonly options:PlanExecutionCoordinatorOptions){}
   public async start(planId:string,input:PlanStartInput):Promise<PlanExecutionStartResult>{
     if(this.#active.has(planId))throw coded('PLAN_CONFLICT'); this.#active.add(planId);
     try{
-      const version=this.options.planLifecycle.approvedVersion(planId,input);
-      let current=this.options.planLifecycle.getPlan(planId); if(!current)throw coded('PLAN_NOT_FOUND');
-      const links=new Map(current.tasks.flatMap((t)=>t.runtimeTaskId===null?[]:[[t.planTaskId,t.runtimeTaskId] as const]));
-      for(const definition of version.tasks){
-        if(links.has(definition.planTaskId))continue;
-        const task=this.options.tasks.createTask({projectId:current.projectId,title:definition.title,description:definition.description,requiredCapabilities:[...definition.requiredCapabilities],requiredSpecialties:[...definition.requiredSpecialties],acceptanceCriteria:[...definition.acceptanceCriteria],complexity:definition.complexity,risk:definition.risk});
-        this.options.planLifecycle.linkRuntimeTask(planId,version.version,definition.planTaskId,task.id);
-      }
-      current=this.options.planLifecycle.markStarted(planId,version.version);
-      const reviewBundles=await this.#dispatchEligible(planId,current);
-      return Object.freeze({plan:this.options.planLifecycle.refresh(planId),reviewBundles:Object.freeze(reviewBundles)});
+      return await this.#enqueue(planId,async()=>{
+        const version=this.options.planLifecycle.approvedVersion(planId,input);
+        let current=this.options.planLifecycle.getPlan(planId); if(!current)throw coded('PLAN_NOT_FOUND');
+        const links=new Map(current.tasks.flatMap((t)=>t.runtimeTaskId===null?[]:[[t.planTaskId,t.runtimeTaskId] as const]));
+        for(const definition of version.tasks){
+          if(links.has(definition.planTaskId))continue;
+          const task=this.options.tasks.createTask({projectId:current.projectId,title:definition.title,description:definition.description,requiredCapabilities:[...definition.requiredCapabilities],requiredSpecialties:[...definition.requiredSpecialties],acceptanceCriteria:[...definition.acceptanceCriteria],complexity:definition.complexity,risk:definition.risk});
+          this.options.planLifecycle.linkRuntimeTask(planId,version.version,definition.planTaskId,task.id);
+        }
+        current=this.options.planLifecycle.markStarted(planId,version.version);
+        const reviewBundles=await this.#dispatchEligible(planId,current);
+        return Object.freeze({plan:this.options.planLifecycle.refresh(planId),reviewBundles:Object.freeze(reviewBundles)});
+      });
     }finally{this.#active.delete(planId);}
   }
   public async afterReview(runtimeTaskId:string):Promise<readonly TaskReviewBundle[]>{
     this.options.planLifecycle.markReviewPendingByTask(runtimeTaskId,false);
     const plan=this.options.planLifecycle.listPlans().find((p)=>p.tasks.some((t)=>t.runtimeTaskId===runtimeTaskId));
     if(!plan)return [];
-    const bundles=await this.#dispatchEligible(plan.planId,this.options.planLifecycle.refresh(plan.planId));
-    return Object.freeze(bundles);
+    return this.#enqueue(plan.planId,async()=>{
+      const bundles=await this.#dispatchEligible(plan.planId,this.options.planLifecycle.refresh(plan.planId));
+      return Object.freeze(bundles);
+    });
+  }
+  async #enqueue<T>(planId:string,fn:()=>Promise<T>):Promise<T>{
+    const prior=this.#queues.get(planId)??Promise.resolve();
+    let release!:()=>void; const gate=new Promise<void>((resolve)=>{release=resolve;});
+    const running=prior.then(()=>gate,()=>gate); this.#queues.set(planId,running);
+    await prior.then(()=>undefined,()=>undefined);
+    try{return await fn();}finally{release(); if(this.#queues.get(planId)===running)this.#queues.delete(planId);}
   }
   async #dispatchEligible(planId:string,plan:PlanDto):Promise<TaskReviewBundle[]>{
     const bundles:TaskReviewBundle[]=[];

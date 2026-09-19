@@ -41,7 +41,7 @@ function fakeApplication(eventBus: EventBus, providerCatalog: ProviderCatalogSer
 }
 
 describe('API v0.7.2 Endpoints', () => {
-  it('GET /api/v1/health reports version 0.7.2', async () => {
+  it('GET /api/v1/health reports package lifecycle version', async () => {
     const bus = new EventBus();
     const catalogService = new ProviderCatalogService({
       claudeDetector: createMockDetector(true, true),
@@ -59,7 +59,7 @@ describe('API v0.7.2 Endpoints', () => {
       expect(res.status).toBe(200);
       const body = (await res.json()) as { ok: boolean; data: { status: string; version: string } };
       expect(body.ok).toBe(true);
-      expect(body.data.version).toBe('0.7.2A');
+      expect(body.data.version).toBe('0.7.3A');
     } finally {
       await server.stop();
     }
