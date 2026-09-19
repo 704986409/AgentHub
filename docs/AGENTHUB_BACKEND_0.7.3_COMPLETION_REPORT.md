@@ -5,7 +5,7 @@ Implementation is complete for the public Human → Lead → Specialist lifecycl
 Base: `dd27fd7f84732b72e0e23516ee35d1824f5676e9`  
 Backend changes: lifecycle service, validated settings-backed snapshot persistence, public HTTP routes/state DTOs, error mapping, docs, and focused tests. Desktop was not modified.
 
-Production SHA: `c6ba819b7385b44ef19f46959da3e77fa5eb0f13`  
+Production SHA: `c6ba819b7385b44ef19f46959da3e77fa5eb0f13`
 CI run: `35456322847` — head SHA exact, completed, success.
 
 Contract matrix:
@@ -35,7 +35,7 @@ Tests:
 
 Historical `0.7.2E` remains immutable. The annotated `0.7.3` tag is created on the docs-only release head after exact production CI success.
 
-Tag: `0.7.3`  
+Tag: `0.7.3`
 Tag object and peeled commit are recorded in the final release verification below.
 
 PENDING INDEPENDENT AUDIT
