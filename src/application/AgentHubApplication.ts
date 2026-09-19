@@ -3,6 +3,7 @@ import type { AgentScheduler, AssignmentDispatcher, TaskLifecycleOrchestrator } 
 import type { AssignmentRepository, ProjectRepository } from '../repositories/index.js';
 import type { AgentManagementService, AgentRegistry, AssignmentManager, ProviderCatalogService, TaskManager } from '../services/index.js';
 import type { BuildTestEvidencePlan, MergeGatePolicy } from '../workspace/index.js';
+import type { PlanLifecycleService } from '../lifecycle/plan-lifecycle.js';
 
 /** The single authoritative object graph exposed to transport adapters. */
 export interface AgentHubApplication {
@@ -21,4 +22,5 @@ export interface AgentHubApplication {
   readonly targetBranch: string;
   readonly providerCatalog?: ProviderCatalogService;
   readonly mergePolicy?: MergeGatePolicy;
+  readonly planLifecycle?: PlanLifecycleService;
 }

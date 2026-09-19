@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
 import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
@@ -89,12 +90,19 @@ export class AgentHubHttpServer {
     if (path === '/api/v1/providers') return ok(await this.#providers());
     if (path === '/api/v1/state') return ok({ projects: this.#app.projects.list().map(projectDto),
       agents: this.#app.agents.listAgents().map(agentDto), tasks: this.#app.tasks.listTasks().map(taskDto),
-      assignments: this.#app.assignmentQueries.list().map(assignmentDto) });
+      assignments: this.#app.assignmentQueries.list().map(assignmentDto),
+      intakes: this.#app.planLifecycle?.listIntakes() ?? [], plans: this.#app.planLifecycle?.listPlans() ?? [],
+      planTasks: (this.#app.planLifecycle?.listPlans() ?? []).flatMap((p) => p.current?.tasks ?? []),
+      planDependencies: (this.#app.planLifecycle?.listPlans() ?? []).flatMap((p) => p.current?.dependencies ?? []) });
     if (path === '/api/v1/projects') return ok(this.#app.projects.list().map(projectDto));
     if (path === '/api/v1/agents') return ok(this.#app.agents.listAgents().map(agentDto));
     if (path === '/api/v1/tasks') return ok(this.#app.tasks.listTasks().map(taskDto));
     if (path === '/api/v1/assignments') return ok(this.#app.assignmentQueries.list().map(assignmentDto));
     if (path === '/api/v1/events') return ok(this.#events(url));
+    if (path === '/api/v1/intakes') return ok(this.#app.planLifecycle?.listIntakes() ?? []);
+    if (path === '/api/v1/plans') return ok(this.#app.planLifecycle?.listPlans() ?? []);
+    const planMatch = /^\/api\/v1\/plans\/([^/]+)$/u.exec(path);
+    if (planMatch !== null) { const plan = this.#app.planLifecycle?.getPlan(decodeURIComponent(planMatch[1] ?? '')); if (!plan) throw apiError('AGENTHUB_API_NOT_FOUND', 404); return ok(plan); }
     const match = /^\/api\/v1\/(agents|tasks|assignments)\/([^/]+)$/u.exec(path);
     if (match !== null) {
       const id = decodeURIComponent(match[2] ?? '');
@@ -142,6 +150,25 @@ export class AgentHubHttpServer {
         if (this.#app.projects.findById(input.projectId) === null) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
         return Promise.resolve(taskDto(this.#app.tasks.createTask(input)));
       }, 201);
+    }
+    if (path === '/api/v1/intakes') {
+      if (!this.#app.planLifecycle) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+      return this.#mutate(request, 'POST', path, body, () => Promise.resolve(this.#app.planLifecycle!.createIntake(body as never)), 201);
+    }
+    if (path === '/api/v1/plans') {
+      if (!this.#app.planLifecycle) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+      return this.#mutate(request, 'POST', path, body, () => Promise.resolve(this.#app.planLifecycle!.createPlan(body as never)), 201);
+    }
+    const decision = /^\/api\/v1\/plans\/([^/]+)\/(approve|request-changes|reject)$/u.exec(path);
+    if (decision !== null) {
+      if (!this.#app.planLifecycle) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+      const planId = decodeURIComponent(decision[1] ?? ''); const action = decision[2] === 'approve' ? 'APPROVE' : decision[2] === 'reject' ? 'REJECT' : 'REQUEST_CHANGES';
+      return this.#mutate(request, 'POST', path, body, () => Promise.resolve(this.#app.planLifecycle!.decide(planId, (body as { planVersion: number }).planVersion, action, (body as { actorId: string }).actorId, (body as { summary?: string }).summary ?? '')), 200);
+    }
+    const start = /^\/api\/v1\/plans\/([^/]+)\/start$/u.exec(path);
+    if (start !== null) {
+      if (!this.#app.planLifecycle) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+      const planId = decodeURIComponent(start[1] ?? ''); return this.#mutate(request, 'POST', path, body, () => Promise.resolve(this.#app.planLifecycle!.start(planId, (body as { planVersion: number }).planVersion)), 200);
     }
     const execute = /^\/api\/v1\/tasks\/([^/]+)\/execute$/u.exec(path);
     const review = /^\/api\/v1\/reviews\/([^/]+)\/decision$/u.exec(path);

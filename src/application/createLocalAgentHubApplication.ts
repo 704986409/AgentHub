@@ -10,6 +10,7 @@ import { AgentPool, AgentProviderFactory, AntigravityAgentProvider, ClaudeAgentP
 import { AgentManagementService, AgentProfileManager, AgentRegistry, AssignmentManager, ProviderCatalogService, TaskManager, TaskStateMachine } from '../services/index.js';
 import { GitCommandRunner, GitWorktreeManager, type GitCommandRunnerLike } from '../workspace/index.js';
 import type { AgentHubApplication } from './AgentHubApplication.js';
+import { PlanLifecycleService } from '../lifecycle/plan-lifecycle.js';
 
 export interface LocalAgentHubOptions { readonly repositoryRoot?: string; readonly dataDirectory?: string }
 export interface OwnedAgentHubApplication { readonly application: AgentHubApplication; close(): Promise<void> }
@@ -76,8 +77,10 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
   const lifecycle = new TaskLifecycleOrchestrator({ taskManager: tasks, agentRegistry: agents,
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
+  const planLifecycle = new PlanLifecycleService(projectRepository, agents, eventBus, database);
   const application: AgentHubApplication = Object.freeze({ projects: projectRepository, agents, agentManagement, tasks,
     assignments, assignmentQueries: assignmentRepository, events, eventBus, scheduler, dispatcher, lifecycle,
+    planLifecycle,
     buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }),
     targetBranch, providerCatalog });
