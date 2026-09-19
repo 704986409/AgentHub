@@ -79,6 +79,9 @@ export interface TaskRow {
   risk: TaskRisk;
   assigned_agent_id: string | null;
   assignment_id: string | null;
+  origin_plan_id: string | null;
+  origin_plan_version: number | null;
+  origin_plan_task_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -96,6 +99,9 @@ export const mapTask = (row: TaskRow): Task => ({
   risk: row.risk,
   assignedAgentId: row.assigned_agent_id,
   assignmentId: row.assignment_id,
+  originPlanId: row.origin_plan_id ?? null,
+  originPlanVersion: row.origin_plan_version ?? null,
+  originPlanTaskId: row.origin_plan_task_id ?? null,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 });

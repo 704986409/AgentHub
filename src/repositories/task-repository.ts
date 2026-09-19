@@ -21,8 +21,8 @@ export class SqliteTaskRepository implements TaskRepository {
     this.database.connection
       .prepare(`INSERT INTO tasks
         (id, project_id, title, description, required_capabilities, required_specialties, acceptance_criteria,
-         status, complexity, risk, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+         status, complexity, risk, origin_plan_id, origin_plan_version, origin_plan_task_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         id,
         input.projectId,
@@ -34,6 +34,9 @@ export class SqliteTaskRepository implements TaskRepository {
         status,
         input.complexity,
         input.risk,
+        input.originPlanId ?? null,
+        input.originPlanVersion ?? null,
+        input.originPlanTaskId ?? null,
         now,
         now,
       );
@@ -43,6 +46,36 @@ export class SqliteTaskRepository implements TaskRepository {
   public findById(id: string): Task | null {
     const row = this.database.connection.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as TaskRow | undefined;
     return row === undefined ? null : mapTask(row);
+  }
+
+  public findByPlanOrigin(planId: string, planVersion: number, planTaskId: string): Task | null {
+    const rows = this.database.connection.prepare(
+      `SELECT * FROM tasks WHERE origin_plan_id = ? AND origin_plan_version = ? AND origin_plan_task_id = ?`,
+    ).all(planId, planVersion, planTaskId) as TaskRow[];
+    if (rows.length > 1) {
+      const error = new Error('PLAN_RUNTIME_MATERIALIZATION_RECONCILIATION_REQUIRED') as Error & { code: string };
+      error.code = 'PLAN_RUNTIME_MATERIALIZATION_RECONCILIATION_REQUIRED';
+      throw error;
+    }
+    const row = rows[0];
+    return row === undefined ? null : mapTask(row);
+  }
+
+  public bindPlanOrigin(id: string, planId: string, planVersion: number, planTaskId: string): Task {
+    const current = this.findRequired(id);
+    const bound = current.originPlanId !== null || current.originPlanVersion !== null || current.originPlanTaskId !== null;
+    if (bound && (current.originPlanId !== planId || current.originPlanVersion !== planVersion ||
+      current.originPlanTaskId !== planTaskId)) {
+      const error = new Error('PLAN_RUNTIME_MATERIALIZATION_RECONCILIATION_REQUIRED') as Error & { code: string };
+      error.code = 'PLAN_RUNTIME_MATERIALIZATION_RECONCILIATION_REQUIRED';
+      throw error;
+    }
+    if (!bound) {
+      this.database.connection.prepare(
+        `UPDATE tasks SET origin_plan_id = ?, origin_plan_version = ?, origin_plan_task_id = ?, updated_at = ? WHERE id = ?`,
+      ).run(planId, planVersion, planTaskId, new Date().toISOString(), id);
+    }
+    return this.findRequired(id);
   }
 
   public list(): Task[] {

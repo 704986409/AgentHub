@@ -174,4 +174,24 @@ export const migrations: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 6,
+    name: 'plan_task_materialization_identity',
+    up: `
+      ALTER TABLE tasks ADD COLUMN origin_plan_id TEXT;
+      ALTER TABLE tasks ADD COLUMN origin_plan_version INTEGER;
+      ALTER TABLE tasks ADD COLUMN origin_plan_task_id TEXT;
+      CREATE UNIQUE INDEX idx_tasks_plan_origin
+        ON tasks(origin_plan_id, origin_plan_version, origin_plan_task_id)
+        WHERE origin_plan_id IS NOT NULL;
+      CREATE TABLE plan_task_materializations (
+        plan_id TEXT NOT NULL,
+        plan_version INTEGER NOT NULL,
+        plan_task_id TEXT NOT NULL,
+        runtime_task_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (plan_id, plan_version, plan_task_id)
+      );
+    `,
+  },
 ];

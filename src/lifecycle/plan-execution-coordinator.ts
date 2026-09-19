@@ -19,11 +19,8 @@ export class PlanExecutionCoordinator {
       return await this.#enqueue(planId,async()=>{
         const version=this.options.planLifecycle.approvedVersion(planId,input);
         let current=this.options.planLifecycle.getPlan(planId); if(!current)throw coded('PLAN_NOT_FOUND');
-        const links=new Map(current.tasks.flatMap((t)=>t.runtimeTaskId===null?[]:[[t.planTaskId,t.runtimeTaskId] as const]));
         for(const definition of version.tasks){
-          if(links.has(definition.planTaskId))continue;
-          const task=this.options.tasks.createTask({projectId:current.projectId,title:definition.title,description:definition.description,requiredCapabilities:[...definition.requiredCapabilities],requiredSpecialties:[...definition.requiredSpecialties],acceptanceCriteria:[...definition.acceptanceCriteria],complexity:definition.complexity,risk:definition.risk});
-          this.options.planLifecycle.linkRuntimeTask(planId,version.version,definition.planTaskId,task.id);
+          this.options.planLifecycle.materializeRuntimeTask(planId,version.version,definition);
         }
         current=this.options.planLifecycle.markStarted(planId,version.version);
         const reviewBundles=await this.#dispatchEligible(planId,current);

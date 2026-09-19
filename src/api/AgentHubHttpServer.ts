@@ -86,7 +86,7 @@ export class AgentHubHttpServer {
     noUnknownQuery(url, url.pathname === '/api/v1/events'
       ? ['limit', 'after', 'projectId', 'agentId', 'taskId', 'assignmentId', 'eventType'] : []);
     const path = url.pathname;
-    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.3A' });
+    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.3B' });
     if (path === '/api/v1/providers') return ok(await this.#providers());
     if (path === '/api/v1/state') return ok({ projects: this.#app.projects.list().map(projectDto),
       agents: this.#app.agents.listAgents().map(agentDto), tasks: this.#app.tasks.listTasks().map(taskDto),

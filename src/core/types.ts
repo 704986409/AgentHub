@@ -120,6 +120,9 @@ export interface Task {
   risk: TaskRisk;
   assignedAgentId: string | null;
   assignmentId: string | null;
+  originPlanId: string | null;
+  originPlanVersion: number | null;
+  originPlanTaskId: string | null;
   createdAt: string;
   updatedAt: string;
 }

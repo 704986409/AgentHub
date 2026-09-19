@@ -22,6 +22,14 @@ export class TaskManager {
     return this.repository.findById(id);
   }
 
+  public findByPlanOrigin(planId: string, planVersion: number, planTaskId: string): Task | null {
+    return this.repository.findByPlanOrigin(planId, planVersion, planTaskId);
+  }
+
+  public bindPlanOrigin(id: string, planId: string, planVersion: number, planTaskId: string): Task {
+    return this.repository.bindPlanOrigin(id, planId, planVersion, planTaskId);
+  }
+
   public listTasks(): Task[] {
     return this.repository.list();
   }

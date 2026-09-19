@@ -377,6 +377,7 @@ function task(overrides: Partial<Task> = {}): Task {
     id: 'TASK-A', projectId: 'PROJECT-A', title: 'ignored', description: null,
     requiredCapabilities: [], requiredSpecialties: [], acceptanceCriteria: [], status: 'CREATED' as Task['status'],
     complexity: TaskComplexity.MEDIUM, risk: TaskRisk.MEDIUM, assignedAgentId: null, assignmentId: null,
+    originPlanId: null, originPlanVersion: null, originPlanTaskId: null,
     createdAt: 'ignored', updatedAt: 'ignored', ...overrides,
   };
 }

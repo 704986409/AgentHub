@@ -61,6 +61,9 @@ export interface CreateTaskInput {
   status?: TaskStatus;
   complexity: TaskComplexity;
   risk: TaskRisk;
+  originPlanId?: string | null;
+  originPlanVersion?: number | null;
+  originPlanTaskId?: string | null;
 }
 
 export interface UpdateTaskInput {
@@ -124,9 +127,11 @@ export interface AgentRepository {
 export interface TaskRepository {
   create(input: CreateTaskInput): Task;
   findById(id: string): Task | null;
+  findByPlanOrigin(planId: string, planVersion: number, planTaskId: string): Task | null;
   list(): Task[];
   update(id: string, input: UpdateTaskInput): Task;
   setStatus(id: string, status: TaskStatus): Task;
+  bindPlanOrigin(id: string, planId: string, planVersion: number, planTaskId: string): Task;
 }
 
 export interface AssignmentRepository {

@@ -432,9 +432,13 @@ function requireScheduleable(task: Task): void {
   if (!isScheduleable(task)) throw schedulerError('AGENT_SCHEDULER_TASK_NOT_SCHEDULABLE');
 }
 
-function isScheduleable(task: Task): boolean {
+export function isRuntimeTaskSchedulable(task: Task): boolean {
   return (task.status === TaskStatus.CREATED || task.status === TaskStatus.QUEUED) &&
     task.assignedAgentId === null && task.assignmentId === null;
+}
+
+function isScheduleable(task: Task): boolean {
+  return isRuntimeTaskSchedulable(task);
 }
 
 function isExactAssignment(
