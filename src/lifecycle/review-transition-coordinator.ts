@@ -14,6 +14,7 @@ export interface ReviewTransitionFailpoints {
   readonly afterTaskCompletedBeforeExpire?: () => void;
   readonly afterNewReviewBeforeOldExpire?: () => void;
   readonly beforeDependentReviewPersist?: () => void;
+  readonly afterTerminalReviewExpiredBeforePlanResolution?: () => void;
 }
 
 export interface ReviewTransitionCoordinatorOptions {
@@ -64,6 +65,7 @@ export class ReviewTransitionCoordinator {
   public expireAfterTerminalDecision(handle: string): void {
     this.#fail('afterTaskCompletedBeforeExpire');
     this.#reviews.expire(handle);
+    this.#fail('afterTerminalReviewExpiredBeforePlanResolution');
   }
 
   public reconcile(): void {
@@ -94,11 +96,17 @@ export class ReviewTransitionCoordinator {
 
     for (const link of this.#planLifecycle.listReviewAuthority()) {
       const task = this.#tasks.getTask(link.runtimeTaskId);
+      const activeReview = this.#reviews.getActiveForTask(link.runtimeTaskId);
       if (task !== null && (task.status === TaskStatus.COMPLETED || task.status === TaskStatus.FAILED
-        || task.status === TaskStatus.CANCELLED)) continue;
+        || task.status === TaskStatus.CANCELLED)) {
+        if (link.reviewPending && activeReview === undefined) {
+          this.#planLifecycle.markReviewPendingByTask(link.runtimeTaskId, false);
+        }
+        continue;
+      }
       const reviewing = link.reviewPending || task?.status === TaskStatus.REVIEWING;
       if (!reviewing) continue;
-      if (this.#reviews.getActiveForTask(link.runtimeTaskId) !== undefined) continue;
+      if (activeReview !== undefined) continue;
       this.#reconciliationRequired = true;
       throw coded(PLAN_REVIEW_RECONCILIATION_REQUIRED);
     }
