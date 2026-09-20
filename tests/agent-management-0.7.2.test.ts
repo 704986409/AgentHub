@@ -131,6 +131,7 @@ function setupHarness(options: { usableProviders?: Set<string> } = {}) {
     tasks: taskManager,
     eventBus,
     isProviderUsable: (id) => usableSet.has(id),
+    isLifecycleReferenced: () => false,
   });
 
   return { service, usableSet, agentRegistry };

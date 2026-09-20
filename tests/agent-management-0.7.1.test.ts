@@ -200,6 +200,7 @@ describe('V0.7.1 runtime-safe agent management', () => {
     pool = new AgentPool({ providerFactory, eventBus: bus });
     management = new AgentManagementService({
       agentRegistry: agents, agentPool: pool, providerFactory, projects, assignments: assignmentRepository, tasks, eventBus: bus,
+      isLifecycleReferenced: () => false,
     });
     scheduler = new AgentScheduler({
       taskManager: tasks, agentRegistry: agents, providerFactory, agentPool: pool, assignmentManager: assignments,
@@ -437,6 +438,7 @@ describe('V0.7.1 agent HTTP API', () => {
     pool = new AgentPool({ providerFactory, eventBus: bus });
     const management = new AgentManagementService({
       agentRegistry: agents, agentPool: pool, providerFactory, projects, assignments: assignmentRepository, tasks, eventBus: bus,
+      isLifecycleReferenced: () => false,
     });
     const scheduler = new AgentScheduler({
       taskManager: tasks, agentRegistry: agents, providerFactory, agentPool: pool, assignmentManager: assignments,
@@ -606,6 +608,7 @@ describe('0.7.1A Enable guard hardening', () => {
     pool = new AgentPool({ providerFactory, eventBus: bus });
     management = new AgentManagementService({
       agentRegistry: agents, agentPool: pool, providerFactory, projects, assignments: assignmentRepository, tasks, eventBus: bus,
+      isLifecycleReferenced: () => false,
     });
   }
 
@@ -722,6 +725,7 @@ describe('0.7.1A Management event atomicity', () => {
     pool = new AgentPool({ providerFactory, eventBus: bus });
     management = new AgentManagementService({
       agentRegistry: agents, agentPool: pool, providerFactory, projects, assignments: assignmentRepository, tasks, eventBus: bus,
+      isLifecycleReferenced: () => false,
     });
   }
 

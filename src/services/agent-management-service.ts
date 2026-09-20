@@ -39,6 +39,10 @@ export interface AgentDeleteResult {
   readonly deleted: true;
 }
 
+export interface AgentLifecycleReferenceQuery {
+  isLeadReferenced(agentId: string): boolean;
+}
+
 export interface AgentManagementServiceOptions {
   readonly agentRegistry: AgentRegistry;
   readonly agentPool: AgentPool;
@@ -48,6 +52,7 @@ export interface AgentManagementServiceOptions {
   readonly tasks: TaskManager;
   readonly eventBus?: EventBus;
   readonly isProviderUsable?: (providerId: string) => boolean;
+  readonly isLifecycleReferenced: (agentId: string) => boolean;
 }
 
 export class AgentManagementError extends Error {
@@ -66,6 +71,7 @@ export class AgentManagementService {
   readonly #tasks: TaskManager;
   readonly #eventBus: EventBus | undefined;
   readonly #isProviderUsable: (providerId: string) => boolean;
+  readonly #isLifecycleReferenced: (agentId: string) => boolean;
 
   public constructor(options: AgentManagementServiceOptions) {
     this.#agents = options.agentRegistry;
@@ -76,6 +82,7 @@ export class AgentManagementService {
     this.#tasks = options.tasks;
     this.#eventBus = options.eventBus ?? options.agentRegistry.eventBusInstance;
     this.#isProviderUsable = options.isProviderUsable ?? ((id) => options.providerFactory.has(id));
+    this.#isLifecycleReferenced = options.isLifecycleReferenced;
   }
 
   public createAgent(input: CreateManagedAgentInput): Agent {
@@ -175,6 +182,12 @@ export class AgentManagementService {
     }
     if (this.#tasks.listTasks().some((task) => task.assignedAgentId === agentId)) {
       throw new AgentManagementError('AGENT_DELETE_TASK_CONFLICT', 'Agent is referenced by a task');
+    }
+    if (this.#isLifecycleReferenced(agentId)) {
+      throw new AgentManagementError(
+        'AGENT_DELETE_LIFECYCLE_REFERENCE_CONFLICT',
+        'Agent is referenced by lifecycle authority',
+      );
     }
     const wasRegistered = this.#pool.has(agentId);
     if (wasRegistered) this.#pool.unregister(agentId);

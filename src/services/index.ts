@@ -4,6 +4,7 @@ export {
   AgentManagementService,
   AgentManagementError,
   type AgentManagementServiceOptions,
+  type AgentLifecycleReferenceQuery,
   type CreateManagedAgentInput,
   type UpdateManagedAgentInput,
   type AgentDeleteResult,

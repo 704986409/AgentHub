@@ -68,17 +68,18 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
   }
   const scheduler = new AgentScheduler({ taskManager: tasks, agentRegistry: agents, providerFactory,
     agentPool: pool, assignmentManager: assignments });
+  const planLifecycle = new PlanLifecycleService(projectRepository, agents, eventBus, database, tasks, assignmentRepository);
   const agentManagement = new AgentManagementService({
     agentRegistry: agents, agentPool: pool, providerFactory, projects: projectRepository,
     assignments: assignmentRepository, tasks, eventBus,
     isProviderUsable: (id) => providerCatalog.isUsableSync(id),
+    isLifecycleReferenced: (agentId) => planLifecycle.isLeadReferenced(agentId),
   });
   const worktrees = await GitWorktreeManager.open({ repositoryRoot });
   const dispatcher = new AssignmentDispatcher({ taskManager: tasks, agentRegistry: agents,
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
   const lifecycle = new TaskLifecycleOrchestrator({ taskManager: tasks, agentRegistry: agents,
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
-  const planLifecycle = new PlanLifecycleService(projectRepository, agents, eventBus, database, tasks, assignmentRepository);
   const planExecution = new PlanExecutionCoordinator({ planLifecycle, tasks, scheduler, dispatcher,
     taskLifecycle: lifecycle, targetBranch, buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }), eventBus });
