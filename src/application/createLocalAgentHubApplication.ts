@@ -14,7 +14,11 @@ import { PlanLifecycleService } from '../lifecycle/plan-lifecycle.js';
 import { PlanExecutionCoordinator } from '../lifecycle/plan-execution-coordinator.js';
 
 export interface LocalAgentHubOptions { readonly repositoryRoot?: string; readonly dataDirectory?: string }
-export interface OwnedAgentHubApplication { readonly application: AgentHubApplication; close(): Promise<void> }
+export interface OwnedAgentHubApplication {
+  readonly application: AgentHubApplication;
+  readonly database: Database;
+  close(): Promise<void>;
+}
 
 export async function resolvePrimaryBranch(repositoryRoot: string,
   runner: GitCommandRunnerLike = new GitCommandRunner()): Promise<string> {
@@ -89,5 +93,5 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
     buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }),
     targetBranch, providerCatalog });
-  return { application, async close() { await pool.shutdownAll(); events.close(); database.close(); } };
+  return { application, database, async close() { await pool.shutdownAll(); events.close(); database.close(); } };
 }

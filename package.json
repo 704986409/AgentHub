@@ -1,6 +1,6 @@
 {
   "name": "agenthub",
-  "version": "0.7.3D",
+  "version": "0.7.3E",
   "description": "Core data foundation for AgentHub",
   "private": true,
   "type": "module",

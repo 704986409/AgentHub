@@ -72,6 +72,24 @@ export function reviewReadyDto(bundle: Readonly<TaskReviewBundle>) {
     evidenceSha256: bundle.buildTestEvidence.evidenceSha256 });
 }
 
+export interface LifecycleReviewLink {
+  readonly planId: string;
+  readonly planVersion: number;
+  readonly planTaskId: string;
+}
+
+export function lifecycleReviewDto(bundle: Readonly<TaskReviewBundle>, link: LifecycleReviewLink) {
+  return frozen({
+    planId: link.planId,
+    planVersion: link.planVersion,
+    planTaskId: link.planTaskId,
+    runtimeTaskId: bundle.taskId,
+    assignmentId: bundle.assignmentId,
+    agentId: bundle.agentId,
+    review: reviewReadyDto(bundle),
+  });
+}
+
 export function lifecycleDto(result: Readonly<TaskLifecycleReviewResult>): unknown {
   if (result.outcome === 'review-ready') return reviewReadyDto(result.reviewBundle);
   const record = result as unknown as Record<string, unknown>;

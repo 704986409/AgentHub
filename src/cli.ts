@@ -15,7 +15,7 @@ if (command === 'doctor') {
   const host = option('--host') ?? '127.0.0.1';
   const port = Number(option('--port') ?? '3210');
   const owned = await createLocalAgentHubApplication();
-  const server = new AgentHubHttpServer({ application: owned.application, host, port });
+  const server = new AgentHubHttpServer({ application: owned.application, database: owned.database, host, port });
   try {
     const address = await server.start();
     console.log(`AgentHub API listening on http://${address.host}:${String(address.port)}`);

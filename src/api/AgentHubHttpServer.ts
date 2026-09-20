@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import type { AgentHubApplication } from '../application/index.js';
+import type { Database } from '../database/index.js';
 import { agentDeleteDto, agentDto, assignmentDto, eventDto, lifecycleDto, projectDto, providerDto, reviewReadyDto,
   snapshotCreateAgent, snapshotCreateTask, snapshotEmptyObject, snapshotExecuteCommand,
   snapshotReviewDecision, snapshotUpdateAgent, taskDto, snapshotCreateIntake, snapshotCreatePlan,
@@ -16,6 +17,7 @@ export interface AgentHubHttpServerOptions {
   readonly host?: string;
   readonly port?: number;
   readonly maxBodyBytes?: number;
+  readonly database?: Database;
 }
 export interface AgentHubServerAddress { readonly host: string; readonly port: number }
 
@@ -27,7 +29,7 @@ export class AgentHubHttpServer {
   readonly #http: Server;
   readonly #realtime: RealtimeHub;
   readonly #idempotency = new IdempotencyStore();
-  readonly #reviews = new ReviewHandleStore();
+  readonly #reviews: ReviewHandleStore;
   #address: AgentHubServerAddress | undefined;
   #stopped = false;
 
@@ -38,6 +40,7 @@ export class AgentHubHttpServer {
       throw apiError('AGENTHUB_API_INVALID_REQUEST', 400);
     }
     this.#app = options.application; this.#maxBodyBytes = options.maxBodyBytes ?? 1024 * 1024;
+    this.#reviews = new ReviewHandleStore(options.database);
     this.#realtime = new RealtimeHub({ eventBus: this.#app.eventBus });
     this.#http = createServer((request, response) => { void this.#handle(request, response); });
     this.#http.on('upgrade', (request, socket, head) => this.#realtime.handleUpgrade(request, socket, head));
@@ -57,7 +60,7 @@ export class AgentHubHttpServer {
   }
   public async stop(): Promise<void> {
     this.#stopped = true;
-    this.#realtime.stop(); this.#reviews.clear(); this.#idempotency.clear(); this.#address = undefined;
+    this.#realtime.stop(); this.#idempotency.clear(); this.#address = undefined;
     if (!this.#http.listening) return;
     await new Promise<void>((resolve, reject) => this.#http.close((error) => error === undefined ? resolve() : reject(error)));
   }
@@ -86,7 +89,7 @@ export class AgentHubHttpServer {
     noUnknownQuery(url, url.pathname === '/api/v1/events'
       ? ['limit', 'after', 'projectId', 'agentId', 'taskId', 'assignmentId', 'eventType'] : []);
     const path = url.pathname;
-    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.3D' });
+    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.3E' });
     if (path === '/api/v1/providers') return ok(await this.#providers());
     if (path === '/api/v1/state') return ok({ projects: this.#app.projects.list().map(projectDto),
       agents: this.#app.agents.listAgents().map(agentDto), tasks: this.#app.tasks.listTasks().map(taskDto),
@@ -101,6 +104,7 @@ export class AgentHubHttpServer {
     if (path === '/api/v1/events') return ok(this.#events(url));
     if (path === '/api/v1/intakes') return ok(this.#app.planLifecycle?.listIntakes() ?? []);
     if (path === '/api/v1/plans') return ok(this.#app.planLifecycle?.listPlans() ?? []);
+    if (path === '/api/v1/reviews') return ok(this.#reviews.listPublic(this.#app.planLifecycle?.listPlans() ?? []));
     const planMatch = /^\/api\/v1\/plans\/([^/]+)$/u.exec(path);
     if (planMatch !== null) { const plan = this.#app.planLifecycle?.getPlan(decodeURIComponent(planMatch[1] ?? '')); if (!plan) throw apiError('AGENTHUB_API_NOT_FOUND', 404); return ok(plan); }
     const match = /^\/api\/v1\/(agents|tasks|assignments)\/([^/]+)$/u.exec(path);
