@@ -12,6 +12,7 @@ import { TaskComplexity, TaskRisk, TaskStatus } from '../src/core/types.js';
 import { Database } from '../src/database/index.js';
 import { EventBus } from '../src/events/index.js';
 import { PlanExecutionCoordinator } from '../src/lifecycle/plan-execution-coordinator.js';
+import { PlanRecoveryCoordinator } from '../src/lifecycle/plan-recovery-coordinator.js';
 import { PlanLifecycleService, type CreatePlanTaskInput } from '../src/lifecycle/plan-lifecycle.js';
 import {
   PLAN_REVIEW_RECONCILIATION_REQUIRED,
@@ -108,7 +109,9 @@ function step(clientId: string): CreatePlanTaskInput {
 describe('0.7.3H post-reconciliation execution resume', { timeout: 8_000 }, () => {
   const directories: string[] = [];
   const databases: Database[] = [];
+  const recoveries: PlanRecoveryCoordinator[] = [];
   afterEach(async () => {
+    for (const recovery of recoveries.splice(0)) await recovery.stop();
     for (const database of databases.splice(0)) database.close();
     await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
   });
@@ -198,10 +201,14 @@ describe('0.7.3H post-reconciliation execution resume', { timeout: 8_000 }, () =
 
   async function recover(h: ReturnType<typeof bind>, calls: string[]) {
     const wired = execution(h, calls);
-    await recoverLifecycleAfterStartup({
-      reviewTransitions: wired.transitions, planExecution: wired.coordinator,
+    const recovery = new PlanRecoveryCoordinator({
+      planLifecycle: h.planLifecycle, planExecution: wired.coordinator,
+      reviewTransitions: wired.transitions, eventBus: h.events,
     });
-    return wired;
+    recoveries.push(recovery);
+    recoverLifecycleAfterStartup({ reviewTransitions: wired.transitions, recovery });
+    await recovery.idle();
+    return { ...wired, recovery };
   }
 
   function approveAndStart(
@@ -356,10 +363,14 @@ describe('0.7.3H post-reconciliation execution resume', { timeout: 8_000 }, () =
     const restored = reopen(h);
     const calls: string[] = [];
     const wired = execution(restored, calls);
-    expect(() => { wired.transitions.reconcile(); }).toThrow(PLAN_REVIEW_RECONCILIATION_REQUIRED);
-    await recoverLifecycleAfterStartup({
-      reviewTransitions: wired.transitions, planExecution: wired.coordinator,
+    const recovery = new PlanRecoveryCoordinator({
+      planLifecycle: restored.planLifecycle, planExecution: wired.coordinator,
+      reviewTransitions: wired.transitions, eventBus: restored.events,
     });
+    recoveries.push(recovery);
+    expect(() => { wired.transitions.reconcile(); }).toThrow(PLAN_REVIEW_RECONCILIATION_REQUIRED);
+    recoverLifecycleAfterStartup({ reviewTransitions: wired.transitions, recovery });
+    await recovery.idle();
     expect(wired.transitions.reconciliationRequired).toBe(true);
     expect(calls.filter((item) => item === `schedule:${runtimeE}`)).toHaveLength(0);
     expect(calls.filter((item) => item === `dispatch:${runtimeE}`)).toHaveLength(0);

@@ -12,6 +12,7 @@ import { GitCommandRunner, GitWorktreeManager, type GitCommandRunnerLike } from 
 import type { AgentHubApplication } from './AgentHubApplication.js';
 import { PlanLifecycleService } from '../lifecycle/plan-lifecycle.js';
 import { PlanExecutionCoordinator } from '../lifecycle/plan-execution-coordinator.js';
+import { PlanRecoveryCoordinator } from '../lifecycle/plan-recovery-coordinator.js';
 import {
   PLAN_REVIEW_RECONCILIATION_REQUIRED,
   ReviewTransitionCoordinator,
@@ -96,26 +97,38 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
   const planExecution = new PlanExecutionCoordinator({ planLifecycle, tasks, scheduler, dispatcher,
     taskLifecycle: lifecycle, targetBranch, buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }), eventBus, reviewTransitions });
-  await recoverLifecycleAfterStartup({ reviewTransitions, planExecution });
+  const planRecovery = new PlanRecoveryCoordinator({
+    planLifecycle, planExecution, reviewTransitions, eventBus,
+  });
+  recoverLifecycleAfterStartup({ reviewTransitions, recovery: planRecovery });
   const application: AgentHubApplication = Object.freeze({ projects: projectRepository, agents, agentManagement, tasks,
     assignments, assignmentQueries: assignmentRepository, events, eventBus, scheduler, dispatcher, lifecycle,
     planLifecycle, planExecution, reviews, reviewTransitions,
     buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }),
     targetBranch, providerCatalog });
-  return { application, database, async close() { await pool.shutdownAll(); events.close(); database.close(); } };
+  return {
+    application,
+    database,
+    async close() {
+      await planRecovery.stop();
+      await pool.shutdownAll();
+      events.close();
+      database.close();
+    },
+  };
 }
 
-/** Production startup: repair Review authority, then resume already-started Plans. */
-export async function recoverLifecycleAfterStartup(options: {
+/** Synchronous Review-authority gate, then arm asynchronous execution recovery. */
+export function recoverLifecycleAfterStartup(options: {
   readonly reviewTransitions: ReviewTransitionCoordinator;
-  readonly planExecution: PlanExecutionCoordinator;
-}): Promise<void> {
+  readonly recovery: PlanRecoveryCoordinator;
+}): void {
   try {
     options.reviewTransitions.reconcile();
   } catch (error) {
     if (!(error instanceof Error) || error.message !== PLAN_REVIEW_RECONCILIATION_REQUIRED) throw error;
     return;
   }
-  await options.planExecution.resumeStartedPlans();
+  options.recovery.start();
 }
