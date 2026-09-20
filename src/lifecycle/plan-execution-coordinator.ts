@@ -4,15 +4,35 @@ import type { TaskLifecycleOrchestrator, TaskReviewBundle } from '../orchestrati
 import type { TaskManager } from '../services/task-manager.js';
 import type { BuildTestEvidencePlan } from '../workspace/BuildTestEvidenceCollector.js';
 import type { EventBus } from '../events/event-bus.js';
-import type { PlanDto, PlanStartInput, PlanTaskRuntimeDto, PlanLifecycleService } from './plan-lifecycle.js';
+import type { PlanDto, PlanStartInput, PlanState, PlanTaskRuntimeDto, PlanLifecycleService } from './plan-lifecycle.js';
 
 export interface PlanExecutionStartResult { readonly plan:PlanDto; readonly reviewBundles:readonly TaskReviewBundle[] }
 export interface PlanExecutionCoordinatorOptions { planLifecycle:PlanLifecycleService; tasks:TaskManager; scheduler:AgentScheduler; dispatcher:AssignmentDispatcher; taskLifecycle:TaskLifecycleOrchestrator; targetBranch:string; buildTestPlan:BuildTestEvidencePlan; eventBus:EventBus; reviewTransitions?: { markPlanReviewPending(runtimeTaskId:string):void } }
+
+export function isResumablePlanState(state:PlanState):boolean {
+  return state==='EXECUTING' || state==='REVIEWING';
+}
 
 export class PlanExecutionCoordinator {
   readonly #active=new Set<string>();
   readonly #queues=new Map<string,Promise<unknown>>();
   public constructor(private readonly options:PlanExecutionCoordinatorOptions){}
+  public async resume(planId:string):Promise<readonly TaskReviewBundle[]>{
+    return this.#enqueue(planId,async()=>{
+      const plan=this.options.planLifecycle.getPlan(planId);
+      if(!plan)throw coded('PLAN_NOT_FOUND');
+      if(!isResumablePlanState(plan.state) || plan.startedVersion===null){
+        return Object.freeze([]);
+      }
+      const bundles=await this.#dispatchEligible(plan.planId,this.options.planLifecycle.refresh(plan.planId));
+      return Object.freeze(bundles);
+    });
+  }
+  public async resumeStartedPlans():Promise<void>{
+    for(const plan of this.options.planLifecycle.listPlans()){
+      await this.resume(plan.planId);
+    }
+  }
   public async start(planId:string,input:PlanStartInput):Promise<PlanExecutionStartResult>{
     if(this.#active.has(planId))throw coded('PLAN_CONFLICT'); this.#active.add(planId);
     try{
