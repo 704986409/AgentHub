@@ -12,6 +12,8 @@ import { GitCommandRunner, GitWorktreeManager, type GitCommandRunnerLike } from 
 import type { AgentHubApplication } from './AgentHubApplication.js';
 import { PlanLifecycleService } from '../lifecycle/plan-lifecycle.js';
 import { PlanExecutionCoordinator } from '../lifecycle/plan-execution-coordinator.js';
+import { ReviewTransitionCoordinator } from '../lifecycle/review-transition-coordinator.js';
+import { ReviewHandleStore } from '../api/ReviewHandleStore.js';
 
 export interface LocalAgentHubOptions { readonly repositoryRoot?: string; readonly dataDirectory?: string }
 export interface OwnedAgentHubApplication {
@@ -82,14 +84,23 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
   const worktrees = await GitWorktreeManager.open({ repositoryRoot });
   const dispatcher = new AssignmentDispatcher({ taskManager: tasks, agentRegistry: agents,
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
+  const reviews = new ReviewHandleStore(database);
+  const reviewTransitions = new ReviewTransitionCoordinator({
+    database, reviews, planLifecycle, tasks,
+  });
   const lifecycle = new TaskLifecycleOrchestrator({ taskManager: tasks, agentRegistry: agents,
-    assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees });
+    assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees, reviewTransitions });
   const planExecution = new PlanExecutionCoordinator({ planLifecycle, tasks, scheduler, dispatcher,
     taskLifecycle: lifecycle, targetBranch, buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
-      executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }), eventBus });
+      executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }), eventBus, reviewTransitions });
+  try {
+    reviewTransitions.reconcile();
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== 'PLAN_REVIEW_RECONCILIATION_REQUIRED') throw error;
+  }
   const application: AgentHubApplication = Object.freeze({ projects: projectRepository, agents, agentManagement, tasks,
     assignments, assignmentQueries: assignmentRepository, events, eventBus, scheduler, dispatcher, lifecycle,
-    planLifecycle, planExecution,
+    planLifecycle, planExecution, reviews, reviewTransitions,
     buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }),
     targetBranch, providerCatalog });

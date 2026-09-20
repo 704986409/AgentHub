@@ -40,7 +40,7 @@ export class AgentHubHttpServer {
       throw apiError('AGENTHUB_API_INVALID_REQUEST', 400);
     }
     this.#app = options.application; this.#maxBodyBytes = options.maxBodyBytes ?? 1024 * 1024;
-    this.#reviews = new ReviewHandleStore(options.database);
+    this.#reviews = options.application.reviews ?? new ReviewHandleStore(options.database);
     this.#realtime = new RealtimeHub({ eventBus: this.#app.eventBus });
     this.#http = createServer((request, response) => { void this.#handle(request, response); });
     this.#http.on('upgrade', (request, socket, head) => this.#realtime.handleUpgrade(request, socket, head));
@@ -89,14 +89,17 @@ export class AgentHubHttpServer {
     noUnknownQuery(url, url.pathname === '/api/v1/events'
       ? ['limit', 'after', 'projectId', 'agentId', 'taskId', 'assignmentId', 'eventType'] : []);
     const path = url.pathname;
-    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.3E' });
+    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.3F' });
     if (path === '/api/v1/providers') return ok(await this.#providers());
-    if (path === '/api/v1/state') return ok({ projects: this.#app.projects.list().map(projectDto),
+    if (path === '/api/v1/state') {
+      this.#app.reviewTransitions?.assertReady();
+      return ok({ projects: this.#app.projects.list().map(projectDto),
       agents: this.#app.agents.listAgents().map(agentDto), tasks: this.#app.tasks.listTasks().map(taskDto),
       assignments: this.#app.assignmentQueries.list().map(assignmentDto),
       intakes: this.#app.planLifecycle?.listIntakes() ?? [], plans: this.#app.planLifecycle?.listPlans() ?? [],
       planTasks: (this.#app.planLifecycle?.listPlans() ?? []).flatMap((p) => p.tasks),
       planDependencies: (this.#app.planLifecycle?.listPlans() ?? []).flatMap((p) => p.dependencies) });
+    }
     if (path === '/api/v1/projects') return ok(this.#app.projects.list().map(projectDto));
     if (path === '/api/v1/agents') return ok(this.#app.agents.listAgents().map(agentDto));
     if (path === '/api/v1/tasks') return ok(this.#app.tasks.listTasks().map(taskDto));
@@ -104,7 +107,10 @@ export class AgentHubHttpServer {
     if (path === '/api/v1/events') return ok(this.#events(url));
     if (path === '/api/v1/intakes') return ok(this.#app.planLifecycle?.listIntakes() ?? []);
     if (path === '/api/v1/plans') return ok(this.#app.planLifecycle?.listPlans() ?? []);
-    if (path === '/api/v1/reviews') return ok(this.#reviews.listPublic(this.#app.planLifecycle?.listPlans() ?? []));
+    if (path === '/api/v1/reviews') {
+      this.#app.reviewTransitions?.assertReady();
+      return ok(this.#reviews.listPublic(this.#app.planLifecycle?.listPlans() ?? []));
+    }
     const planMatch = /^\/api\/v1\/plans\/([^/]+)$/u.exec(path);
     if (planMatch !== null) { const plan = this.#app.planLifecycle?.getPlan(decodeURIComponent(planMatch[1] ?? '')); if (!plan) throw apiError('AGENTHUB_API_NOT_FOUND', 404); return ok(plan); }
     const match = /^\/api\/v1\/(agents|tasks|assignments)\/([^/]+)$/u.exec(path);
@@ -173,7 +179,7 @@ export class AgentHubHttpServer {
     }
     const start = /^\/api\/v1\/plans\/([^/]+)\/start$/u.exec(path);
     if (start !== null) {
-      const execution=this.#app.planExecution;if(!execution)throw apiError('AGENTHUB_API_NOT_FOUND',404);const planId=decodeURIComponent(start[1]??'');const input=snapshotPlanStart(body);return this.#mutate(request,'POST',path,input,async()=>{const result=await execution.start(planId,input);for(const bundle of result.reviewBundles)this.#reviews.register(bundle);return result.plan;},200);
+      const execution=this.#app.planExecution;if(!execution)throw apiError('AGENTHUB_API_NOT_FOUND',404);this.#app.reviewTransitions?.assertReady();const planId=decodeURIComponent(start[1]??'');const input=snapshotPlanStart(body);return this.#mutate(request,'POST',path,input,async()=>{const result=await execution.start(planId,input);if(this.#app.reviewTransitions===undefined){for(const bundle of result.reviewBundles)this.#reviews.register(bundle);}return result.plan;},200);
     }
     const execute = /^\/api\/v1\/tasks\/([^/]+)\/execute$/u.exec(path);
     const review = /^\/api\/v1\/reviews\/([^/]+)\/decision$/u.exec(path);
@@ -190,13 +196,16 @@ export class AgentHubHttpServer {
           turn: { prompt: input.prompt, protocol: 'worker-result' } });
         const prepared = await this.#app.lifecycle.prepareReview({ dispatchResult: dispatched,
           buildTestPlan: this.#app.buildTestPlan });
-        if (prepared.outcome === 'review-ready') this.#reviews.register(prepared.reviewBundle);
+        if (prepared.outcome === 'review-ready' && this.#app.reviewTransitions === undefined) {
+          this.#reviews.register(prepared.reviewBundle);
+        }
         return prepared.outcome === 'review-ready' ? reviewReadyDto(prepared.reviewBundle) : lifecycleDto(prepared);
       });
     }
     if (review !== null) {
       const reviewHandle = decodeURIComponent(review[1] ?? ''); const input = snapshotReviewDecision(body);
       return this.#mutate(request, 'POST', path, body, async () => {
+        this.#app.reviewTransitions?.assertReady();
         this.#reviews.claim(reviewHandle);
         try {
           const bundle = this.#reviews.resolve(reviewHandle);
@@ -204,10 +213,19 @@ export class AgentHubHttpServer {
             buildTestPlan: this.#app.buildTestPlan, targetBranch: this.#app.targetBranch,
             ...(this.#app.mergePolicy === undefined ? {} : { mergePolicy: this.#app.mergePolicy }),
             allowNoChangeCompletion: input.allowNoChangeCompletion });
-          if (result.outcome === 'review-ready') { this.#reviews.expire(reviewHandle); this.#reviews.register(result.reviewBundle); }
-          else if (result.outcome !== 'merge-denied') this.#reviews.expire(reviewHandle);
+          if (result.outcome === 'review-ready') {
+            if (this.#app.reviewTransitions === undefined) {
+              this.#reviews.expire(reviewHandle); this.#reviews.register(result.reviewBundle);
+            }
+          } else if (result.outcome !== 'merge-denied') {
+            if (this.#app.reviewTransitions !== undefined) this.#app.reviewTransitions.expireAfterTerminalDecision(reviewHandle);
+            else this.#reviews.expire(reviewHandle);
+          }
           if (result.outcome !== 'review-ready' && result.outcome !== 'merge-denied') {
-            for (const next of await this.#app.planExecution?.afterReview(bundle.taskId) ?? []) this.#reviews.register(next);
+            const next = await this.#app.planExecution?.afterReview(bundle.taskId) ?? [];
+            if (this.#app.reviewTransitions === undefined) {
+              for (const bundleNext of next) this.#reviews.register(bundleNext);
+            }
           }
           return lifecycleDto(result);
         } finally { this.#reviews.release(reviewHandle); }

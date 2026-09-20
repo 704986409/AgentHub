@@ -12,6 +12,7 @@ export type ApiErrorCode =
   | 'AGENTHUB_API_LIFECYCLE_DENIED'
   | 'AGENTHUB_API_PROVIDER_UNAVAILABLE'
   | 'AGENTHUB_API_RUNTIME_RECONCILIATION_REQUIRED'
+  | 'AGENTHUB_API_PLAN_REVIEW_RECONCILIATION_REQUIRED'
   | 'AGENTHUB_API_INTERNAL';
 
 export class ApiError extends Error {
@@ -28,6 +29,11 @@ export function apiError(code: ApiErrorCode, status: number): ApiError {
 export function normalizeApiError(error: unknown): ApiError {
   if (error instanceof ApiError) return error;
   const code = isRecord(error) && typeof error.code === 'string' ? error.code : '';
+  if (code === 'PLAN_REVIEW_RECONCILIATION_REQUIRED' ||
+    (typeof error === 'object' && error !== null && 'message' in error &&
+      (error as { message: string }).message === 'PLAN_REVIEW_RECONCILIATION_REQUIRED')) {
+    return apiError('AGENTHUB_API_PLAN_REVIEW_RECONCILIATION_REQUIRED', 503);
+  }
   if (code.includes('RECONCILIATION')) {
     return apiError('AGENTHUB_API_RUNTIME_RECONCILIATION_REQUIRED', 503);
   }
@@ -65,6 +71,7 @@ function safeApiMessage(code: ApiErrorCode): string {
     AGENTHUB_API_LIFECYCLE_DENIED: 'Lifecycle operation was denied',
     AGENTHUB_API_PROVIDER_UNAVAILABLE: 'Runtime provider is unavailable',
     AGENTHUB_API_RUNTIME_RECONCILIATION_REQUIRED: 'Runtime state requires reconciliation',
+    AGENTHUB_API_PLAN_REVIEW_RECONCILIATION_REQUIRED: 'Plan review state requires reconciliation',
     AGENTHUB_API_INTERNAL: 'Internal server error',
   };
   return messages[code];

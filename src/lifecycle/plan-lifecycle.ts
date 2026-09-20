@@ -98,6 +98,13 @@ export class PlanLifecycleService {
   }
   public markStarted(planId:string,version:number):PlanDto { const p=this.#requirePlan(planId),v=this.#current(p); if(p.currentVersion!==version) fail('PLAN_STALE'); if(!p.decisions.some((d)=>d.planVersion===version&&d.proposalHash===v.proposalHash&&d.decision==='APPROVE'))fail('PLAN_NOT_APPROVED'); if(p.runtimeLinks.size!==v.tasks.length) fail('PLAN_RUNTIME_LINK_CONFLICT'); p.startedVersion=version; p.startedAt??=now(); p.state='EXECUTING'; p.updatedAt=now(); this.#recompute(p); this.#commit(); this.#emit('PlanStarted',{planId,planVersion:version}); return this.#project(p); }
   public markReviewPendingByTask(runtimeTaskId:string,pending:boolean):void { const found=this.#findLink(runtimeTaskId); if(!found)return; found.link.reviewPending=pending; this.#recompute(found.plan); this.#commit(); this.#emit(pending?'PlanTaskReviewReady':'PlanTaskReviewResolved',{planId:found.plan.planId,planVersion:found.plan.currentVersion,planTaskId:found.link.planTaskId,runtimeTaskId}); }
+  public listReviewAuthority():readonly {planId:string;planTaskId:string;runtimeTaskId:string;reviewPending:boolean}[] {
+    const rows:{planId:string;planTaskId:string;runtimeTaskId:string;reviewPending:boolean}[]=[];
+    for(const p of this.#plans.values()) for(const link of p.runtimeLinks.values()){
+      rows.push({planId:p.planId,planTaskId:link.planTaskId,runtimeTaskId:link.runtimeTaskId,reviewPending:link.reviewPending});
+    }
+    return Object.freeze(rows);
+  }
   public refresh(planId:string):PlanDto { const p=this.#requirePlan(planId); this.#recompute(p); this.#commit(); return this.#project(p); }
   public eligibleTasks(planId:string):readonly PlanTaskRuntimeDto[]{
     const p=this.#requirePlan(planId); this.#recompute(p);

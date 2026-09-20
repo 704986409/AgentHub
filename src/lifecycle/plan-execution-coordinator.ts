@@ -7,7 +7,7 @@ import type { EventBus } from '../events/event-bus.js';
 import type { PlanDto, PlanStartInput, PlanTaskRuntimeDto, PlanLifecycleService } from './plan-lifecycle.js';
 
 export interface PlanExecutionStartResult { readonly plan:PlanDto; readonly reviewBundles:readonly TaskReviewBundle[] }
-export interface PlanExecutionCoordinatorOptions { planLifecycle:PlanLifecycleService; tasks:TaskManager; scheduler:AgentScheduler; dispatcher:AssignmentDispatcher; taskLifecycle:TaskLifecycleOrchestrator; targetBranch:string; buildTestPlan:BuildTestEvidencePlan; eventBus:EventBus }
+export interface PlanExecutionCoordinatorOptions { planLifecycle:PlanLifecycleService; tasks:TaskManager; scheduler:AgentScheduler; dispatcher:AssignmentDispatcher; taskLifecycle:TaskLifecycleOrchestrator; targetBranch:string; buildTestPlan:BuildTestEvidencePlan; eventBus:EventBus; reviewTransitions?: { markPlanReviewPending(runtimeTaskId:string):void } }
 
 export class PlanExecutionCoordinator {
   readonly #active=new Set<string>();
@@ -55,7 +55,9 @@ export class PlanExecutionCoordinator {
       this.options.eventBus.publish({eventType:'PlanTaskDispatched',taskId:step.runtimeTaskId,assignmentId:scheduled.assignmentId,agentId:scheduled.agentId,payload:{planId,planVersion:plan.currentVersion,planTaskId:step.planTaskId,runtimeTaskId:step.runtimeTaskId}});
       const prepared=await this.options.taskLifecycle.prepareReview({dispatchResult:dispatched,buildTestPlan:this.options.buildTestPlan});
       if(prepared.outcome==='review-ready'){
-        this.options.planLifecycle.markReviewPendingByTask(step.runtimeTaskId,true); bundles.push(prepared.reviewBundle);
+        if(this.options.reviewTransitions) this.options.reviewTransitions.markPlanReviewPending(step.runtimeTaskId);
+        else this.options.planLifecycle.markReviewPendingByTask(step.runtimeTaskId,true);
+        bundles.push(prepared.reviewBundle);
       }else{
         this.options.planLifecycle.refresh(planId);
       }

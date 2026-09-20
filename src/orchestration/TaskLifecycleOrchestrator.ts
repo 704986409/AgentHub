@@ -48,6 +48,7 @@ export interface TaskLifecycleOrchestratorOptions {
   readonly taskManager: TaskManager; readonly agentRegistry: AgentRegistry;
   readonly assignmentManager: AssignmentManager; readonly agentPool: AgentPool;
   readonly worktreeManager: GitWorktreeManager;
+  readonly reviewTransitions?: { commitPrepared(bundle: TaskReviewBundle, persistReviewing: () => void): void };
 }
 interface ReviewPreparationInput {
   readonly dispatch: Readonly<AssignmentDispatchResult>; readonly workerResult: AgentHubWorkerResult;
@@ -66,6 +67,7 @@ export class TaskLifecycleOrchestrator {
   readonly #runtimeGuard: RuntimeGuard;
   readonly #convergence: LifecycleConvergence;
   readonly #revisionCoordinator: RevisionCoordinator;
+  readonly #reviewTransitions: TaskLifecycleOrchestratorOptions['reviewTransitions'];
 
   public constructor(options: TaskLifecycleOrchestratorOptions) {
     if (!isRecord(options) || !(options.worktreeManager instanceof GitWorktreeManager)) {
@@ -74,6 +76,7 @@ export class TaskLifecycleOrchestrator {
     this.#tasks = options.taskManager; this.#agents = options.agentRegistry;
     this.#assignments = options.assignmentManager; this.#pool = options.agentPool;
     this.#worktrees = options.worktreeManager;
+    this.#reviewTransitions = options.reviewTransitions;
     this.#reviewPreparation = new ReviewPreparationCoordinator(this.#worktrees);
     this.#completionCoordinator = new CompletionCoordinator(this.#worktrees);
     this.#runtimeGuard = new RuntimeGuard({ pool: this.#pool, assignments: this.#assignments, tasks: this.#tasks, agents: this.#agents });
@@ -219,7 +222,12 @@ export class TaskLifecycleOrchestrator {
       throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED');
     }
     if (prepared.outcome === 'evidence-integrity-blocked') return this.#blockEvidenceIntegrity(dispatch);
-    this.#transition(dispatch.taskId, TaskStatus.REVIEWING);
+    const persistReviewing = (): void => { this.#transition(dispatch.taskId, TaskStatus.REVIEWING); };
+    if (this.#reviewTransitions !== undefined) {
+      this.#reviewTransitions.commitPrepared(prepared.reviewBundle, persistReviewing);
+    } else {
+      persistReviewing();
+    }
     return lifecycleResult({ outcome: 'review-ready' as const, reviewBundle: prepared.reviewBundle });
   }
 

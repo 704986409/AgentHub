@@ -18,22 +18,51 @@ export class ReviewHandleStore {
   }
 
   public register(bundle: Readonly<TaskReviewBundle>): string {
+    return this.replaceActiveForTask(bundle.taskId, bundle);
+  }
+
+  public replaceActiveForTask(
+    runtimeTaskId: string,
+    bundle: Readonly<TaskReviewBundle>,
+    expectedPriorHandle?: string,
+  ): string {
+    if (bundle.taskId !== runtimeTaskId) throw apiError('AGENTHUB_API_CONFLICT', 409);
     const handle = bundle.reviewBundleSha256;
     const existing = this.#active.get(handle);
     if (existing !== undefined && existing !== bundle &&
       JSON.stringify(existing) !== JSON.stringify(bundle)) throw apiError('AGENTHUB_API_CONFLICT', 409);
-    const previous = existing;
-    const wasExpired = this.#expired.delete(handle);
+    const priorForTask = this.getActiveForTask(runtimeTaskId);
+    if (expectedPriorHandle !== undefined && priorForTask !== undefined &&
+      priorForTask.reviewBundleSha256 !== expectedPriorHandle) {
+      throw apiError('AGENTHUB_API_CONFLICT', 409);
+    }
+    const snapshot = this.#snapshot();
+    for (const [activeHandle, active] of this.#active) {
+      if (active.taskId === runtimeTaskId && activeHandle !== handle) {
+        this.#active.delete(activeHandle);
+        this.#expired.add(activeHandle);
+      }
+    }
+    this.#expired.delete(handle);
     this.#active.set(handle, bundle);
     try {
       this.#persist();
     } catch (error) {
-      if (previous === undefined) this.#active.delete(handle);
-      else this.#active.set(handle, previous);
-      if (wasExpired) this.#expired.add(handle);
+      this.#restore(snapshot);
       throw error;
     }
     return handle;
+  }
+
+  public getActiveForTask(runtimeTaskId: string): Readonly<TaskReviewBundle> | undefined {
+    for (const bundle of this.#active.values()) {
+      if (bundle.taskId === runtimeTaskId) return bundle;
+    }
+    return undefined;
+  }
+
+  public listActive(): readonly Readonly<TaskReviewBundle>[] {
+    return Object.freeze([...this.#active.values()]);
   }
 
   public resolve(handle: string): Readonly<TaskReviewBundle> {
@@ -44,16 +73,13 @@ export class ReviewHandleStore {
 
   public expire(handle: string): void {
     if (!this.#active.has(handle)) return;
-    const previous = this.#active.get(handle);
+    const snapshot = this.#snapshot();
     this.#active.delete(handle);
     this.#expired.add(handle);
     try {
       this.#persist();
     } catch (error) {
-      if (previous !== undefined) {
-        this.#active.set(handle, previous);
-        this.#expired.delete(handle);
-      }
+      this.#restore(snapshot);
       throw error;
     }
   }
@@ -124,16 +150,29 @@ export class ReviewHandleStore {
       if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return;
       const record = raw as { schemaVersion?: unknown; bundles?: unknown };
       if (record.schemaVersion !== 1 || !Array.isArray(record.bundles)) return;
+      const byTask = new Map<string, Readonly<TaskReviewBundle>>();
       for (const item of record.bundles) {
         try {
           const bundle = snapshotTaskReviewBundle(item);
-          this.#active.set(bundle.reviewBundleSha256, bundle);
+          byTask.set(bundle.taskId, bundle);
         } catch {
           // Fail closed: skip a corrupt/forged bundle without resurrecting it.
         }
       }
+      for (const bundle of byTask.values()) this.#active.set(bundle.reviewBundleSha256, bundle);
     } catch {
       this.#active.clear();
     }
+  }
+
+  #snapshot(): { active: Map<string, Readonly<TaskReviewBundle>>; expired: Set<string> } {
+    return { active: new Map(this.#active), expired: new Set(this.#expired) };
+  }
+
+  #restore(snapshot: { active: Map<string, Readonly<TaskReviewBundle>>; expired: Set<string> }): void {
+    this.#active.clear();
+    this.#expired.clear();
+    for (const [handle, bundle] of snapshot.active) this.#active.set(handle, bundle);
+    for (const handle of snapshot.expired) this.#expired.add(handle);
   }
 }
