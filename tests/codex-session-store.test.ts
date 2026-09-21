@@ -81,7 +81,7 @@ describe('SQLite Codex session store', () => {
 
     const database = new Database(path);
     database.initialize();
-    expect(database.migrationManager.currentVersion()).toBe(6);
+    expect(database.migrationManager.currentVersion()).toBe(7);
     expect(database.connection.prepare('SELECT name FROM projects WHERE id = ?').get('project-1'))
       .toEqual({ name: 'Existing project' });
     expect(database.connection.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='codex_sessions'").get())

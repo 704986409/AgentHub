@@ -12,6 +12,7 @@ import { GitCommandRunner, GitWorktreeManager, type GitCommandRunnerLike } from 
 import type { AgentHubApplication } from './AgentHubApplication.js';
 import { PlanLifecycleService } from '../lifecycle/plan-lifecycle.js';
 import { PlanExecutionCoordinator } from '../lifecycle/plan-execution-coordinator.js';
+import { PlanExecutionRecoveryService } from '../lifecycle/plan-execution-recovery.js';
 import { PlanRecoveryCoordinator } from '../lifecycle/plan-recovery-coordinator.js';
 import {
   PLAN_REVIEW_RECONCILIATION_REQUIRED,
@@ -94,9 +95,12 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
   });
   const lifecycle = new TaskLifecycleOrchestrator({ taskManager: tasks, agentRegistry: agents,
     assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees, reviewTransitions });
+  const assignmentRecovery = new PlanExecutionRecoveryService({
+    database, planLifecycle, tasks, assignments, agentPool: pool, eventBus, reviews,
+  });
   const planExecution = new PlanExecutionCoordinator({ planLifecycle, tasks, scheduler, dispatcher,
     taskLifecycle: lifecycle, targetBranch, buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
-      executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }), eventBus, reviewTransitions });
+      executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }), eventBus, reviewTransitions, assignmentRecovery });
   const planRecovery = new PlanRecoveryCoordinator({
     planLifecycle, planExecution, reviewTransitions, eventBus,
   });

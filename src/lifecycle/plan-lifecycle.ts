@@ -114,6 +114,16 @@ export class PlanLifecycleService {
       return !!task && isRuntimeTaskSchedulable(task);
     });
   }
+  public recoverableRuntimeTasks(planId:string):readonly PlanTaskRuntimeDto[]{
+    const p=this.#requirePlan(planId); this.#recompute(p);
+    return this.#projectTasks(p).filter((t)=>{
+      if(t.dependencyState!=='ELIGIBLE'||t.runtimeTaskId===null) return false;
+      const task=this.tasks?.getTask(t.runtimeTaskId);
+      if(!task || isRuntimeTaskSchedulable(task)) return false;
+      return task.status===TaskStatus.ASSIGNED || task.status===TaskStatus.IMPLEMENTING
+        || task.status===TaskStatus.REVIEWING || t.runtimeState==='REVIEWING';
+    });
+  }
   #project(p:InternalPlan):PlanDto { this.#recompute(p); const current=this.#current(p),tasks=this.#projectTasks(p),aggregate=aggregateFor(p.state,tasks); return Object.freeze({planId:p.planId,intakeId:p.intakeId,projectId:p.projectId,leadAgentId:p.leadAgentId,currentVersion:p.currentVersion,state:aggregate.state,current,tasks:Object.freeze(tasks),dependencies:current.dependencies,decisions:Object.freeze(p.decisions.map((d)=>({...d}))),aggregate,startedVersion:p.startedVersion,startedAt:p.startedAt,createdAt:p.createdAt,updatedAt:p.updatedAt,completedAt:p.completedAt}); }
   #projectTasks(p:InternalPlan):PlanTaskRuntimeDto[]{
     const v=this.#current(p);

@@ -1,5 +1,6 @@
 import { DomainEventType } from '../core/types.js';
 import type { DomainEvent, EventBus } from '../events/event-bus.js';
+import { PLAN_ASSIGNMENT_RECOVERY_REQUIRED } from './plan-execution-recovery.js';
 import { PLAN_REVIEW_RECONCILIATION_REQUIRED } from './review-transition-coordinator.js';
 import type { ReviewTransitionCoordinator } from './review-transition-coordinator.js';
 import type { PlanExecutionCoordinator } from './plan-execution-coordinator.js';
@@ -107,16 +108,20 @@ export class PlanRecoveryCoordinator {
       } catch (error) {
         const category = classify(error);
         const retryable = category === 'operational' || category === 'unavailable';
+        const code = errorCode(error);
         this.#eventBus.publish({
           eventType: PLAN_RECOVERY_FAILED,
           payload: {
             planId: plan.planId,
             category,
-            code: errorCode(error),
+            code,
             retryable,
           },
         });
-        if (category === 'safety') return;
+        if (category === 'safety') {
+          if (code === PLAN_REVIEW_RECONCILIATION_REQUIRED || code === 'PLAN_CORRUPT_SNAPSHOT') return;
+          continue;
+        }
         if (retryable) deferred += 1;
       }
     }
@@ -216,7 +221,14 @@ function errorCode(error: unknown): string {
 
 function classify(error: unknown): PlanRecoveryCategory {
   const code = errorCode(error);
-  if (code === PLAN_REVIEW_RECONCILIATION_REQUIRED || code === 'PLAN_CORRUPT_SNAPSHOT') return 'safety';
+  if (code === PLAN_REVIEW_RECONCILIATION_REQUIRED || code === 'PLAN_CORRUPT_SNAPSHOT'
+    || code === PLAN_ASSIGNMENT_RECOVERY_REQUIRED
+    || code === 'AGENT_DISPATCH_TURN_FAILED'
+    || code === 'AGENT_DISPATCH_RUNTIME_RECONCILIATION_REQUIRED'
+    || code === 'AGENT_DISPATCH_RECONCILIATION_REQUIRED'
+    || code === 'AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION'
+    || code === 'AGENT_DISPATCH_STALE_PROFILE'
+    || code === 'AGENT_DISPATCH_STALE_RESERVATION') return 'safety';
   if (code === 'no-available-agent' || code === 'AGENT_SCHEDULER_NO_AVAILABLE_AGENT') return 'unavailable';
   if (code === 'PLAN_RUNTIME_LINK_CONFLICT' || code === 'PLAN_NOT_FOUND') return 'contract';
   return 'operational';

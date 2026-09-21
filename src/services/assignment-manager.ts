@@ -116,6 +116,24 @@ export class AssignmentManager {
     return result;
   }
 
+  /** Release a pre-turn Assignment so the Task can be scheduled again. */
+  public requeueDispatchResidue(id: string): Assignment {
+    const assignment = this.requireAssignment(id);
+    if (assignment.status !== AssignmentStatus.DISPATCHING && assignment.status !== AssignmentStatus.ACCEPTED) {
+      throw coded('PLAN_ASSIGNMENT_RECOVERY_REQUIRED');
+    }
+    const task = this.tasks.getTask(assignment.taskId);
+    if (task === null || task.status !== TaskStatus.ASSIGNED ||
+      task.assignedAgentId !== assignment.agentId || task.assignmentId !== assignment.id) {
+      throw coded('PLAN_ASSIGNMENT_RECOVERY_REQUIRED');
+    }
+    this.tasks.transitionTask(task.id, TaskStatus.QUEUED);
+    this.tasks.updateTask(task.id, { assignedAgentId: null, assignmentId: null });
+    const result = this.repository.update(id, { status: AssignmentStatus.RELEASED });
+    this.releaseAgent(assignment.agentId);
+    return result;
+  }
+
   public releaseAssignment(id: string): Assignment {
     const assignment = this.requireAssignment(id);
     if ([AssignmentStatus.COMPLETED, AssignmentStatus.RELEASED, AssignmentStatus.STALE].includes(assignment.status)) {
@@ -276,4 +294,10 @@ export class AssignmentManager {
     if (assignment === null) throw new Error(`Assignment ${id} was not found`);
     return assignment;
   }
+}
+
+function coded(code: string): Error {
+  const error = new Error(code) as Error & { code: string };
+  error.code = code;
+  return error;
 }

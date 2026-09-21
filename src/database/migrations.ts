@@ -194,4 +194,42 @@ export const migrations: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 7,
+    name: 'assignment_dispatch_recovery',
+    up: `
+      PRAGMA foreign_keys = OFF;
+      CREATE TABLE assignments_new (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        spec_version TEXT NOT NULL DEFAULT '1.0.0',
+        profile_hash TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL CHECK (status IN ('DISPATCHING','ACCEPTED','ACTIVE','COMPLETED','RELEASED','STALE','PENDING','REJECTED','CANCELLED')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO assignments_new (id, task_id, agent_id, spec_version, profile_hash, status, created_at, updated_at)
+        SELECT id, task_id, agent_id, spec_version, profile_hash, status, created_at, updated_at FROM assignments;
+      DROP TABLE assignments;
+      ALTER TABLE assignments_new RENAME TO assignments;
+      CREATE INDEX idx_assignments_task_id ON assignments(task_id);
+      CREATE INDEX idx_assignments_agent_id ON assignments(agent_id);
+      CREATE UNIQUE INDEX idx_assignments_live_task
+        ON assignments(task_id) WHERE status IN ('DISPATCHING','ACCEPTED','ACTIVE','PENDING');
+      CREATE UNIQUE INDEX idx_assignments_live_task_agent
+        ON assignments(task_id, agent_id) WHERE status IN ('DISPATCHING','ACCEPTED','ACTIVE','PENDING');
+      CREATE TABLE assignment_dispatch_recovery (
+        assignment_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        plan_id TEXT,
+        reservation_json TEXT NOT NULL CHECK (json_valid(reservation_json)),
+        dispatch_json TEXT CHECK (dispatch_json IS NULL OR json_valid(dispatch_json)),
+        stage TEXT NOT NULL,
+        turn_may_have_started INTEGER NOT NULL DEFAULT 0 CHECK (turn_may_have_started IN (0, 1)),
+        updated_at TEXT NOT NULL
+      );
+      PRAGMA foreign_keys = ON;
+    `,
+  },
 ];

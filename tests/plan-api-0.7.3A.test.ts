@@ -83,13 +83,13 @@ describe('0.7.3A lifecycle HTTP snapshots', { timeout: 8_000 }, () => {
     expectInvalid(() => snapshotPlanStart({ planVersion: 1.5, proposalHash: hash }));
   });
 
-  it('serves health 0.7.3I and lifecycle routes with decisionId distinct from Idempotency-Key', async () => {
+  it('serves health 0.7.3J and lifecycle routes with decisionId distinct from Idempotency-Key', async () => {
     const { app, service } = harness();
     const server = new AgentHubHttpServer({ application: app, port: 0 });
     const address = await server.start(); const base = `http://${address.host}:${String(address.port)}`;
     try {
       const health = await (await fetch(`${base}/api/v1/health`)).json() as { data: { version: string } };
-      expect(health.data.version).toBe('0.7.3I');
+      expect(health.data.version).toBe('0.7.3J');
       const intakeRes = await post(base, '/api/v1/intakes', { projectId: 'p', createdBy: 'human', goal: 'ship', leadAgentId: 'lead' }, 'intake-1');
       expect(intakeRes.status).toBe(201);
       const intake = (await intakeRes.json() as { data: { intakeId: string } }).data;
