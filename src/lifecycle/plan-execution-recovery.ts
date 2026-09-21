@@ -61,6 +61,7 @@ interface RecoveryRow {
   readonly dispatch_json: string | null;
   readonly stage: string;
   readonly turn_may_have_started: number;
+  readonly revision_round: number;
 }
 
 export class PlanExecutionRecoveryService {
@@ -97,6 +98,39 @@ export class PlanExecutionRecoveryService {
       dispatchJson: this.#row(snapshot.assignmentId)?.dispatch_json ?? null,
       stage,
       turnMayHaveStarted: this.#row(snapshot.assignmentId)?.turn_may_have_started === 1,
+      revisionRound: this.#row(snapshot.assignmentId)?.revision_round ?? 0,
+    });
+  }
+
+  public persistRevisionDispatch(dispatch: Readonly<AssignmentDispatchResult>, round: number): void {
+    if (!Number.isInteger(round) || round < 1) throw coded(PLAN_ASSIGNMENT_RECOVERY_REQUIRED);
+    const row = this.#row(dispatch.assignmentId);
+    if (!row) throw coded(PLAN_ASSIGNMENT_RECOVERY_REQUIRED);
+    const snapshot = snapshotAssignmentDispatchResult(dispatch);
+    this.#upsert({
+      assignmentId: dispatch.assignmentId,
+      taskId: row.task_id,
+      planId: row.plan_id,
+      reservation: parseReservation(row.reservation_json),
+      dispatchJson: JSON.stringify(snapshot),
+      stage: 'TURN_STARTED',
+      turnMayHaveStarted: true,
+      revisionRound: round,
+    });
+  }
+
+  public markReviewReady(assignmentId: string): void {
+    const row = this.#row(assignmentId);
+    if (!row) return;
+    this.#upsert({
+      assignmentId,
+      taskId: row.task_id,
+      planId: row.plan_id,
+      reservation: parseReservation(row.reservation_json),
+      dispatchJson: row.dispatch_json,
+      stage: 'REVIEW_READY',
+      turnMayHaveStarted: row.turn_may_have_started === 1,
+      revisionRound: row.revision_round,
     });
   }
 
@@ -111,6 +145,7 @@ export class PlanExecutionRecoveryService {
       dispatchJson: JSON.stringify(snapshotAssignmentDispatchResult(dispatch)),
       stage: 'TURN_COMPLETED',
       turnMayHaveStarted: true,
+      revisionRound: row.revision_round,
     });
   }
 
@@ -129,6 +164,7 @@ export class PlanExecutionRecoveryService {
       dispatchJson: row.dispatch_json,
       stage: stageForError(code, row.stage),
       turnMayHaveStarted,
+      revisionRound: row.revision_round,
     });
   }
 
@@ -145,6 +181,10 @@ export class PlanExecutionRecoveryService {
     const assignment = task.assignmentId === null ? null : this.#assignments.getAssignment(task.assignmentId);
     const row = assignment === null ? this.#rowByTask(runtimeTaskId) : this.#row(assignment.id);
     const handle = this.#reviews?.getActiveForTask(runtimeTaskId);
+    if (row?.stage === 'TURN_STARTED' && row.turn_may_have_started === 1 && handle === undefined) {
+      this.#blocked(assignment?.id ?? row.assignment_id, runtimeTaskId, PLAN_ASSIGNMENT_RECOVERY_REQUIRED);
+      return { outcome: 'reconciliation-required', code: PLAN_ASSIGNMENT_RECOVERY_REQUIRED };
+    }
     if (handle !== undefined || task.status === TaskStatus.REVIEWING || link?.reviewPending === true) {
       if (handle !== undefined) {
         return { outcome: 'review-ready', assignmentId: assignment?.id ?? handle.assignmentId };
@@ -233,6 +273,7 @@ export class PlanExecutionRecoveryService {
           dispatchJson: row.dispatch_json,
           stage: 'REQUEUED',
           turnMayHaveStarted: false,
+          revisionRound: row.revision_round,
         });
       }
     })();
@@ -307,12 +348,14 @@ export class PlanExecutionRecoveryService {
     dispatchJson: string | null;
     stage: string;
     turnMayHaveStarted: boolean;
+    revisionRound: number;
   }): void {
     const now = new Date().toISOString();
     this.#database.connection.prepare(`
       INSERT INTO assignment_dispatch_recovery
-        (assignment_id, task_id, plan_id, reservation_json, dispatch_json, stage, turn_may_have_started, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (assignment_id, task_id, plan_id, reservation_json, dispatch_json, stage, turn_may_have_started,
+         revision_round, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(assignment_id) DO UPDATE SET
         task_id = excluded.task_id,
         plan_id = excluded.plan_id,
@@ -320,6 +363,7 @@ export class PlanExecutionRecoveryService {
         dispatch_json = excluded.dispatch_json,
         stage = excluded.stage,
         turn_may_have_started = excluded.turn_may_have_started,
+        revision_round = excluded.revision_round,
         updated_at = excluded.updated_at
     `).run(
       input.assignmentId,
@@ -329,6 +373,7 @@ export class PlanExecutionRecoveryService {
       input.dispatchJson,
       input.stage,
       input.turnMayHaveStarted ? 1 : 0,
+      input.revisionRound,
       now,
     );
   }

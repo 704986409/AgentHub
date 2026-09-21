@@ -233,4 +233,12 @@ export const migrations: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 8,
+    name: 'assignment_dispatch_recovery_revision_round',
+    up: `
+      ALTER TABLE assignment_dispatch_recovery
+        ADD COLUMN revision_round INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
 ];

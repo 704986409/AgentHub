@@ -13,6 +13,7 @@ import {
 } from '../workspace/index.js';
 import { type AssignmentDispatchResult } from './AssignmentDispatcher.js';
 import { dispatchDigest, turnResultForDigest } from './dispatch/AssignmentDispatchContract.js';
+import type { PlanExecutionRecoveryService } from '../lifecycle/plan-execution-recovery.js';
 import { CompletionCoordinator } from './lifecycle/CompletionCoordinator.js';
 import { LifecycleConvergence } from './lifecycle/LifecycleConvergence.js';
 import { RuntimeGuard } from './lifecycle/RuntimeGuard.js';
@@ -54,6 +55,8 @@ export interface TaskLifecycleOrchestratorOptions {
     commitPrepared(bundle: TaskReviewBundle, persistReviewing: () => void): void;
     retireForRevision?(taskId: string, priorHandle: string): number;
   };
+  readonly assignmentRecovery?: PlanExecutionRecoveryService;
+  readonly revisionRecoveryFailpoint?: { afterRevisionTurnDurableBeforeReview?: () => void };
 }
 interface ReviewPreparationInput {
   readonly dispatch: Readonly<AssignmentDispatchResult>; readonly workerResult: AgentHubWorkerResult;
@@ -73,6 +76,8 @@ export class TaskLifecycleOrchestrator {
   readonly #convergence: LifecycleConvergence;
   readonly #revisionCoordinator: RevisionCoordinator;
   readonly #reviewTransitions: TaskLifecycleOrchestratorOptions['reviewTransitions'];
+  readonly #assignmentRecovery: PlanExecutionRecoveryService | undefined;
+  readonly #revisionRecoveryFailpoint: TaskLifecycleOrchestratorOptions['revisionRecoveryFailpoint'];
   readonly #localRounds = new Map<string, number>();
 
   public constructor(options: TaskLifecycleOrchestratorOptions) {
@@ -83,6 +88,8 @@ export class TaskLifecycleOrchestrator {
     this.#assignments = options.assignmentManager; this.#pool = options.agentPool;
     this.#worktrees = options.worktreeManager;
     this.#reviewTransitions = options.reviewTransitions;
+    this.#assignmentRecovery = options.assignmentRecovery;
+    this.#revisionRecoveryFailpoint = options.revisionRecoveryFailpoint;
     this.#reviewPreparation = new ReviewPreparationCoordinator(this.#worktrees);
     this.#completionCoordinator = new CompletionCoordinator(this.#worktrees);
     this.#runtimeGuard = new RuntimeGuard({ pool: this.#pool, assignments: this.#assignments, tasks: this.#tasks, agents: this.#agents });
@@ -171,9 +178,10 @@ export class TaskLifecycleOrchestrator {
         this.#localRounds.set(bundle.taskId, next);
         return next;
       })();
+    const dispatch = revisionBundleToDispatch(bundle, round);
+    this.#assignmentRecovery?.persistRevisionDispatch(dispatch, round);
     this.#transition(bundle.taskId, TaskStatus.REVISION_REQUIRED);
     this.#transition(bundle.taskId, TaskStatus.IMPLEMENTING);
-    const dispatch = revisionBundleToDispatch(bundle, round);
     await this.#requireExecution(dispatch, TaskStatus.IMPLEMENTING);
     let turn: AgentProviderTurnResult;
     try { turn = await this.#revisionCoordinator.run(revisionPlan); }
@@ -198,8 +206,12 @@ export class TaskLifecycleOrchestrator {
       catch { throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED'); }
       throw lifecycleError('TASK_LIFECYCLE_REVISION_FAILED');
     }
-    const revised = await this.#handleTurn({ dispatch, turnResult: turn,
+    const completed = dispatchWithTurn(dispatch, turn);
+    this.#assignmentRecovery?.persistDispatch(completed.assignmentId, completed);
+    this.#revisionRecoveryFailpoint?.afterRevisionTurnDurableBeforeReview?.();
+    const revised = await this.#handleTurn({ dispatch: completed, turnResult: turn,
       buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions });
+    if (revised.outcome === 'review-ready') this.#assignmentRecovery?.markReviewReady(completed.assignmentId);
     return revised.outcome === 'review-ready'
       ? lifecycleResult({ outcome: 'review-ready' as const, reviewEvidence: review, reviewBundle: revised.reviewBundle })
       : revised;
@@ -360,6 +372,32 @@ function revisionBundleToDispatch(bundle: TaskReviewBundle, round: number): Assi
   };
   const dispatchSha256 = dispatchDigest(digestInput);
   return { ...identity, dispatchSha256 };
+}
+
+function dispatchWithTurn(
+  dispatch: AssignmentDispatchResult,
+  turn: AgentProviderTurnResult,
+): AssignmentDispatchResult {
+  const identity = {
+    version: dispatch.version,
+    taskId: dispatch.taskId,
+    projectId: dispatch.projectId,
+    agentId: dispatch.agentId,
+    providerId: dispatch.providerId,
+    assignmentId: dispatch.assignmentId,
+    reservationSha256: dispatch.reservationSha256,
+    executionProfileSha256: dispatch.executionProfileSha256,
+    workspace: dispatch.workspace,
+    assignmentStatus: dispatch.assignmentStatus,
+    taskStatus: dispatch.taskStatus,
+    turnResult: turn,
+  };
+  const digestInput = {
+    ...identity,
+    turnProtocol: 'worker-result' as const,
+    turnResult: turnResultForDigest(turn),
+  };
+  return { ...identity, dispatchSha256: dispatchDigest(digestInput) };
 }
 function ownedPool(pool: Readonly<AgentPoolEntrySnapshot>, dispatch: Pick<AssignmentDispatchResult,
   'taskId' | 'assignmentId'>, specVersion: string, profileHash: string): boolean {

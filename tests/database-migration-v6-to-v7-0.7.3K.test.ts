@@ -22,7 +22,7 @@ describe('0.7.3K schema v6 to v7 assignment foreign-key integrity', () => {
 
     const database = new Database(seeded.path);
     database.initialize();
-    expect(database.migrationManager.currentVersion()).toBe(7);
+    expect(database.migrationManager.currentVersion()).toBe(8);
     expect(foreignKeys(database.connection)).toBe(1);
     expect(foreignKeyCheck(database.connection)).toEqual([]);
 
@@ -48,7 +48,7 @@ describe('0.7.3K schema v6 to v7 assignment foreign-key integrity', () => {
     expect(taskA).toEqual({ assignment_id: seeded.assignmentA, assigned_agent_id: seeded.agentId });
 
     database.initialize();
-    expect(database.migrationManager.currentVersion()).toBe(7);
+    expect(database.migrationManager.currentVersion()).toBe(8);
     expect(foreignKeys(database.connection)).toBe(1);
     database.close();
   });

@@ -93,11 +93,12 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
   const reviewTransitions = new ReviewTransitionCoordinator({
     database, reviews, planLifecycle, tasks,
   });
-  const lifecycle = new TaskLifecycleOrchestrator({ taskManager: tasks, agentRegistry: agents,
-    assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees, reviewTransitions });
   const assignmentRecovery = new PlanExecutionRecoveryService({
     database, planLifecycle, tasks, assignments, agentPool: pool, eventBus, reviews,
   });
+  const lifecycle = new TaskLifecycleOrchestrator({ taskManager: tasks, agentRegistry: agents,
+    assignmentManager: assignments, agentPool: pool, worktreeManager: worktrees, reviewTransitions,
+    assignmentRecovery });
   const planExecution = new PlanExecutionCoordinator({ planLifecycle, tasks, scheduler, dispatcher,
     taskLifecycle: lifecycle, targetBranch, buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }), eventBus, reviewTransitions, assignmentRecovery });
