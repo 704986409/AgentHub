@@ -219,10 +219,16 @@ export class TaskLifecycleOrchestrator {
       throw lifecycleError('TASK_LIFECYCLE_REVISION_FAILED');
     }
     const completed = dispatchWithTurn(dispatch, turn);
-    this.#assignmentRecovery?.persistDispatch(completed.assignmentId, completed);
-    this.#revisionRecoveryFailpoint?.afterRevisionTurnDurableBeforeReview?.();
-    const revised = await this.#consumeCompletedTurn({ dispatch: completed,
-      buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions });
+    let revised: TaskLifecyclePreparationResult;
+    if (this.#assignmentRecovery !== undefined) {
+      this.#assignmentRecovery.persistDispatch(completed.assignmentId, completed);
+      this.#revisionRecoveryFailpoint?.afterRevisionTurnDurableBeforeReview?.();
+      revised = await this.#consumeCompletedTurn({ dispatch: completed,
+        buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions });
+    } else {
+      revised = await this.#handleTurn({ dispatch: completed, turnResult: turn,
+        buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions });
+    }
     return revised.outcome === 'review-ready'
       ? lifecycleResult({ outcome: 'review-ready' as const, reviewEvidence: review, reviewBundle: revised.reviewBundle })
       : revised;

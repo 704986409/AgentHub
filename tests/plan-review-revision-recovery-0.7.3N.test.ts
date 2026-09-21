@@ -77,12 +77,18 @@ class ControllableSession implements AgentProviderSession {
 class ControllableProvider implements AgentProvider {
   public readonly id = 'fake';
   public readonly capabilities = capabilities;
+  public readonly sessions: ControllableSession[] = [];
   public session: ControllableSession | undefined;
   public constructor(private readonly outcome: AgentHubWorkerOutcome = 'COMPLETED') {}
+  public get runCalls(): number {
+    return this.sessions.reduce((sum, session) => sum + session.runCalls, 0);
+  }
   public createSession(options: AgentProviderSessionCreateOptions): AgentProviderSession {
     if (options.workspacePath === undefined) throw new Error('workspace path required');
-    this.session = new ControllableSession(this.outcome);
-    return this.session;
+    const session = new ControllableSession(this.outcome);
+    this.sessions.push(session);
+    this.session = session;
+    return session;
   }
 }
 
@@ -253,7 +259,7 @@ describe('0.7.3N standalone revision and TURN_COMPLETED restart', { timeout: 180
     const initial = recoveryRow(h.database, task.id);
     expect(initial.revision_round).toBe(0);
     expect(h.tasks.getTask(task.id)?.status).toBe(TaskStatus.REVIEWING);
-    const callsAfterExecute = h.provider.session?.runCalls ?? 0;
+    const callsAfterExecute = h.provider.runCalls;
     const revised = await fetch(`${h.baseUrl}/api/v1/reviews/${firstBody.data.reviewHandle}/decision`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': 'rev-n-1' },
       body: JSON.stringify(revisionBody),
@@ -262,7 +268,7 @@ describe('0.7.3N standalone revision and TURN_COMPLETED restart', { timeout: 180
     const secondBody = await revised.json() as { data: { reviewHandle: string } };
     expect(secondBody.data.reviewHandle).not.toBe(firstBody.data.reviewHandle);
     expect(recoveryRow(h.database, task.id).revision_round).toBe(2);
-    expect(h.provider.session?.runCalls).toBe(callsAfterExecute + 1);
+    expect(h.provider.runCalls).toBe(callsAfterExecute + 1);
     expect(h.tasks.listTasks()).toHaveLength(1);
     expect(h.assignmentRepo.list()).toHaveLength(1);
     expect(() => h.reviews.resolve(firstBody.data.reviewHandle)).toThrow();

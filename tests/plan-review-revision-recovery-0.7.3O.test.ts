@@ -82,7 +82,10 @@ class ControllableProvider implements AgentProvider {
   public readonly id = 'fake';
   public readonly capabilities = capabilities;
   public session: ControllableSession | undefined;
-  public constructor(private readonly outcome: AgentHubWorkerOutcome = 'COMPLETED') {}
+  public outcome: AgentHubWorkerOutcome;
+  public constructor(outcome: AgentHubWorkerOutcome = 'COMPLETED') {
+    this.outcome = outcome;
+  }
   public createSession(options: AgentProviderSessionCreateOptions): AgentProviderSession {
     if (options.workspacePath === undefined) throw new Error('workspace path required');
     this.session = new ControllableSession(this.outcome);
@@ -378,7 +381,7 @@ describe('0.7.3O recovered revision continuation', { timeout: 240_000 }, () => {
       harnesses.push(h);
       const started = await setupStartedPlan(h);
       if (!h.provider.session) throw new Error('missing session');
-      h.provider.session.outcome = outcome;
+      h.provider.outcome = outcome;
       h.failpoint.afterRevisionTurnDurableBeforeReview = () => { throw new Error('CRASH_BEFORE_CONVERGENCE'); };
       const crashed = await fetch(`${h.baseUrl}/api/v1/reviews/${started.handle}/decision`, {
         method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': `rev-o-${outcome}` },

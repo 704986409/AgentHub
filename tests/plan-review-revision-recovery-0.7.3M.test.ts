@@ -57,7 +57,7 @@ class ControllableSession implements AgentProviderSession {
   public active = false;
   public runCalls = 0;
   public turnGate: Promise<void> | undefined;
-  public onTurnStart?: () => void;
+  public onTurnStart: (() => void) | undefined = undefined;
   public constructor(private readonly outcome: AgentHubWorkerOutcome = 'COMPLETED') {}
   public start(): Promise<void> { this.started = true; return Promise.resolve(); }
   public async runTurn(): Promise<AgentProviderTurnResult> {
@@ -79,11 +79,16 @@ class ControllableProvider implements AgentProvider {
   public readonly id = 'fake';
   public readonly capabilities = capabilities;
   public session: ControllableSession | undefined;
+  public turnGate: Promise<void> | undefined;
+  public onTurnStart: (() => void) | undefined = undefined;
   public constructor(private readonly outcome: AgentHubWorkerOutcome = 'COMPLETED') {}
   public createSession(options: AgentProviderSessionCreateOptions): AgentProviderSession {
     if (options.workspacePath === undefined) throw new Error('workspace path required');
-    this.session = new ControllableSession(this.outcome);
-    return this.session;
+    const session = new ControllableSession(this.outcome);
+    session.turnGate = this.turnGate;
+    session.onTurnStart = this.onTurnStart;
+    this.session = session;
+    return session;
   }
 }
 
@@ -239,8 +244,8 @@ describe('0.7.3M revision dispatch durable recovery', { timeout: 180_000 }, () =
     let startedTurn!: () => void;
     const turnStarted = new Promise<void>((resolve) => { startedTurn = resolve; });
     if (!h.provider.session) throw new Error('missing session');
-    h.provider.session.turnGate = gate;
-    h.provider.session.onTurnStart = startedTurn;
+    h.provider.turnGate = gate;
+    h.provider.onTurnStart = startedTurn;
     const pending = fetch(`${h.baseUrl}/api/v1/reviews/${started.handle}/decision`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': 'rev-m-1' },
       body: JSON.stringify(revisionBody),
@@ -270,8 +275,8 @@ describe('0.7.3M revision dispatch durable recovery', { timeout: 180_000 }, () =
     let startedTurn!: () => void;
     const turnStarted = new Promise<void>((resolve) => { startedTurn = resolve; });
     if (!h.provider.session) throw new Error('missing session');
-    h.provider.session.turnGate = gate;
-    h.provider.session.onTurnStart = startedTurn;
+    h.provider.turnGate = gate;
+    h.provider.onTurnStart = startedTurn;
     const pending = fetch(`${h.baseUrl}/api/v1/reviews/${started.handle}/decision`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': 'rev-m-2' },
       body: JSON.stringify(revisionBody),

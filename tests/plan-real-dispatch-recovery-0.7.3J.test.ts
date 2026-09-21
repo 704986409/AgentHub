@@ -14,6 +14,7 @@ import {
   PlanRecoveryCoordinator, SqliteAgentRepository,
   SqliteAssignmentRepository, SqliteProjectRepository, SqliteTaskRepository,
   TaskComplexity, TaskManager, TaskRisk, TaskStateMachine, TaskStatus,
+  type TaskLifecycleOrchestrator, type TaskLifecyclePreparationResult,
   type AgentProvider, type AgentProviderCapabilities, type AgentProviderSession,
   type AgentProviderTurnRequest, type AgentProviderTurnResult, type CreatedTaskWorkspace,
   type RecoveryClock,
@@ -233,7 +234,7 @@ describe('0.7.3J real dispatcher failure recovery', { timeout: 20_000 }, () => {
     expect(h.pool.getSnapshot(h.worker.id).state).toBe('OWNED');
   });
 
-  it('J7. prepareReview failure does not rerun Provider turn', async () => {
+  it('J7. review convergence failure does not rerun Provider turn', async () => {
     const h = await open(directories, databases);
     const started = startPlan(h);
     const runtimeId = started.tasks[0]?.runtimeTaskId as string;
@@ -504,16 +505,23 @@ function wire(
       return h.scheduler.scheduleTask(request);
     },
   };
+  const convergeReview: TaskLifecycleOrchestrator['prepareReview'] = (request) => {
+    prepareCalls += 1;
+    if (overrides.prepareReview) {
+      return overrides.prepareReview(request) as Promise<TaskLifecyclePreparationResult>;
+    }
+    return Promise.resolve(reviewReady(
+      h, request.dispatchResult.taskId, request.dispatchResult.assignmentId, reviews, transitions,
+    )) as Promise<TaskLifecyclePreparationResult>;
+  };
+  const taskLifecycle = {
+    prepareReview: convergeReview,
+    consumeCompletedTurn: convergeReview,
+  } satisfies Pick<TaskLifecycleOrchestrator, 'prepareReview' | 'consumeCompletedTurn'>;
   const coordinator = new PlanExecutionCoordinator({
     planLifecycle: h.planLifecycle, tasks: h.tasks, scheduler: scheduler as never,
     dispatcher: h.dispatcher, assignmentRecovery: recoveryService,
-    taskLifecycle: {
-      prepareReview: (request: { dispatchResult: { taskId: string; assignmentId: string } }) => {
-        prepareCalls += 1;
-        if (overrides.prepareReview) return overrides.prepareReview(request);
-        return Promise.resolve(reviewReady(h, request.dispatchResult.taskId, request.dispatchResult.assignmentId, reviews, transitions));
-      },
-    } as never,
+    taskLifecycle: taskLifecycle as unknown as TaskLifecycleOrchestrator,
     targetBranch: 'main', buildTestPlan: { commands: [] }, eventBus: h.events, reviewTransitions: transitions,
   });
   const recovery = new PlanRecoveryCoordinator({
