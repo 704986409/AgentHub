@@ -203,8 +203,11 @@ export class AgentHubHttpServer {
           throw error;
         }
         recovery?.persistDispatch(reservation.assignmentId, dispatched);
-        const prepared = await this.#app.lifecycle.prepareReview({ dispatchResult: dispatched,
-          buildTestPlan: this.#app.buildTestPlan });
+        const prepared = recovery !== undefined
+          ? await this.#app.lifecycle.consumeCompletedTurn({ dispatchResult: dispatched,
+            buildTestPlan: this.#app.buildTestPlan })
+          : await this.#app.lifecycle.prepareReview({ dispatchResult: dispatched,
+            buildTestPlan: this.#app.buildTestPlan });
         if (prepared.outcome === 'review-ready' && this.#app.reviewTransitions === undefined) {
           this.#reviews.register(prepared.reviewBundle);
         }

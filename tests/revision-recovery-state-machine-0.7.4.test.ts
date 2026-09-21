@@ -59,7 +59,7 @@ class ControllableSession implements AgentProviderSession {
   public runCalls = 0;
   public outcome: AgentHubWorkerOutcome = 'COMPLETED';
   public turnGate: Promise<void> | undefined;
-  public onTurnStart?: () => void;
+  public onTurnStart: (() => void) | undefined = undefined;
   public constructor(outcome: AgentHubWorkerOutcome = 'COMPLETED') { this.outcome = outcome; }
   public start(): Promise<void> { this.started = true; return Promise.resolve(); }
   public async runTurn(): Promise<AgentProviderTurnResult> {
@@ -85,7 +85,7 @@ class ControllableProvider implements AgentProvider {
   public session: ControllableSession | undefined;
   public outcome: AgentHubWorkerOutcome = 'COMPLETED';
   public turnGate: Promise<void> | undefined;
-  public onTurnStart?: () => void;
+  public onTurnStart: (() => void) | undefined = undefined;
   public createSession(options: AgentProviderSessionCreateOptions): AgentProviderSession {
     if (options.workspacePath === undefined) throw new Error('workspace path required');
     const session = new ControllableSession(this.outcome);
