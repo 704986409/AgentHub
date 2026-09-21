@@ -2,6 +2,8 @@ export interface Migration {
   version: number;
   name: string;
   up: string;
+  /** When true, foreign_keys is disabled outside the migration transaction. */
+  readonly foreignKeysOff?: boolean;
 }
 
 export const migrations: readonly Migration[] = [
@@ -197,8 +199,8 @@ export const migrations: readonly Migration[] = [
   {
     version: 7,
     name: 'assignment_dispatch_recovery',
+    foreignKeysOff: true,
     up: `
-      PRAGMA foreign_keys = OFF;
       CREATE TABLE assignments_new (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -229,7 +231,6 @@ export const migrations: readonly Migration[] = [
         turn_may_have_started INTEGER NOT NULL DEFAULT 0 CHECK (turn_may_have_started IN (0, 1)),
         updated_at TEXT NOT NULL
       );
-      PRAGMA foreign_keys = ON;
     `,
   },
 ];

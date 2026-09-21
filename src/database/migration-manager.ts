@@ -48,11 +48,37 @@ export class MigrationManager {
   }
 
   private apply(migration: Migration): void {
+    if (migration.foreignKeysOff === true) {
+      this.applyWithForeignKeysOff(migration);
+      return;
+    }
     this.connection.transaction(() => {
-      this.connection.exec(migration.up);
-      this.connection
-        .prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
-        .run(migration.version, migration.name, new Date().toISOString());
+      this.execAndRecord(migration);
     })();
+  }
+
+  private applyWithForeignKeysOff(migration: Migration): void {
+    if (this.connection.inTransaction) {
+      throw new Error('FOREIGN_KEYS_OFF_REQUIRES_NO_TRANSACTION');
+    }
+    try {
+      this.connection.pragma('foreign_keys = OFF');
+      this.connection.transaction(() => {
+        this.execAndRecord(migration);
+        const violations = this.connection.pragma('foreign_key_check') as unknown[];
+        if (violations.length > 0) {
+          throw new Error('FOREIGN_KEY_CHECK_FAILED');
+        }
+      })();
+    } finally {
+      this.connection.pragma('foreign_keys = ON');
+    }
+  }
+
+  private execAndRecord(migration: Migration): void {
+    this.connection.exec(migration.up);
+    this.connection
+      .prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
+      .run(migration.version, migration.name, new Date().toISOString());
   }
 }

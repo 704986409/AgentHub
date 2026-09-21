@@ -39,6 +39,8 @@ describe('core data foundation', () => {
 
   it('initializes the database and applies migrations idempotently', () => {
     expect(database.migrationManager.currentVersion()).toBe(7);
+    expect(Number(database.connection.pragma('foreign_keys', { simple: true }))).toBe(1);
+    expect(database.connection.pragma('foreign_key_check')).toEqual([]);
     database.initialize();
     expect(database.migrationManager.currentVersion()).toBe(7);
 
@@ -47,7 +49,7 @@ describe('core data foundation', () => {
       .all()
       .map((row) => (row as { name: string }).name);
     expect(tables).toEqual(
-      expect.arrayContaining(['agents', 'assignments', 'codex_sessions', 'events', 'plan_task_materializations', 'projects', 'schema_migrations', 'settings', 'tasks']),
+      expect.arrayContaining(['agents', 'assignment_dispatch_recovery', 'assignments', 'codex_sessions', 'events', 'plan_task_materializations', 'projects', 'schema_migrations', 'settings', 'tasks']),
     );
   });
 
