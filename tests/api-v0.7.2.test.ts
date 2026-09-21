@@ -59,7 +59,7 @@ describe('API v0.7.2 Endpoints', () => {
       expect(res.status).toBe(200);
       const body = (await res.json()) as { ok: boolean; data: { status: string; version: string } };
       expect(body.ok).toBe(true);
-      expect(body.data.version).toBe('0.7.3O');
+      expect(body.data.version).toBe('0.7.4');
     } finally {
       await server.stop();
     }

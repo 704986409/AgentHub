@@ -1,4 +1,5 @@
 import type { EventBus } from '../events/event-bus.js';
+import { classifyRuntimeOwnership, type RuntimeOwnershipState } from '../lifecycle/revision-recovery-state.js';
 import {
   AgentRuntime,
   type AgentRuntimeBinding,
@@ -173,6 +174,17 @@ export class AgentPool {
 
   public getSnapshot(agentId: string): Readonly<AgentPoolEntrySnapshot> {
     return snapshotEntry(this.#requireEntry(agentId));
+  }
+
+  /** Pure query. Does not start, stop, or reserve a runtime. */
+  public inspectAssignmentOwnership(agentId: string, assignmentId: string, expected?: {
+    readonly taskId?: string;
+    readonly specVersion?: string;
+    readonly profileHash?: string;
+  }): { readonly state: RuntimeOwnershipState; readonly exact: boolean } {
+    let pool: AgentPoolEntrySnapshot | undefined;
+    try { pool = this.getSnapshot(agentId); } catch { pool = undefined; }
+    return classifyRuntimeOwnership(pool, { assignmentId, ...expected });
   }
 
   public list(): readonly Readonly<AgentPoolEntrySnapshot>[] {

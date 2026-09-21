@@ -14,6 +14,7 @@ import {
 import { type AssignmentDispatchResult } from './AssignmentDispatcher.js';
 import { dispatchDigest, turnResultForDigest } from './dispatch/AssignmentDispatchContract.js';
 import type { PlanExecutionRecoveryService } from '../lifecycle/plan-execution-recovery.js';
+import type { RuntimeOwnershipState } from '../lifecycle/revision-recovery-state.js';
 import { CompletionCoordinator } from './lifecycle/CompletionCoordinator.js';
 import { LifecycleConvergence } from './lifecycle/LifecycleConvergence.js';
 import { RuntimeGuard } from './lifecycle/RuntimeGuard.js';
@@ -65,6 +66,10 @@ interface ReviewPreparationInput {
 }
 
 type ApplySnapshot = ApplyTaskReviewSnapshot;
+interface TurnConsumptionContext {
+  readonly source: 'LIVE' | 'DURABLE_RECOVERY';
+  readonly runtimeOwnership: RuntimeOwnershipState;
+}
 
 export class TaskLifecycleOrchestrator {
   readonly #tasks: TaskManager; readonly #agents: AgentRegistry;
@@ -107,21 +112,10 @@ export class TaskLifecycleOrchestrator {
     });
   }
 
-  public prepareReviewFromRecoveredDispatch(request: PrepareTaskReviewRequest): Promise<TaskLifecyclePreparationResult> {
+  public consumeCompletedTurn(request: PrepareTaskReviewRequest): Promise<TaskLifecyclePreparationResult> {
     let input: ReturnType<typeof snapshotPrepareRequest>;
     try { input = snapshotPrepareRequest(request); } catch (error) { return rejectPreserving(error); }
-    return this.#withFence(input.dispatch.taskId, async () => {
-      if (!this.#assignmentRecovery) throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
-      try { this.#assignmentRecovery.assertCompletedRevisionIdentity(input.dispatch); }
-      catch { throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION'); }
-      try { await this.#captureReviewSource(input.dispatch.taskId); }
-      catch { throw lifecycleError('TASK_LIFECYCLE_STALE_SOURCE'); }
-      await this.#requireExecution(input.dispatch, TaskStatus.IMPLEMENTING, { requireOwnedPool: false });
-      const prepared = await this.#handleTurn({ dispatch: input.dispatch, turnResult: input.dispatch.turnResult,
-        buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions }, { recovered: true });
-      if (prepared.outcome === 'review-ready') this.#assignmentRecovery.markReviewReady(input.dispatch.assignmentId);
-      return prepared;
-    });
+    return this.#withFence(input.dispatch.taskId, () => this.#consumeCompletedTurn(input));
   }
 
   public applyReview(request: ApplyTaskReviewRequest): Promise<TaskLifecycleReviewResult> {
@@ -227,37 +221,61 @@ export class TaskLifecycleOrchestrator {
     const completed = dispatchWithTurn(dispatch, turn);
     this.#assignmentRecovery?.persistDispatch(completed.assignmentId, completed);
     this.#revisionRecoveryFailpoint?.afterRevisionTurnDurableBeforeReview?.();
-    const revised = await this.#handleTurn({ dispatch: completed, turnResult: turn,
+    const revised = await this.#consumeCompletedTurn({ dispatch: completed,
       buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions });
-    if (revised.outcome === 'review-ready') this.#assignmentRecovery?.markReviewReady(completed.assignmentId);
     return revised.outcome === 'review-ready'
       ? lifecycleResult({ outcome: 'review-ready' as const, reviewEvidence: review, reviewBundle: revised.reviewBundle })
       : revised;
   }
 
+  async #consumeCompletedTurn(input: ReturnType<typeof snapshotPrepareRequest>): Promise<TaskLifecyclePreparationResult> {
+    if (!this.#assignmentRecovery) throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
+    const stage = this.#assignmentRecovery.durableStage(input.dispatch.assignmentId);
+    if (stage !== 'TURN_COMPLETED') throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
+    const durable = this.#assignmentRecovery.durableRevision(input.dispatch.assignmentId);
+    if (durable !== undefined && durable.revisionRound >= 1) {
+      try { this.#assignmentRecovery.assertCompletedRevisionIdentity(input.dispatch); }
+      catch { throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION'); }
+    }
+    try { await this.#captureReviewSource(input.dispatch.taskId); }
+    catch { throw lifecycleError('TASK_LIFECYCLE_STALE_SOURCE'); }
+    await this.#runtimeGuard.ensureCleanAfterCompletedTurn(input.dispatch);
+    const prepared = await this.#handleTurn({ dispatch: input.dispatch, turnResult: input.dispatch.turnResult,
+      buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions },
+      { source: 'DURABLE_RECOVERY', runtimeOwnership: 'ABSENT' });
+    if (prepared.outcome === 'review-ready') this.#assignmentRecovery.markReviewReady(input.dispatch.assignmentId);
+    else this.#assignmentRecovery.markTerminal(input.dispatch.assignmentId);
+    return prepared;
+  }
+
   async #handleTurn(input: Omit<ReviewPreparationInput, 'workerResult'> &
     { readonly turnResult: AgentProviderTurnResult },
-    options?: { readonly recovered?: boolean }): Promise<TaskLifecyclePreparationResult> {
+    context: TurnConsumptionContext = { source: 'LIVE', runtimeOwnership: 'OWNED' }): Promise<TaskLifecyclePreparationResult> {
     const { dispatch, turnResult } = input;
     if (turnResult.protocol !== 'worker-result') throw lifecycleError('TASK_LIFECYCLE_UNSUPPORTED_TURN_PROTOCOL');
-    const recovered = options?.recovered === true;
+    const durable = context.source === 'DURABLE_RECOVERY';
+    if (durable && context.runtimeOwnership !== 'ABSENT') {
+      throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED');
+    }
     if (!turnResult.protocolValid) {
-      await this.#shutdownTurnRuntime(dispatch, recovered); this.#convergence.suspend(dispatch.assignmentId, TaskStatus.BLOCKED);
+      await this.#releaseLiveRuntime(dispatch, durable);
+      this.#convergence.suspend(dispatch.assignmentId, TaskStatus.BLOCKED);
       return lifecycleResult({ outcome: 'blocked' as const, taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
     }
     const worker = turnResult.workerResult;
     if (worker.outcome === 'FAILED') {
-      await this.#shutdownTurnRuntime(dispatch, recovered); this.#convergence.finalizeFailed(dispatch.assignmentId);
+      await this.#releaseLiveRuntime(dispatch, durable);
+      this.#convergence.finalizeFailed(dispatch.assignmentId);
       return lifecycleResult({ outcome: 'failed' as const, taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
     }
     if (worker.outcome === 'BLOCKED' || worker.outcome === 'NEEDS_INPUT') {
-      await this.#shutdownTurnRuntime(dispatch, recovered);
+      await this.#releaseLiveRuntime(dispatch, durable);
       const target = worker.outcome === 'BLOCKED' ? TaskStatus.BLOCKED : TaskStatus.WAITING_INPUT;
       this.#convergence.suspend(dispatch.assignmentId, target);
       return lifecycleResult({ outcome: worker.outcome === 'BLOCKED' ? 'blocked' as const : 'waiting-input' as const,
         taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
     }
-    await this.#requireExecution(dispatch, TaskStatus.IMPLEMENTING, { requireOwnedPool: options?.recovered !== true });
+    await this.#requireExecution(dispatch, TaskStatus.IMPLEMENTING, { requireOwnedPool: !durable });
     let prepared: Awaited<ReturnType<ReviewPreparationCoordinator['prepare']>>;
     try {
       prepared = await this.#reviewPreparation.prepare({ dispatch, workerResult: worker,
@@ -266,7 +284,7 @@ export class TaskLifecycleOrchestrator {
       if (error instanceof GitTaskCommitError) throw lifecycleError('TASK_LIFECYCLE_COMMIT_FAILED');
       throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED');
     }
-    if (prepared.outcome === 'evidence-integrity-blocked') return this.#blockEvidenceIntegrity(dispatch, recovered);
+    if (prepared.outcome === 'evidence-integrity-blocked') return this.#blockEvidenceIntegrity(dispatch, durable);
     const persistReviewing = (): void => { this.#transition(dispatch.taskId, TaskStatus.REVIEWING); };
     if (this.#reviewTransitions !== undefined) {
       this.#reviewTransitions.commitPrepared(prepared.reviewBundle, persistReviewing);
@@ -276,20 +294,24 @@ export class TaskLifecycleOrchestrator {
     return lifecycleResult({ outcome: 'review-ready' as const, reviewBundle: prepared.reviewBundle });
   }
 
-  async #shutdownTurnRuntime(dispatch: { readonly agentId: string; readonly assignmentId: string }, recovered: boolean): Promise<void> {
-    if (recovered) return;
-    await this.#runtimeGuard.shutdown(dispatch);
+  async #releaseLiveRuntime(dispatch: Pick<AssignmentDispatchResult, 'agentId' | 'assignmentId' | 'taskId'>, durable: boolean): Promise<void> {
+    if (durable) return;
+    await this.#runtimeGuard.ensureCleanAfterCompletedTurn(dispatch);
   }
 
   async #ensureRevisionRuntime(bundle: TaskReviewBundle): Promise<void> {
     const dispatch = bundleToDispatch(bundle);
     await this.#requireExecution(dispatch, TaskStatus.REVIEWING, { requireOwnedPool: false });
-    if (this.#poolOwns(bundle.agentId, bundle.assignmentId)) {
+    const assignment = this.#assignments.getAssignment(bundle.assignmentId);
+    if (assignment === null) throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
+    const ownership = this.#runtimeGuard.inspectOwnership(bundle.agentId, bundle.assignmentId, {
+      taskId: bundle.taskId, specVersion: assignment.specVersion, profileHash: assignment.profileHash,
+    });
+    if (ownership.state === 'OWNED' && ownership.exact) {
       await this.#requireExecution(dispatch, TaskStatus.REVIEWING);
       return;
     }
-    const assignment = this.#assignments.getAssignment(bundle.assignmentId);
-    if (assignment === null) throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
+    if (ownership.state !== 'ABSENT') throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
     let workspace;
     try { workspace = await this.#worktrees.inspectWorkspace(bundle.taskId); }
     catch { throw lifecycleError('TASK_LIFECYCLE_STALE_SOURCE'); }
@@ -307,30 +329,24 @@ export class TaskLifecycleOrchestrator {
     await this.#requireExecution(dispatch, TaskStatus.REVIEWING);
   }
 
-  async #blockEvidenceIntegrity(dispatch: Readonly<AssignmentDispatchResult>, recovered = false): Promise<TaskLifecyclePreparationResult> {
-    await this.#shutdownTurnRuntime(dispatch, recovered);
+  async #blockEvidenceIntegrity(dispatch: Readonly<AssignmentDispatchResult>, durable = false): Promise<TaskLifecyclePreparationResult> {
+    await this.#releaseLiveRuntime(dispatch, durable);
     this.#convergence.suspend(dispatch.assignmentId, TaskStatus.BLOCKED);
     return lifecycleResult({ outcome: 'blocked' as const, taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
   }
 
-  async #shutdownIfRuntimeOwned(binding: { readonly agentId: string; readonly assignmentId: string }): Promise<void> {
-    if (this.#assignmentRecovery?.isReadyRevision(binding.assignmentId) === true &&
-      !this.#poolOwns(binding.agentId, binding.assignmentId)) return;
+  async #shutdownIfRuntimeOwned(binding: { readonly agentId: string; readonly assignmentId: string; readonly taskId?: string }): Promise<void> {
+    const ownership = this.#runtimeGuard.inspectOwnership(binding.agentId, binding.assignmentId, {
+      ...(binding.taskId === undefined ? {} : { taskId: binding.taskId }),
+    });
+    if (this.#assignmentRecovery?.durableStage(binding.assignmentId) === 'REVIEW_READY' && ownership.state === 'ABSENT') return;
     await this.#runtimeGuard.shutdown(binding);
   }
 
-  #poolOwns(agentId: string, assignmentId: string): boolean {
-    try {
-      const pool = this.#pool.getSnapshot(agentId);
-      return pool.state === 'OWNED' && pool.assignmentId === assignmentId;
-    } catch {
-      return false;
-    }
-  }
-
   async #requireBundleFresh(bundle: TaskReviewBundle): Promise<void> {
-    const recovered = this.#assignmentRecovery?.isReadyRevision(bundle.assignmentId) === true
-      && !this.#poolOwns(bundle.agentId, bundle.assignmentId);
+    const ownership = this.#runtimeGuard.inspectOwnership(bundle.agentId, bundle.assignmentId, { taskId: bundle.taskId });
+    const recovered = this.#assignmentRecovery?.durableStage(bundle.assignmentId) === 'REVIEW_READY'
+      && ownership.state === 'ABSENT';
     await this.#requireExecution(bundleToDispatch(bundle), TaskStatus.REVIEWING, { requireOwnedPool: !recovered });
     if (!sourceMatchesEvidence(bundle.source, bundle.buildTestEvidence) ||
       bundle.source.headCommit !== bundle.taskCommit.headAfter || !cleanSource(bundle.source)) {

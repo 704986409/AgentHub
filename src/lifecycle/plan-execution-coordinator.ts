@@ -137,6 +137,11 @@ export class PlanExecutionCoordinator {
         if(prepared) bundles.push(prepared);
         continue;
       }
+      if(inspected.outcome==='turn-completed'){
+        const prepared=await this.#preparePersisted(planId,step.runtimeTaskId,inspected.dispatch);
+        if(prepared) bundles.push(prepared);
+        continue;
+      }
       recovery.ensureReserved(inspected.reservation);
       const prepared=await this.#dispatchReserved(plan,step,inspected.reservation,'resume');
       if(prepared==='deferred'){ deferredEligible+=1; continue; }
@@ -184,12 +189,12 @@ export class PlanExecutionCoordinator {
     dispatchedResult:Parameters<TaskLifecycleOrchestrator['prepareReview']>[0]['dispatchResult'] | object,
   ):Promise<TaskReviewBundle|null>{
     const dispatch=dispatchedResult as { assignmentId?: string };
-    const durable=typeof dispatch.assignmentId==='string'
-      ? this.options.assignmentRecovery?.durableRevision(dispatch.assignmentId)
-      : undefined;
-    const recovered=durable?.stage==='TURN_COMPLETED' && durable.revisionRound>=1;
-    const prepared=recovered
-      ? await this.options.taskLifecycle.prepareReviewFromRecoveredDispatch({
+    const assignmentId=typeof dispatch.assignmentId==='string' ? dispatch.assignmentId : undefined;
+    const stage=assignmentId===undefined
+      ? undefined
+      : this.options.assignmentRecovery?.durableStage(assignmentId);
+    const prepared=stage==='TURN_COMPLETED'
+      ? await this.options.taskLifecycle.consumeCompletedTurn({
         dispatchResult:dispatchedResult as never,
         buildTestPlan:this.options.buildTestPlan,
       })

@@ -4,6 +4,7 @@ import type { AgentRegistry } from '../../services/agent-registry.js';
 import type { AssignmentManager } from '../../services/assignment-manager.js';
 import type { TaskManager } from '../../services/task-manager.js';
 import type { AssignmentDispatchResult } from '../AssignmentDispatcher.js';
+import { classifyRuntimeOwnership, type RuntimeOwnershipState } from '../../lifecycle/revision-recovery-state.js';
 import { lifecycleError, type TaskReviewBundle } from './TaskLifecycleContract.js';
 
 type RuntimeBinding = Pick<AssignmentDispatchResult, 'agentId' | 'assignmentId'>;
@@ -24,6 +25,33 @@ export class RuntimeGuard {
     this.#assignments = options.assignments;
     this.#tasks = options.tasks;
     this.#agents = options.agents;
+  }
+
+  public inspectOwnership(agentId: string, assignmentId: string, expected?: {
+    readonly taskId?: string;
+    readonly specVersion?: string;
+    readonly profileHash?: string;
+  }): { readonly state: RuntimeOwnershipState; readonly exact: boolean } {
+    let pool: AgentPoolEntrySnapshot | undefined;
+    try { pool = this.#pool.getSnapshot(agentId); } catch { pool = undefined; }
+    return classifyRuntimeOwnership(pool, { assignmentId, ...expected });
+  }
+
+  public async ensureCleanAfterCompletedTurn(dispatch: Pick<AssignmentDispatchResult,
+    'agentId' | 'assignmentId' | 'taskId'>): Promise<void> {
+    const assignment = this.#assignments.getAssignment(dispatch.assignmentId);
+    const ownership = this.inspectOwnership(dispatch.agentId, dispatch.assignmentId, {
+      taskId: dispatch.taskId,
+      ...(assignment === null ? {} : { specVersion: assignment.specVersion, profileHash: assignment.profileHash }),
+    });
+    if (ownership.state === 'ABSENT') return;
+    if (ownership.state === 'OWNED' && ownership.exact) {
+      await this.shutdown({ agentId: dispatch.agentId, assignmentId: dispatch.assignmentId });
+      const after = this.inspectOwnership(dispatch.agentId, dispatch.assignmentId, { taskId: dispatch.taskId });
+      if (after.state !== 'ABSENT') throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED');
+      return;
+    }
+    throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED');
   }
 
   public async shutdown(value: RuntimeBinding): Promise<void> {

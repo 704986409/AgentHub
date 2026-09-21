@@ -1,4 +1,10 @@
-import { AssignmentStatus, TaskStatus } from '../core/types.js';
+import { AgentStatus, AssignmentStatus, TaskStatus } from '../core/types.js';
+import {
+  classifyRuntimeOwnership,
+  decideRevisionRecovery,
+  mapDurableStage,
+  type DurableExecutionStage,
+} from './revision-recovery-state.js';
 import type { Database } from '../database/index.js';
 import type { EventBus } from '../events/event-bus.js';
 import {
@@ -39,6 +45,7 @@ export type AssignmentRecoveryResult =
   | { outcome: 'requeue-safe'; assignmentId: string }
   | { outcome: 'requeued'; oldAssignmentId: string }
   | { outcome: 'review-resumable'; assignmentId: string; dispatch: Readonly<AssignmentDispatchResult> }
+  | { outcome: 'turn-completed'; assignmentId: string; dispatch: Readonly<AssignmentDispatchResult>; revisionRound: number }
   | { outcome: 'review-ready'; assignmentId: string }
   | { outcome: 'idle' }
   | { outcome: 'reconciliation-required'; code: string };
@@ -150,8 +157,28 @@ export class PlanExecutionRecoveryService {
   }
 
   public isReadyRevision(assignmentId: string): boolean {
+    return this.durableStage(assignmentId) === 'REVIEW_READY';
+  }
+
+  public durableStage(assignmentId: string): DurableExecutionStage | undefined {
     const row = this.#row(assignmentId);
-    return row?.stage === 'REVIEW_READY' && row.revision_round >= 1;
+    if (!row) return undefined;
+    return mapDurableStage(row.stage);
+  }
+
+  public markTerminal(assignmentId: string): void {
+    const row = this.#row(assignmentId);
+    if (!row) return;
+    this.#upsert({
+      assignmentId,
+      taskId: row.task_id,
+      planId: row.plan_id,
+      reservation: parseReservation(row.reservation_json),
+      dispatchJson: row.dispatch_json,
+      stage: 'TERMINAL',
+      turnMayHaveStarted: row.turn_may_have_started === 1,
+      revisionRound: row.revision_round,
+    });
   }
 
   public markReviewReady(assignmentId: string): void {
@@ -217,6 +244,26 @@ export class PlanExecutionRecoveryService {
     const row = assignment === null ? this.#rowByTask(runtimeTaskId) : this.#row(assignment.id);
     const handle = this.#reviews?.getActiveForTask(runtimeTaskId);
     if (row?.stage === 'TURN_STARTED' && row.turn_may_have_started === 1 && handle === undefined) {
+      const ownership = classifyRuntimeOwnership(assignment === null ? undefined : this.#safePool(assignment.agentId) ?? undefined, {
+        assignmentId: assignment?.id ?? row.assignment_id,
+        taskId: runtimeTaskId,
+        ...(assignment === null ? {} : { specVersion: assignment.specVersion, profileHash: assignment.profileHash }),
+      });
+      const decision = decideRevisionRecovery({
+        taskId: runtimeTaskId,
+        assignmentId: assignment?.id ?? row.assignment_id,
+        agentId: assignment?.agentId ?? '',
+        providerId: '',
+        revisionRound: row.revision_round,
+        durableStage: 'TURN_STARTED',
+        runtimeOwnership: ownership.state,
+        taskStatus: task.status,
+        assignmentStatus: assignment?.status ?? AssignmentStatus.ACTIVE,
+        agentStatus: AgentStatus.BUSY,
+        hasActiveReview: false,
+        turnMayHaveStarted: true,
+      });
+      if (decision.kind === 'NOOP') return { outcome: 'idle' };
       this.#blocked(assignment?.id ?? row.assignment_id, runtimeTaskId, PLAN_ASSIGNMENT_RECOVERY_REQUIRED);
       return { outcome: 'reconciliation-required', code: PLAN_ASSIGNMENT_RECOVERY_REQUIRED };
     }
@@ -225,6 +272,9 @@ export class PlanExecutionRecoveryService {
         return { outcome: 'review-ready', assignmentId: assignment?.id ?? handle.assignmentId };
       }
       const dispatch = row?.dispatch_json ? parseDispatch(row.dispatch_json) : null;
+      if (dispatch !== null && assignment !== null && mapDurableStage(row?.stage) === 'TURN_COMPLETED') {
+        return { outcome: 'turn-completed', assignmentId: assignment.id, dispatch, revisionRound: row?.revision_round ?? 0 };
+      }
       if (dispatch !== null && assignment !== null) {
         return { outcome: 'review-resumable', assignmentId: assignment.id, dispatch };
       }
@@ -244,6 +294,10 @@ export class PlanExecutionRecoveryService {
       assignment.status === AssignmentStatus.ACTIVE ||
       pool?.state === 'OWNED';
 
+    if (dispatch !== null && mapDurableStage(row?.stage) === 'TURN_COMPLETED'
+      && task.status === TaskStatus.IMPLEMENTING) {
+      return { outcome: 'turn-completed', assignmentId: assignment.id, dispatch, revisionRound: row?.revision_round ?? 0 };
+    }
     if (dispatch !== null && (task.status === TaskStatus.IMPLEMENTING || assignment.status === AssignmentStatus.ACTIVE)) {
       return { outcome: 'review-resumable', assignmentId: assignment.id, dispatch };
     }

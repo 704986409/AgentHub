@@ -228,7 +228,8 @@ function classify(error: unknown): PlanRecoveryCategory {
     || code === 'AGENT_DISPATCH_RECONCILIATION_REQUIRED'
     || code === 'AGENT_DISPATCH_PROVIDER_CONTRACT_VIOLATION'
     || code === 'AGENT_DISPATCH_STALE_PROFILE'
-    || code === 'AGENT_DISPATCH_STALE_RESERVATION') return 'safety';
+    || code === 'AGENT_DISPATCH_STALE_RESERVATION'
+    || code === 'TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED') return 'safety';
   if (code === 'no-available-agent' || code === 'AGENT_SCHEDULER_NO_AVAILABLE_AGENT') return 'unavailable';
   if (code === 'PLAN_RUNTIME_LINK_CONFLICT' || code === 'PLAN_NOT_FOUND') return 'contract';
   return 'operational';
