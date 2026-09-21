@@ -217,11 +217,14 @@ export class AgentPool {
     this.#reservationOwners.delete(assignmentId);
   }
 
-  public start(agentId: string, binding: AgentRuntimeBinding): Promise<void> {
+  public start(agentId: string, binding: AgentRuntimeBinding, context?: AgentRuntimeStartContext): Promise<void> {
     try {
       this.#ensureNotDraining();
       const entry = this.#requireEntry(agentId);
-      const snapshot = this.#withInputSnapshotReservation(() => snapshotBinding(binding));
+      const [snapshot, startContext] = this.#withInputSnapshotReservation(() => [
+        snapshotBinding(binding),
+        snapshotStartContext(context),
+      ] as const);
       this.#ensureNotDraining();
       if (this.#entries.get(agentId) !== entry) {
         throw new AgentPoolError('AGENT_POOL_AGENT_NOT_FOUND', `Agent ${agentId} is not registered`);
@@ -238,7 +241,7 @@ export class AgentPool {
       this.#assignmentOwners.set(snapshot.assignmentId, agentId);
       let starting: Promise<void>;
       try {
-        starting = entry.runtime.start(snapshot);
+        starting = entry.runtime.start(snapshot, startContext);
       } catch (error) {
         this.#reconcileStartFailure(entry, snapshot.assignmentId);
         throw error;

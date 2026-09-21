@@ -116,6 +116,7 @@ export class TaskLifecycleOrchestrator {
       catch { throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION'); }
       try { await this.#captureReviewSource(input.dispatch.taskId); }
       catch { throw lifecycleError('TASK_LIFECYCLE_STALE_SOURCE'); }
+      await this.#requireExecution(input.dispatch, TaskStatus.IMPLEMENTING, { requireOwnedPool: false });
       const prepared = await this.#handleTurn({ dispatch: input.dispatch, turnResult: input.dispatch.turnResult,
         buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions }, { recovered: true });
       if (prepared.outcome === 'review-ready') this.#assignmentRecovery.markReviewReady(input.dispatch.assignmentId);
@@ -187,6 +188,7 @@ export class TaskLifecycleOrchestrator {
   async #revise(bundle: TaskReviewBundle, review: ReviewEvidence, input: ApplySnapshot): Promise<TaskLifecycleReviewResult> {
     const task = this.#tasks.getTask(bundle.taskId);
     if (task === null) throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
+    await this.#ensureRevisionRuntime(bundle);
     const revisionPlan = this.#revisionCoordinator.prepare(review, task, bundle);
     const round = this.#reviewTransitions?.retireForRevision?.(bundle.taskId, bundle.reviewBundleSha256)
       ?? (() => {
@@ -238,17 +240,18 @@ export class TaskLifecycleOrchestrator {
     options?: { readonly recovered?: boolean }): Promise<TaskLifecyclePreparationResult> {
     const { dispatch, turnResult } = input;
     if (turnResult.protocol !== 'worker-result') throw lifecycleError('TASK_LIFECYCLE_UNSUPPORTED_TURN_PROTOCOL');
+    const recovered = options?.recovered === true;
     if (!turnResult.protocolValid) {
-      await this.#runtimeGuard.shutdown(dispatch); this.#convergence.suspend(dispatch.assignmentId, TaskStatus.BLOCKED);
+      await this.#shutdownTurnRuntime(dispatch, recovered); this.#convergence.suspend(dispatch.assignmentId, TaskStatus.BLOCKED);
       return lifecycleResult({ outcome: 'blocked' as const, taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
     }
     const worker = turnResult.workerResult;
     if (worker.outcome === 'FAILED') {
-      await this.#runtimeGuard.shutdown(dispatch); this.#convergence.finalizeFailed(dispatch.assignmentId);
+      await this.#shutdownTurnRuntime(dispatch, recovered); this.#convergence.finalizeFailed(dispatch.assignmentId);
       return lifecycleResult({ outcome: 'failed' as const, taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
     }
     if (worker.outcome === 'BLOCKED' || worker.outcome === 'NEEDS_INPUT') {
-      await this.#runtimeGuard.shutdown(dispatch);
+      await this.#shutdownTurnRuntime(dispatch, recovered);
       const target = worker.outcome === 'BLOCKED' ? TaskStatus.BLOCKED : TaskStatus.WAITING_INPUT;
       this.#convergence.suspend(dispatch.assignmentId, target);
       return lifecycleResult({ outcome: worker.outcome === 'BLOCKED' ? 'blocked' as const : 'waiting-input' as const,
@@ -263,7 +266,7 @@ export class TaskLifecycleOrchestrator {
       if (error instanceof GitTaskCommitError) throw lifecycleError('TASK_LIFECYCLE_COMMIT_FAILED');
       throw lifecycleError('TASK_LIFECYCLE_RECONCILIATION_REQUIRED');
     }
-    if (prepared.outcome === 'evidence-integrity-blocked') return this.#blockEvidenceIntegrity(dispatch);
+    if (prepared.outcome === 'evidence-integrity-blocked') return this.#blockEvidenceIntegrity(dispatch, recovered);
     const persistReviewing = (): void => { this.#transition(dispatch.taskId, TaskStatus.REVIEWING); };
     if (this.#reviewTransitions !== undefined) {
       this.#reviewTransitions.commitPrepared(prepared.reviewBundle, persistReviewing);
@@ -273,8 +276,39 @@ export class TaskLifecycleOrchestrator {
     return lifecycleResult({ outcome: 'review-ready' as const, reviewBundle: prepared.reviewBundle });
   }
 
-  async #blockEvidenceIntegrity(dispatch: Readonly<AssignmentDispatchResult>): Promise<TaskLifecyclePreparationResult> {
+  async #shutdownTurnRuntime(dispatch: { readonly agentId: string; readonly assignmentId: string }, recovered: boolean): Promise<void> {
+    if (recovered) return;
     await this.#runtimeGuard.shutdown(dispatch);
+  }
+
+  async #ensureRevisionRuntime(bundle: TaskReviewBundle): Promise<void> {
+    const dispatch = bundleToDispatch(bundle);
+    await this.#requireExecution(dispatch, TaskStatus.REVIEWING, { requireOwnedPool: false });
+    if (this.#poolOwns(bundle.agentId, bundle.assignmentId)) {
+      await this.#requireExecution(dispatch, TaskStatus.REVIEWING);
+      return;
+    }
+    const assignment = this.#assignments.getAssignment(bundle.assignmentId);
+    if (assignment === null) throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
+    let workspace;
+    try { workspace = await this.#worktrees.inspectWorkspace(bundle.taskId); }
+    catch { throw lifecycleError('TASK_LIFECYCLE_STALE_SOURCE'); }
+    if (workspace === undefined || workspace.worktreePath.length === 0) throw lifecycleError('TASK_LIFECYCLE_STALE_SOURCE');
+    try {
+      await this.#pool.start(bundle.agentId, {
+        taskId: bundle.taskId,
+        assignmentId: bundle.assignmentId,
+        specVersion: assignment.specVersion,
+        profileHash: assignment.profileHash,
+      }, { workspacePath: workspace.worktreePath });
+    } catch {
+      throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
+    }
+    await this.#requireExecution(dispatch, TaskStatus.REVIEWING);
+  }
+
+  async #blockEvidenceIntegrity(dispatch: Readonly<AssignmentDispatchResult>, recovered = false): Promise<TaskLifecyclePreparationResult> {
+    await this.#shutdownTurnRuntime(dispatch, recovered);
     this.#convergence.suspend(dispatch.assignmentId, TaskStatus.BLOCKED);
     return lifecycleResult({ outcome: 'blocked' as const, taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
   }
