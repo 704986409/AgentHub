@@ -89,7 +89,7 @@ export class AgentHubHttpServer {
     noUnknownQuery(url, url.pathname === '/api/v1/events'
       ? ['limit', 'after', 'projectId', 'agentId', 'taskId', 'assignmentId', 'eventType'] : []);
     const path = url.pathname;
-    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.3K' });
+    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.3L' });
     if (path === '/api/v1/providers') return ok(await this.#providers());
     if (path === '/api/v1/state') {
       this.#app.reviewTransitions?.assertReady();
@@ -109,7 +109,7 @@ export class AgentHubHttpServer {
     if (path === '/api/v1/plans') return ok(this.#app.planLifecycle?.listPlans() ?? []);
     if (path === '/api/v1/reviews') {
       this.#app.reviewTransitions?.assertReady();
-      return ok(this.#reviews.listPublic(this.#app.planLifecycle?.listPlans() ?? []));
+      return ok(this.#reviews.listPublic(this.#app.planLifecycle?.listPlans() ?? [], this.#app.tasks));
     }
     const planMatch = /^\/api\/v1\/plans\/([^/]+)$/u.exec(path);
     if (planMatch !== null) { const plan = this.#app.planLifecycle?.getPlan(decodeURIComponent(planMatch[1] ?? '')); if (!plan) throw apiError('AGENTHUB_API_NOT_FOUND', 404); return ok(plan); }

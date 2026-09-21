@@ -94,6 +94,8 @@ function harness(prepare: (taskId: string) => TaskReviewBundle = (taskId) => pub
       });
     } } as never,
     taskLifecycle: { prepareReview: (request: { dispatchResult: { taskId: string } }) => {
+      const task = taskMap.get(request.dispatchResult.taskId);
+      if (task) task.status = TaskStatus.REVIEWING;
       return Promise.resolve({ outcome: 'review-ready', reviewBundle: prepare(request.dispatchResult.taskId) });
     } } as never,
     targetBranch: 'main', buildTestPlan: { commands: [] }, eventBus: events,

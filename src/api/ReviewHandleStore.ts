@@ -1,3 +1,4 @@
+import { TaskStatus, type Task } from '../core/types.js';
 import type { Database } from '../database/index.js';
 import type { PlanDto } from '../lifecycle/plan-lifecycle.js';
 import { snapshotTaskReviewBundle, type TaskReviewBundle } from '../orchestration/TaskLifecycleOrchestrator.js';
@@ -10,6 +11,7 @@ export class ReviewHandleStore {
   readonly #active = new Map<string, Readonly<TaskReviewBundle>>();
   readonly #expired = new Set<string>();
   readonly #claimed = new Set<string>();
+  readonly #rounds = new Map<string, number>();
   readonly #database: Database | undefined;
 
   public constructor(database?: Database) {
@@ -21,6 +23,17 @@ export class ReviewHandleStore {
     return this.replaceActiveForTask(bundle.taskId, bundle);
   }
 
+  public getReviewRound(taskId: string): number {
+    return this.#rounds.get(taskId) ?? 1;
+  }
+
+  public advanceReviewRound(taskId: string): number {
+    const next = (this.#rounds.get(taskId) ?? 1) + 1;
+    this.#rounds.set(taskId, next);
+    this.#persist();
+    return next;
+  }
+
   public replaceActiveForTask(
     runtimeTaskId: string,
     bundle: Readonly<TaskReviewBundle>,
@@ -28,6 +41,7 @@ export class ReviewHandleStore {
   ): string {
     if (bundle.taskId !== runtimeTaskId) throw apiError('AGENTHUB_API_CONFLICT', 409);
     const handle = bundle.reviewBundleSha256;
+    if (this.#expired.has(handle)) throw apiError('AGENTHUB_API_CONFLICT', 409);
     const existing = this.#active.get(handle);
     if (existing !== undefined && existing !== bundle &&
       JSON.stringify(existing) !== JSON.stringify(bundle)) throw apiError('AGENTHUB_API_CONFLICT', 409);
@@ -91,7 +105,10 @@ export class ReviewHandleStore {
 
   public release(handle: string): void { this.#claimed.delete(handle); }
 
-  public listPublic(plans: readonly PlanDto[] = []): readonly ReturnType<typeof lifecycleReviewDto>[] {
+  public listPublic(
+    plans: readonly PlanDto[] = [],
+    tasks?: { getTask(id: string): Task | null },
+  ): readonly ReturnType<typeof lifecycleReviewDto>[] {
     const byRuntime = new Map<string, Array<{ plan: PlanDto; task: PlanDto['tasks'][number] }>>();
     for (const plan of plans) {
       for (const task of plan.tasks) {
@@ -103,6 +120,15 @@ export class ReviewHandleStore {
     }
     const reviews = [];
     for (const bundle of this.#active.values()) {
+      if (this.#expired.has(bundle.reviewBundleSha256)) continue;
+      if (tasks !== undefined) {
+        const realTask = tasks.getTask(bundle.taskId);
+        if (realTask === null) continue;
+        if (realTask.status !== TaskStatus.REVIEWING) continue;
+        if (realTask.id !== bundle.taskId) continue;
+        if (realTask.assignmentId !== null && realTask.assignmentId !== bundle.assignmentId) continue;
+        if (realTask.assignedAgentId !== null && realTask.assignedAgentId !== bundle.agentId) continue;
+      }
       const matches = byRuntime.get(bundle.taskId) ?? [];
       if (matches.length !== 1) continue;
       const mapped = matches[0];
@@ -126,6 +152,7 @@ export class ReviewHandleStore {
     this.#active.clear();
     this.#expired.clear();
     this.#claimed.clear();
+    this.#rounds.clear();
     this.#persist();
   }
 
@@ -134,6 +161,8 @@ export class ReviewHandleStore {
     const snapshot = {
       schemaVersion: 1 as const,
       bundles: [...this.#active.values()],
+      expired: [...this.#expired],
+      rounds: [...this.#rounds.entries()],
     };
     this.#database.connection.prepare(
       'INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at',
@@ -148,7 +177,7 @@ export class ReviewHandleStore {
     try {
       const raw = JSON.parse(row.value) as unknown;
       if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return;
-      const record = raw as { schemaVersion?: unknown; bundles?: unknown };
+      const record = raw as { schemaVersion?: unknown; bundles?: unknown; expired?: unknown; rounds?: unknown };
       if (record.schemaVersion !== 1 || !Array.isArray(record.bundles)) return;
       const byTask = new Map<string, Readonly<TaskReviewBundle>>();
       for (const item of record.bundles) {
@@ -160,19 +189,35 @@ export class ReviewHandleStore {
         }
       }
       for (const bundle of byTask.values()) this.#active.set(bundle.reviewBundleSha256, bundle);
+      if (Array.isArray(record.expired)) {
+        for (const h of record.expired) {
+          if (typeof h === 'string') this.#expired.add(h);
+        }
+      }
+      if (Array.isArray(record.rounds)) {
+        for (const entry of record.rounds) {
+          if (Array.isArray(entry) && typeof entry[0] === 'string' && typeof entry[1] === 'number') {
+            this.#rounds.set(entry[0], entry[1]);
+          }
+        }
+      }
     } catch {
       this.#active.clear();
+      this.#expired.clear();
+      this.#rounds.clear();
     }
   }
 
-  #snapshot(): { active: Map<string, Readonly<TaskReviewBundle>>; expired: Set<string> } {
-    return { active: new Map(this.#active), expired: new Set(this.#expired) };
+  #snapshot(): { active: Map<string, Readonly<TaskReviewBundle>>; expired: Set<string>; rounds: Map<string, number> } {
+    return { active: new Map(this.#active), expired: new Set(this.#expired), rounds: new Map(this.#rounds) };
   }
 
-  #restore(snapshot: { active: Map<string, Readonly<TaskReviewBundle>>; expired: Set<string> }): void {
+  #restore(snapshot: { active: Map<string, Readonly<TaskReviewBundle>>; expired: Set<string>; rounds: Map<string, number> }): void {
     this.#active.clear();
     this.#expired.clear();
+    this.#rounds.clear();
     for (const [handle, bundle] of snapshot.active) this.#active.set(handle, bundle);
     for (const handle of snapshot.expired) this.#expired.add(handle);
+    for (const [taskId, round] of snapshot.rounds) this.#rounds.set(taskId, round);
   }
 }

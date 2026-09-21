@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { AgentStatus, AssignmentStatus, TaskStatus } from '../core/types.js';
 import type { AgentHubWorkerResult } from '../protocol/AgentHubWorkerResult.js';
 import type { AgentPool, AgentPoolEntrySnapshot } from '../runtime/AgentPool.js';
@@ -11,6 +12,7 @@ import {
   type ReviewEvidence,
 } from '../workspace/index.js';
 import { type AssignmentDispatchResult } from './AssignmentDispatcher.js';
+import { dispatchDigest, turnResultForDigest } from './dispatch/AssignmentDispatchContract.js';
 import { CompletionCoordinator } from './lifecycle/CompletionCoordinator.js';
 import { LifecycleConvergence } from './lifecycle/LifecycleConvergence.js';
 import { RuntimeGuard } from './lifecycle/RuntimeGuard.js';
@@ -48,7 +50,10 @@ export interface TaskLifecycleOrchestratorOptions {
   readonly taskManager: TaskManager; readonly agentRegistry: AgentRegistry;
   readonly assignmentManager: AssignmentManager; readonly agentPool: AgentPool;
   readonly worktreeManager: GitWorktreeManager;
-  readonly reviewTransitions?: { commitPrepared(bundle: TaskReviewBundle, persistReviewing: () => void): void };
+  readonly reviewTransitions?: {
+    commitPrepared(bundle: TaskReviewBundle, persistReviewing: () => void): void;
+    retireForRevision?(taskId: string, priorHandle: string): number;
+  };
 }
 interface ReviewPreparationInput {
   readonly dispatch: Readonly<AssignmentDispatchResult>; readonly workerResult: AgentHubWorkerResult;
@@ -68,6 +73,7 @@ export class TaskLifecycleOrchestrator {
   readonly #convergence: LifecycleConvergence;
   readonly #revisionCoordinator: RevisionCoordinator;
   readonly #reviewTransitions: TaskLifecycleOrchestratorOptions['reviewTransitions'];
+  readonly #localRounds = new Map<string, number>();
 
   public constructor(options: TaskLifecycleOrchestratorOptions) {
     if (!isRecord(options) || !(options.worktreeManager instanceof GitWorktreeManager)) {
@@ -159,9 +165,16 @@ export class TaskLifecycleOrchestrator {
     const task = this.#tasks.getTask(bundle.taskId);
     if (task === null) throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
     const revisionPlan = this.#revisionCoordinator.prepare(review, task, bundle);
+    const round = this.#reviewTransitions?.retireForRevision?.(bundle.taskId, bundle.reviewBundleSha256)
+      ?? (() => {
+        const next = (this.#localRounds.get(bundle.taskId) ?? 0) + 1;
+        this.#localRounds.set(bundle.taskId, next);
+        return next;
+      })();
     this.#transition(bundle.taskId, TaskStatus.REVISION_REQUIRED);
     this.#transition(bundle.taskId, TaskStatus.IMPLEMENTING);
-    await this.#requireExecution(bundleToDispatch(bundle), TaskStatus.IMPLEMENTING);
+    const dispatch = revisionBundleToDispatch(bundle, round);
+    await this.#requireExecution(dispatch, TaskStatus.IMPLEMENTING);
     let turn: AgentProviderTurnResult;
     try { turn = await this.#revisionCoordinator.run(revisionPlan); }
     catch (error) {
@@ -185,7 +198,7 @@ export class TaskLifecycleOrchestrator {
       catch { throw lifecycleError('TASK_LIFECYCLE_RUNTIME_RECONCILIATION_REQUIRED'); }
       throw lifecycleError('TASK_LIFECYCLE_REVISION_FAILED');
     }
-    const revised = await this.#handleTurn({ dispatch: bundleToDispatch(bundle), turnResult: turn,
+    const revised = await this.#handleTurn({ dispatch, turnResult: turn,
       buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions });
     return revised.outcome === 'review-ready'
       ? lifecycleResult({ outcome: 'review-ready' as const, reviewEvidence: review, reviewBundle: revised.reviewBundle })
@@ -306,6 +319,47 @@ function bundleToDispatch(bundle: TaskReviewBundle): AssignmentDispatchResult {
       headCommit: bundle.source.headCommit, created: false }, assignmentStatus: 'ACTIVE', taskStatus: 'IMPLEMENTING',
     turnResult: { protocol: 'worker-result', protocolValid: true, providerId: bundle.providerId,
       workerResult: bundle.workerResult }, dispatchSha256: bundle.dispatchSha256 };
+}
+
+function makeRevisionReservationSha(priorReservationSha: string, round: number, priorBundleSha: string): string {
+  return createHash('sha256')
+    .update(`AgentHub.RevisionReservation.v1\0${priorReservationSha}\0${String(round)}\0${priorBundleSha}`)
+    .digest('hex');
+}
+
+function revisionBundleToDispatch(bundle: TaskReviewBundle, round: number): AssignmentDispatchResult {
+  const reservationSha256 = makeRevisionReservationSha(bundle.reservationSha256, round, bundle.reviewBundleSha256);
+  const identity = {
+    version: 1 as const,
+    taskId: bundle.taskId,
+    projectId: bundle.projectId,
+    agentId: bundle.agentId,
+    providerId: bundle.providerId,
+    assignmentId: bundle.assignmentId,
+    reservationSha256,
+    executionProfileSha256: bundle.executionProfileSha256,
+    workspace: {
+      branchName: bundle.source.branchName,
+      baseCommit: bundle.source.baseCommit,
+      headCommit: bundle.source.headCommit,
+      created: false,
+    },
+    assignmentStatus: 'ACTIVE' as const,
+    taskStatus: 'IMPLEMENTING' as const,
+    turnResult: {
+      protocol: 'worker-result' as const,
+      protocolValid: true as const,
+      providerId: bundle.providerId,
+      workerResult: bundle.workerResult,
+    },
+  };
+  const digestInput = {
+    ...identity,
+    turnProtocol: 'worker-result' as const,
+    turnResult: turnResultForDigest(identity.turnResult),
+  };
+  const dispatchSha256 = dispatchDigest(digestInput);
+  return { ...identity, dispatchSha256 };
 }
 function ownedPool(pool: Readonly<AgentPoolEntrySnapshot>, dispatch: Pick<AssignmentDispatchResult,
   'taskId' | 'assignmentId'>, specVersion: string, profileHash: string): boolean {

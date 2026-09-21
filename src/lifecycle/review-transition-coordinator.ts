@@ -57,6 +57,18 @@ export class ReviewTransitionCoordinator {
     this.#fail('afterNewReviewBeforeOldExpire');
   }
 
+  public retireForRevision(taskId: string, priorHandle: string): number {
+    return this.#transaction(() => {
+      this.#reviews.expire(priorHandle);
+      this.#planLifecycle.markReviewPendingByTask(taskId, false);
+      return this.#reviews.advanceReviewRound(taskId);
+    });
+  }
+
+  public getReviewRound(taskId: string): number {
+    return this.#reviews.getReviewRound(taskId);
+  }
+
   public markPlanReviewPending(runtimeTaskId: string): void {
     this.#fail('beforePlanReviewPending');
     this.#planLifecycle.markReviewPendingByTask(runtimeTaskId, true);

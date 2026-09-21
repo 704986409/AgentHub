@@ -56,6 +56,8 @@ function runtime(h: ReturnType<typeof harness>) {
     } } as never,
     taskLifecycle: { prepareReview: (request: { dispatchResult: { taskId: string } }) => {
       calls.push(`review:${request.dispatchResult.taskId}`);
+      const task = h.taskMap.get(request.dispatchResult.taskId);
+      if (task) task.status = TaskStatus.REVIEWING;
       return Promise.resolve({ outcome: 'review-ready', reviewBundle: { taskId: request.dispatchResult.taskId, reviewBundleSha256: 'c'.repeat(64) } });
     } } as never,
     targetBranch: 'main', buildTestPlan: { commands: [] }, eventBus: h.events,

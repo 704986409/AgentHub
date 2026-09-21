@@ -192,7 +192,7 @@ export function projectRuntimeState(task:Task|null,dependencyState:DependencySta
     case TaskStatus.IMPLEMENTING:
     case TaskStatus.IN_PROGRESS:
     case TaskStatus.REVISION_REQUIRED:
-      return reviewPending?'REVIEWING':'RUNNING';
+      return 'RUNNING';
     case TaskStatus.REVIEWING:
       return 'REVIEWING';
     case TaskStatus.COMPLETED:

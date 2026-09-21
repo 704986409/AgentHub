@@ -88,6 +88,8 @@ function harness() {
       });
     } } as never,
     taskLifecycle: { prepareReview: (request: { dispatchResult: { taskId: string } }) => {
+      const task = taskMap.get(request.dispatchResult.taskId);
+      if (task) task.status = TaskStatus.REVIEWING;
       return Promise.resolve({
         outcome: 'review-ready',
         reviewBundle: publicReviewBundle(request.dispatchResult.taskId, `prep-${String(++revisionSalt)}`),
@@ -99,6 +101,7 @@ function harness() {
     applyReview: (request: { reviewBundle: TaskReviewBundle; decision: { verdict: string } }) => {
       const task = taskMap.get(request.reviewBundle.taskId);
       if (request.decision.verdict === 'REQUEST_REVISION') {
+        if (task) task.status = TaskStatus.REVIEWING;
         return Promise.resolve({
           outcome: 'review-ready',
           reviewBundle: publicReviewBundle(request.reviewBundle.taskId, `rev-${String(++revisionSalt)}`),
