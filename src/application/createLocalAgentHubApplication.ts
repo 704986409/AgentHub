@@ -108,7 +108,7 @@ export async function createLocalAgentHubApplication(options: LocalAgentHubOptio
   recoverLifecycleAfterStartup({ reviewTransitions, recovery: planRecovery });
   const application: AgentHubApplication = Object.freeze({ projects: projectRepository, agents, agentManagement, tasks,
     assignments, assignmentQueries: assignmentRepository, events, eventBus, scheduler, dispatcher, lifecycle,
-    planLifecycle, planExecution, reviews, reviewTransitions,
+    planLifecycle, planExecution, assignmentRecovery, reviews, reviewTransitions,
     buildTestPlan: Object.freeze({ commands: Object.freeze([{ id: 'node-runtime-check', phase: 'test' as const,
       executable: process.execPath, args: Object.freeze(['-e', 'process.exit(0)']), timeoutMs: 30_000 }]) }),
     targetBranch, providerCatalog });

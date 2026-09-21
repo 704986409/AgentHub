@@ -84,7 +84,7 @@ export class PlanExecutionRecoveryService {
   }
 
   public persistReservation(
-    planId: string,
+    planId: string | null,
     reservation: Readonly<AgentScheduleReservation>,
     stage: AssignmentRecoveryStage = 'ASSIGNMENT_DISPATCHING',
   ): void {
@@ -117,6 +117,41 @@ export class PlanExecutionRecoveryService {
       turnMayHaveStarted: true,
       revisionRound: round,
     });
+  }
+
+  public durableRevision(assignmentId: string): {
+    readonly stage: string;
+    readonly revisionRound: number;
+    readonly dispatch: Readonly<AssignmentDispatchResult> | null;
+  } | undefined {
+    const row = this.#row(assignmentId);
+    if (!row) return undefined;
+    return {
+      stage: row.stage,
+      revisionRound: row.revision_round,
+      dispatch: row.dispatch_json ? parseDispatch(row.dispatch_json) : null,
+    };
+  }
+
+  public assertCompletedRevisionIdentity(dispatch: Readonly<AssignmentDispatchResult>): void {
+    const row = this.#row(dispatch.assignmentId);
+    const stored = row?.dispatch_json ? parseDispatch(row.dispatch_json) : null;
+    if (!row || row.stage !== 'TURN_COMPLETED' || row.revision_round < 1 || stored === null ||
+      !this.#reviews ||
+      stored.taskId !== dispatch.taskId || stored.assignmentId !== dispatch.assignmentId ||
+      stored.agentId !== dispatch.agentId || stored.providerId !== dispatch.providerId ||
+      stored.reservationSha256 !== dispatch.reservationSha256 ||
+      stored.dispatchSha256 !== dispatch.dispatchSha256 ||
+      stored.executionProfileSha256 !== dispatch.executionProfileSha256 ||
+      this.#reviews.getActiveForTask(dispatch.taskId) !== undefined ||
+      this.#reviews.getReviewRound(dispatch.taskId) !== row.revision_round) {
+      throw coded(PLAN_ASSIGNMENT_RECOVERY_REQUIRED);
+    }
+  }
+
+  public isReadyRevision(assignmentId: string): boolean {
+    const row = this.#row(assignmentId);
+    return row?.stage === 'REVIEW_READY' && row.revision_round >= 1;
   }
 
   public markReviewReady(assignmentId: string): void {

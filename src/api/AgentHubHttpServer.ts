@@ -89,7 +89,7 @@ export class AgentHubHttpServer {
     noUnknownQuery(url, url.pathname === '/api/v1/events'
       ? ['limit', 'after', 'projectId', 'agentId', 'taskId', 'assignmentId', 'eventType'] : []);
     const path = url.pathname;
-    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.3M' });
+    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.3N' });
     if (path === '/api/v1/providers') return ok(await this.#providers());
     if (path === '/api/v1/state') {
       this.#app.reviewTransitions?.assertReady();
@@ -192,8 +192,17 @@ export class AgentHubHttpServer {
           requirements: { requiredOutputProtocols: ['worker-result'] },
         });
         if (reservation.outcome !== 'reserved') throw apiError('AGENTHUB_API_CONFLICT', 409);
-        const dispatched = await this.#app.dispatcher.dispatch({ reservation, baseRef: input.baseRef,
-          turn: { prompt: input.prompt, protocol: 'worker-result' } });
+        const recovery = this.#app.assignmentRecovery;
+        recovery?.persistReservation(null, reservation);
+        let dispatched;
+        try {
+          dispatched = await this.#app.dispatcher.dispatch({ reservation, baseRef: input.baseRef,
+            turn: { prompt: input.prompt, protocol: 'worker-result' } });
+        } catch (error) {
+          recovery?.recordDispatchFailure(reservation.assignmentId, error);
+          throw error;
+        }
+        recovery?.persistDispatch(reservation.assignmentId, dispatched);
         const prepared = await this.#app.lifecycle.prepareReview({ dispatchResult: dispatched,
           buildTestPlan: this.#app.buildTestPlan });
         if (prepared.outcome === 'review-ready' && this.#app.reviewTransitions === undefined) {

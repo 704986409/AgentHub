@@ -5,6 +5,7 @@ import type { AgentManagementService, AgentRegistry, AssignmentManager, Provider
 import type { BuildTestEvidencePlan, MergeGatePolicy } from '../workspace/index.js';
 import type { PlanLifecycleService } from '../lifecycle/plan-lifecycle.js';
 import type { PlanExecutionCoordinator } from '../lifecycle/plan-execution-coordinator.js';
+import type { PlanExecutionRecoveryService } from '../lifecycle/plan-execution-recovery.js';
 import type { ReviewTransitionCoordinator } from '../lifecycle/review-transition-coordinator.js';
 import type { ReviewHandleStore } from '../api/ReviewHandleStore.js';
 
@@ -27,6 +28,7 @@ export interface AgentHubApplication {
   readonly mergePolicy?: MergeGatePolicy;
   readonly planLifecycle?: PlanLifecycleService;
   readonly planExecution?: PlanExecutionCoordinator;
+  readonly assignmentRecovery?: PlanExecutionRecoveryService;
   readonly reviews?: ReviewHandleStore;
   readonly reviewTransitions?: ReviewTransitionCoordinator;
 }

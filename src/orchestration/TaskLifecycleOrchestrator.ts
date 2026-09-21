@@ -107,6 +107,22 @@ export class TaskLifecycleOrchestrator {
     });
   }
 
+  public prepareReviewFromRecoveredDispatch(request: PrepareTaskReviewRequest): Promise<TaskLifecyclePreparationResult> {
+    let input: ReturnType<typeof snapshotPrepareRequest>;
+    try { input = snapshotPrepareRequest(request); } catch (error) { return rejectPreserving(error); }
+    return this.#withFence(input.dispatch.taskId, async () => {
+      if (!this.#assignmentRecovery) throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
+      try { this.#assignmentRecovery.assertCompletedRevisionIdentity(input.dispatch); }
+      catch { throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION'); }
+      try { await this.#captureReviewSource(input.dispatch.taskId); }
+      catch { throw lifecycleError('TASK_LIFECYCLE_STALE_SOURCE'); }
+      const prepared = await this.#handleTurn({ dispatch: input.dispatch, turnResult: input.dispatch.turnResult,
+        buildTestPlan: input.buildTestPlan, evidenceOptions: input.evidenceOptions }, { recovered: true });
+      if (prepared.outcome === 'review-ready') this.#assignmentRecovery.markReviewReady(input.dispatch.assignmentId);
+      return prepared;
+    });
+  }
+
   public applyReview(request: ApplyTaskReviewRequest): Promise<TaskLifecycleReviewResult> {
     let input: ApplySnapshot;
     try { input = snapshotApplyRequest(request); } catch (error) { return rejectPreserving(error); }
@@ -128,14 +144,14 @@ export class TaskLifecycleOrchestrator {
     }
     await this.#requireBundleFresh(bundle);
     if (review.verdict === 'BLOCK') {
-      await this.#runtimeGuard.shutdown(bundle); this.#convergence.finalizeFailed(bundle.assignmentId);
+      await this.#shutdownIfRuntimeOwned(bundle); this.#convergence.finalizeFailed(bundle.assignmentId);
       return lifecycleResult({ outcome: 'failed' as const, taskId: bundle.taskId, assignmentId: bundle.assignmentId, reviewEvidence: review });
     }
     if (review.verdict === 'REQUEST_REVISION') return this.#revise(bundle, review, input);
     if (bundle.taskCommit.outcome === 'no-changes') {
       this.#completionCoordinator.validateNoChangeCompletion(bundle, input.allowNoChangeCompletion);
       const noChangeGate = await this.#completionCoordinator.evaluateNoChangeGate(bundle, review, input.mergePolicy);
-      await this.#requireBundleFresh(bundle); await this.#runtimeGuard.shutdown(bundle);
+      await this.#requireBundleFresh(bundle); await this.#shutdownIfRuntimeOwned(bundle);
       const finalNoChangeGate = await this.#completionCoordinator.evaluateNoChangeGate(bundle, review, input.mergePolicy);
       this.#completionCoordinator.assertNoChangeGateIdentity(noChangeGate, finalNoChangeGate);
       const result = lifecycleResult({ outcome: 'completed-no-change' as const, taskId: bundle.taskId, reviewEvidence: review });
@@ -153,7 +169,7 @@ export class TaskLifecycleOrchestrator {
     const gate = await this.#completionCoordinator.evaluateMergeGate(bundle, review, input.mergePolicy);
     if (!gate.eligible) return lifecycleResult({ outcome: 'merge-denied' as const, taskId: bundle.taskId,
       reviewEvidence: review, mergeGate: gate });
-    await this.#runtimeGuard.shutdown(bundle); this.#runtimeGuard.requirePersistentAfterShutdown(bundle);
+    await this.#shutdownIfRuntimeOwned(bundle); this.#runtimeGuard.requirePersistentAfterShutdown(bundle);
     const merge = await this.#completionCoordinator.merge(bundle, review, input.targetBranch, gate, input.mergePolicy);
     const result = lifecycleResult({ outcome: 'completed' as const, taskId: bundle.taskId,
       reviewEvidence: review, mergeGate: gate, mergeResult: merge });
@@ -218,7 +234,8 @@ export class TaskLifecycleOrchestrator {
   }
 
   async #handleTurn(input: Omit<ReviewPreparationInput, 'workerResult'> &
-    { readonly turnResult: AgentProviderTurnResult }): Promise<TaskLifecyclePreparationResult> {
+    { readonly turnResult: AgentProviderTurnResult },
+    options?: { readonly recovered?: boolean }): Promise<TaskLifecyclePreparationResult> {
     const { dispatch, turnResult } = input;
     if (turnResult.protocol !== 'worker-result') throw lifecycleError('TASK_LIFECYCLE_UNSUPPORTED_TURN_PROTOCOL');
     if (!turnResult.protocolValid) {
@@ -237,7 +254,7 @@ export class TaskLifecycleOrchestrator {
       return lifecycleResult({ outcome: worker.outcome === 'BLOCKED' ? 'blocked' as const : 'waiting-input' as const,
         taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
     }
-    await this.#requireExecution(dispatch, TaskStatus.IMPLEMENTING);
+    await this.#requireExecution(dispatch, TaskStatus.IMPLEMENTING, { requireOwnedPool: options?.recovered !== true });
     let prepared: Awaited<ReturnType<ReviewPreparationCoordinator['prepare']>>;
     try {
       prepared = await this.#reviewPreparation.prepare({ dispatch, workerResult: worker,
@@ -262,8 +279,25 @@ export class TaskLifecycleOrchestrator {
     return lifecycleResult({ outcome: 'blocked' as const, taskId: dispatch.taskId, assignmentId: dispatch.assignmentId });
   }
 
+  async #shutdownIfRuntimeOwned(binding: { readonly agentId: string; readonly assignmentId: string }): Promise<void> {
+    if (this.#assignmentRecovery?.isReadyRevision(binding.assignmentId) === true &&
+      !this.#poolOwns(binding.agentId, binding.assignmentId)) return;
+    await this.#runtimeGuard.shutdown(binding);
+  }
+
+  #poolOwns(agentId: string, assignmentId: string): boolean {
+    try {
+      const pool = this.#pool.getSnapshot(agentId);
+      return pool.state === 'OWNED' && pool.assignmentId === assignmentId;
+    } catch {
+      return false;
+    }
+  }
+
   async #requireBundleFresh(bundle: TaskReviewBundle): Promise<void> {
-    await this.#requireExecution(bundleToDispatch(bundle), TaskStatus.REVIEWING);
+    const recovered = this.#assignmentRecovery?.isReadyRevision(bundle.assignmentId) === true
+      && !this.#poolOwns(bundle.agentId, bundle.assignmentId);
+    await this.#requireExecution(bundleToDispatch(bundle), TaskStatus.REVIEWING, { requireOwnedPool: !recovered });
     if (!sourceMatchesEvidence(bundle.source, bundle.buildTestEvidence) ||
       bundle.source.headCommit !== bundle.taskCommit.headAfter || !cleanSource(bundle.source)) {
       throw lifecycleError('TASK_LIFECYCLE_STALE_SOURCE');
@@ -275,7 +309,8 @@ export class TaskLifecycleOrchestrator {
   }
 
   async #requireExecution(dispatch: Pick<AssignmentDispatchResult, 'taskId' | 'projectId' | 'agentId' | 'providerId' |
-    'assignmentId' | 'executionProfileSha256' | 'workspace'>, status: TaskStatus): Promise<void> {
+    'assignmentId' | 'executionProfileSha256' | 'workspace'>, status: TaskStatus,
+    options?: { readonly requireOwnedPool?: boolean }): Promise<void> {
     const assignment = this.#assignments.getAssignment(dispatch.assignmentId);
     const task = this.#tasks.getTask(dispatch.taskId);
     const agent = this.#agents.getAgent(dispatch.agentId);
@@ -288,10 +323,12 @@ export class TaskLifecycleOrchestrator {
     try { executionHash = this.#agents.calculateExecutionProfileHash(agent.id); }
     catch { throw lifecycleError('TASK_LIFECYCLE_STALE_PROFILE'); }
     if (executionHash !== dispatch.executionProfileSha256) throw lifecycleError('TASK_LIFECYCLE_STALE_PROFILE');
-    let pool: Readonly<AgentPoolEntrySnapshot>;
-    try { pool = this.#pool.getSnapshot(agent.id); } catch { throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION'); }
-    if (!ownedPool(pool, dispatch, assignment.specVersion, assignment.profileHash)) {
-      throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
+    if (options?.requireOwnedPool !== false) {
+      let pool: Readonly<AgentPoolEntrySnapshot>;
+      try { pool = this.#pool.getSnapshot(agent.id); } catch { throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION'); }
+      if (!ownedPool(pool, dispatch, assignment.specVersion, assignment.profileHash)) {
+        throw lifecycleError('TASK_LIFECYCLE_STALE_EXECUTION');
+      }
     }
     let workspace;
     try { workspace = await this.#worktrees.inspectWorkspace(dispatch.taskId); }

@@ -183,10 +183,20 @@ export class PlanExecutionCoordinator {
     runtimeTaskId:string,
     dispatchedResult:Parameters<TaskLifecycleOrchestrator['prepareReview']>[0]['dispatchResult'] | object,
   ):Promise<TaskReviewBundle|null>{
-    const prepared=await this.options.taskLifecycle.prepareReview({
-      dispatchResult:dispatchedResult as never,
-      buildTestPlan:this.options.buildTestPlan,
-    });
+    const dispatch=dispatchedResult as { assignmentId?: string };
+    const durable=typeof dispatch.assignmentId==='string'
+      ? this.options.assignmentRecovery?.durableRevision(dispatch.assignmentId)
+      : undefined;
+    const recovered=durable?.stage==='TURN_COMPLETED' && durable.revisionRound>=1;
+    const prepared=recovered
+      ? await this.options.taskLifecycle.prepareReviewFromRecoveredDispatch({
+        dispatchResult:dispatchedResult as never,
+        buildTestPlan:this.options.buildTestPlan,
+      })
+      : await this.options.taskLifecycle.prepareReview({
+        dispatchResult:dispatchedResult as never,
+        buildTestPlan:this.options.buildTestPlan,
+      });
     if(prepared.outcome==='review-ready'){
       if(this.options.reviewTransitions) this.options.reviewTransitions.markPlanReviewPending(runtimeTaskId);
       else this.options.planLifecycle.markReviewPendingByTask(runtimeTaskId,true);
