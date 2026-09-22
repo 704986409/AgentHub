@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AgentHubApplication } from '../application/index.js';
 import type { Database } from '../database/index.js';
 import { agentDeleteDto, agentDto, assignmentDto, eventDto, lifecycleDto, projectDto, providerDto, reviewReadyDto,
-  snapshotCreateAgent, snapshotCreateTask, snapshotEmptyObject, snapshotExecuteCommand,
+  snapshotCreateAgent, snapshotCreateProject, snapshotCreateTask, snapshotEmptyObject, snapshotExecuteCommand,
   snapshotReviewDecision, snapshotUpdateAgent, taskDto, snapshotCreateIntake, snapshotCreatePlan,
   snapshotCreatePlanRevision, snapshotPlanDecision, snapshotPlanStart } from './ApiDtos.js';
 import { apiError, normalizeApiError } from './ApiErrors.js';
@@ -89,7 +89,7 @@ export class AgentHubHttpServer {
     noUnknownQuery(url, url.pathname === '/api/v1/events'
       ? ['limit', 'after', 'projectId', 'agentId', 'taskId', 'assignmentId', 'eventType'] : []);
     const path = url.pathname;
-    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.4' });
+    if (path === '/api/v1/health') return ok({ status: 'ok', version: '0.7.4C' });
     if (path === '/api/v1/providers') return ok(await this.#providers());
     if (path === '/api/v1/state') {
       this.#app.reviewTransitions?.assertReady();
@@ -135,6 +135,11 @@ export class AgentHubHttpServer {
 
   async #post(path: string, request: IncomingMessage): Promise<{ status: number; data: unknown }> {
     const body = await readJson(request, this.#maxBodyBytes);
+    if (path === '/api/v1/projects') {
+      const input = snapshotCreateProject(body);
+      return this.#mutate(request, 'POST', path, input, () =>
+        Promise.resolve(projectDto(this.#app.projects.create(input))), 201);
+    }
     if (path === '/api/v1/agents') {
       const input = snapshotCreateAgent(body);
       return this.#mutate(request, 'POST', path, input, () =>

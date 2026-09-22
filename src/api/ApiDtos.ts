@@ -1,7 +1,7 @@
 import { AgentAuthority, TaskComplexity, TaskRisk, type Agent, type AgentHubEvent,
   type Assignment, type Project, type Task } from '../core/types.js';
 import type { TaskLifecycleReviewResult, TaskReviewBundle } from '../orchestration/TaskLifecycleOrchestrator.js';
-import type { CreateTaskInput } from '../repositories/interfaces.js';
+import type { CreateTaskInput, CreateProjectInput } from '../repositories/interfaces.js';
 import type { DomainEvent } from '../events/event-bus.js';
 import { redactEventValue } from '../events/event-redaction.js';
 import type { ReviewDecisionInput, ReviewFindingInput, ReviewFindingSeverity, ReviewVerdict } from '../workspace/index.js';
@@ -172,6 +172,13 @@ export function snapshotPlanStart(value: unknown): Readonly<PlanStartInput> {
 function snapshotPlanTasks(value:unknown):CreatePlanInput['tasks'] { if(!Array.isArray(value)||value.length<1||value.length>1000)invalid(); return Object.freeze(value.map((item)=>{const r=exactRecord(item,['clientId','parentClientId','title','description','acceptanceCriteria','requiredCapabilities','requiredSpecialties','complexity','risk']);if(r.parentClientId!==null&&typeof r.parentClientId!=='string')invalid();if(r.description!==null&&typeof r.description!=='string')invalid();if(!Object.values(TaskComplexity).includes(r.complexity as TaskComplexity)||!Object.values(TaskRisk).includes(r.risk as TaskRisk))invalid();return frozen({clientId:exactBoundedText(r.clientId,256),parentClientId:r.parentClientId===null?null:exactBoundedText(r.parentClientId,256),title:boundedText(r.title,16*1024,true),description:r.description===null?null:boundedText(r.description,128*1024,false),acceptanceCriteria:stringArray(r.acceptanceCriteria,256,8192),requiredCapabilities:stringArray(r.requiredCapabilities,256,512),requiredSpecialties:stringArray(r.requiredSpecialties,256,512),complexity:r.complexity as TaskComplexity,risk:r.risk as TaskRisk});})); }
 function snapshotPlanDependencies(value:unknown):CreatePlanInput['dependencies'] { if(!Array.isArray(value)||value.length>4000)invalid(); return Object.freeze(value.map((item)=>{const r=exactRecord(item,['prerequisiteClientId','dependentClientId']);return frozen({prerequisiteClientId:exactBoundedText(r.prerequisiteClientId,256),dependentClientId:exactBoundedText(r.dependentClientId,256)});})); }
 function positiveVersion(value:unknown):number { if(typeof value!=='number'||!Number.isSafeInteger(value)||value<1)invalid();return value; }
+
+export function snapshotCreateProject(value: unknown): Readonly<CreateProjectInput> {
+  const record = exactRecord(value, ['name', 'description']);
+  if (!Object.hasOwn(record, 'name') || !Object.hasOwn(record, 'description')) invalid();
+  const description = record.description === null ? null : boundedText(record.description, 16 * 1024, false);
+  return frozen({ name: exactBoundedText(record.name, 256), description });
+}
 
 export function snapshotCreateTask(value: unknown): Readonly<CreateTaskInput> {
   const record = exactRecord(value, ['projectId', 'title', 'description', 'requiredCapabilities',
