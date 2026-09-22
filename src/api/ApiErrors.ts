@@ -9,6 +9,7 @@ export type ApiErrorCode =
   | 'AGENTHUB_API_IDEMPOTENCY_CAPACITY'
   | 'AGENTHUB_API_REVIEW_HANDLE_EXPIRED'
   | 'AGENTHUB_API_CONFLICT'
+  | 'PLAN_OWNED_TASK_REQUIRES_PLAN_LIFECYCLE'
   | 'AGENTHUB_API_LIFECYCLE_DENIED'
   | 'AGENTHUB_API_PROVIDER_UNAVAILABLE'
   | 'AGENTHUB_API_RUNTIME_RECONCILIATION_REQUIRED'
@@ -40,6 +41,9 @@ export function normalizeApiError(error: unknown): ApiError {
   if (code.includes('PROVIDER_UNAVAILABLE')) {
     return apiError('AGENTHUB_API_PROVIDER_UNAVAILABLE', 422);
   }
+  if (code === 'PLAN_OWNED_TASK_REQUIRES_PLAN_LIFECYCLE') {
+    return apiError('PLAN_OWNED_TASK_REQUIRES_PLAN_LIFECYCLE', 409);
+  }
   if (code.includes('BUSY') || code.includes('STALE') || code.includes('CONFLICT') ||
     code.includes('OWNERSHIP') || code.includes('ALREADY')) return apiError('AGENTHUB_API_CONFLICT', 409);
   if (code.includes('PLAN_STALE') || code.includes('PLAN_CONFLICT') || code.includes('PLAN_INVALID_STATE') ||
@@ -68,6 +72,7 @@ function safeApiMessage(code: ApiErrorCode): string {
     AGENTHUB_API_IDEMPOTENCY_CAPACITY: 'Idempotency capacity is temporarily unavailable',
     AGENTHUB_API_REVIEW_HANDLE_EXPIRED: 'Review handle is unavailable or expired',
     AGENTHUB_API_CONFLICT: 'Request conflicts with current state',
+    PLAN_OWNED_TASK_REQUIRES_PLAN_LIFECYCLE: 'Plan-owned tasks must be executed by the plan lifecycle',
     AGENTHUB_API_LIFECYCLE_DENIED: 'Lifecycle operation was denied',
     AGENTHUB_API_PROVIDER_UNAVAILABLE: 'Runtime provider is unavailable',
     AGENTHUB_API_RUNTIME_RECONCILIATION_REQUIRED: 'Runtime state requires reconciliation',

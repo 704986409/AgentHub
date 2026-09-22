@@ -8,6 +8,7 @@ const maxProviders = 256;
 const maxTaskTokens = 256;
 const maxAgentTokens = 512;
 const maxProviderProtocols = 32;
+const maxExcludedAgents = 64;
 const maxTokenBytes = 256;
 const encoder = new TextEncoder();
 const compare = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
@@ -20,6 +21,7 @@ export interface ProviderRoutingCapabilities {
 export interface TaskRoutingRequirements {
   readonly minimumAuthority?: AgentAuthority;
   readonly requiredOutputProtocols?: readonly AgentOutputProtocol[];
+  readonly excludedAgentIds?: readonly string[];
 }
 
 export interface TaskRoutingRequest {
@@ -38,7 +40,8 @@ export type TaskRouteRejectReason =
   | 'MISSING_SPECIALTY'
   | 'AUTHORITY_INSUFFICIENT'
   | 'PROVIDER_UNAVAILABLE'
-  | 'OUTPUT_PROTOCOL_UNSUPPORTED';
+  | 'OUTPUT_PROTOCOL_UNSUPPORTED'
+  | 'AGENT_EXCLUDED';
 
 export interface TaskRouteCandidate {
   readonly rank: number;
@@ -109,6 +112,7 @@ interface ProviderRoutingSnapshot {
 interface RequirementsSnapshot {
   readonly minimumAuthority: AgentAuthority | null;
   readonly requiredOutputProtocols: readonly AgentOutputProtocol[];
+  readonly excludedAgentIds: readonly string[];
 }
 
 interface RequestSnapshot {
@@ -148,6 +152,7 @@ interface CanonicalProviderRouteIdentity {
 interface CanonicalRoutingRequirements {
   readonly minimumAuthority: AgentAuthority | null;
   readonly requiredOutputProtocols: readonly AgentOutputProtocol[];
+  readonly excludedAgentIds: readonly string[];
 }
 
 const authorityRank: Readonly<Record<AgentAuthority, number>> = Object.freeze({
@@ -297,7 +302,9 @@ function snapshotProvider(value: unknown): ProviderRoutingSnapshot {
 }
 
 function snapshotRequirements(value: unknown): RequirementsSnapshot {
-  if (value === undefined) return deepFreeze({ minimumAuthority: null, requiredOutputProtocols: [] });
+  if (value === undefined) {
+    return deepFreeze({ minimumAuthority: null, requiredOutputProtocols: [], excludedAgentIds: [] });
+  }
   if (!isRecord(value)) fail('TASK_ROUTER_INVALID_REQUEST');
   const minimumAuthorityValue = value.minimumAuthority;
   const minimumAuthority = minimumAuthorityValue === undefined
@@ -307,10 +314,25 @@ function snapshotRequirements(value: unknown): RequirementsSnapshot {
   const requiredOutputProtocols = requiredOutputProtocolsValue === undefined
     ? []
     : enumSet(requiredOutputProtocolsValue, agentOutputProtocols, maxProviderProtocols);
+  const excludedAgentIds = snapshotExcludedAgentIds(value.excludedAgentIds);
   return deepFreeze({
     minimumAuthority,
     requiredOutputProtocols,
+    excludedAgentIds,
   });
+}
+
+function snapshotExcludedAgentIds(value: unknown): readonly string[] {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value)) fail('TASK_ROUTER_INVALID_REQUEST');
+  if (value.length > maxExcludedAgents) fail('TASK_ROUTER_LIMIT_EXCEEDED');
+  const ids = value.map((entry) => {
+    const id = token(entry);
+    if (id !== id.trim()) fail('TASK_ROUTER_INVALID_REQUEST');
+    return id;
+  });
+  if (new Set(ids).size !== ids.length) fail('TASK_ROUTER_INVALID_REQUEST');
+  return Object.freeze([...ids].sort(compare));
 }
 
 function canonicalTaskRouteIdentity(task: TaskRoutingSnapshot): CanonicalTaskRouteIdentity {
@@ -350,6 +372,7 @@ function canonicalRoutingRequirements(requirements: RequirementsSnapshot): Canon
   return {
     minimumAuthority: requirements.minimumAuthority,
     requiredOutputProtocols: requirements.requiredOutputProtocols,
+    excludedAgentIds: requirements.excludedAgentIds,
   };
 }
 
@@ -375,6 +398,7 @@ function rejectReasons(
     (provider === undefined || !containsAll(provider.outputProtocols, requirements.requiredOutputProtocols))) {
     reasons.push('OUTPUT_PROTOCOL_UNSUPPORTED');
   }
+  if (requirements.excludedAgentIds.includes(agent.id)) reasons.push('AGENT_EXCLUDED');
   return Object.freeze(reasons);
 }
 

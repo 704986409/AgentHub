@@ -101,7 +101,7 @@ export class PlanExecutionCoordinator {
     const eligible=this.options.planLifecycle.eligibleTasks(planId);
     for(const step of eligible){
       if(!step.runtimeTaskId)throw coded('PLAN_RUNTIME_LINK_CONFLICT');
-      const scheduled=this.options.scheduler.scheduleTask({taskId:step.runtimeTaskId,requirements:{requiredOutputProtocols:['worker-result']}});
+      const scheduled=this.options.scheduler.scheduleTask({taskId:step.runtimeTaskId,requirements:{requiredOutputProtocols:['worker-result'],excludedAgentIds:[plan.leadAgentId]}});
       if(scheduled.outcome!=='reserved'){ deferredEligible+=1; continue; }
       this.options.assignmentRecovery?.persistReservation(planId,scheduled);
       const prepared=await this.#dispatchReserved(plan,step,scheduled);

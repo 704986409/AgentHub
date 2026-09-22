@@ -192,6 +192,9 @@ export class AgentHubHttpServer {
       const taskId = decodeURIComponent(execute[1] ?? ''); const input = snapshotExecuteCommand(body);
       return this.#mutate(request, 'POST', path, body, async () => {
         if (this.#app.tasks.getTask(taskId) === null) throw apiError('AGENTHUB_API_NOT_FOUND', 404);
+        if (this.#app.planLifecycle?.ownsRuntimeTask(taskId)) {
+          throw apiError('PLAN_OWNED_TASK_REQUIRES_PLAN_LIFECYCLE', 409);
+        }
         const reservation = this.#app.scheduler.scheduleTask({
           taskId,
           requirements: { requiredOutputProtocols: ['worker-result'] },

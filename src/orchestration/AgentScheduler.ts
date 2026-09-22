@@ -46,7 +46,8 @@ export type AgentScheduleUnavailableReason =
   | 'POOL_NOT_REGISTERED'
   | 'POOL_NOT_IDLE'
   | 'POOL_BUSY'
-  | 'POOL_RESERVED';
+  | 'POOL_RESERVED'
+  | 'AGENT_EXCLUDED';
 
 export interface AgentScheduleUnavailableDiagnostic {
   readonly agentId: string;
@@ -207,6 +208,10 @@ export class AgentScheduler {
       const currentTask = this.#taskManager.getTask(task.id);
       if (currentTask === null || !isScheduleable(currentTask)) {
         throw schedulerError('AGENT_SCHEDULER_TASK_NOT_SCHEDULABLE');
+      }
+      if ((request.requirements?.excludedAgentIds ?? []).includes(candidate.agentId)) {
+        unavailable.push({ agentId: candidate.agentId, reason: 'AGENT_EXCLUDED' });
+        continue;
       }
       const agent = this.#agentRegistry.getAgent(candidate.agentId);
       const registryReason = this.#registryAvailability(agent, candidate, task.projectId);
@@ -376,15 +381,20 @@ function snapshotRequest(request: AgentScheduleRequest): Readonly<AgentScheduleR
       if (!isRecord(requirementsValue)) throw new TypeError('invalid requirements');
       const minimumAuthority = requirementsValue.minimumAuthority;
       const protocolsValue = requirementsValue.requiredOutputProtocols;
+      const excludedValue = requirementsValue.excludedAgentIds;
       if (minimumAuthority !== undefined && typeof minimumAuthority !== 'string') {
         throw new TypeError('invalid minimum authority');
       }
       const requiredOutputProtocols = protocolsValue === undefined
         ? undefined
         : snapshotProtocolArray(protocolsValue);
+      const excludedAgentIds = excludedValue === undefined
+        ? undefined
+        : snapshotExcludedAgentIds(excludedValue);
       requirements = deepFreeze({
         ...(minimumAuthority === undefined ? {} : { minimumAuthority }),
         ...(requiredOutputProtocols === undefined ? {} : { requiredOutputProtocols }),
+        ...(excludedAgentIds === undefined ? {} : { excludedAgentIds }),
       } as TaskRoutingRequirements);
     }
     return deepFreeze({
@@ -395,6 +405,24 @@ function snapshotRequest(request: AgentScheduleRequest): Readonly<AgentScheduleR
   } catch {
     throw schedulerError('AGENT_SCHEDULER_INVALID_REQUEST');
   }
+}
+
+const maxExcludedAgents = 64;
+const maxExcludedAgentIdBytes = 256;
+
+function snapshotExcludedAgentIds(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) throw new TypeError('invalid excluded agent ids');
+  if (value.length > maxExcludedAgents) throw new TypeError('invalid excluded agent ids');
+  const ids: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.length === 0 || entry !== entry.trim() || entry.includes('\0')) {
+      throw new TypeError('invalid excluded agent id');
+    }
+    if (encoder.encode(entry).byteLength > maxExcludedAgentIdBytes) throw new TypeError('invalid excluded agent id');
+    ids.push(entry);
+  }
+  if (new Set(ids).size !== ids.length) throw new TypeError('duplicate excluded agent id');
+  return Object.freeze([...ids].sort((left, right) => left < right ? -1 : left > right ? 1 : 0));
 }
 
 function snapshotProtocolArray(value: unknown): readonly string[] {
